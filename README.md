@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="public/Auto-Bumper%20Mascot%20Logo.png" alt="Auto-Bumper mascot — worker with a wrench carrying shield-checked package boxes" width="380" />
-</p>
+![Auto-Bumper mascot](https://raw.githubusercontent.com/sloppylopez/auto-bumper/main/public/Auto-Bumper%20Mascot%20Logo.png)
 
 # Auto-Bumper
 
