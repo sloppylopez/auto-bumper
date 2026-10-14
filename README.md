@@ -109,6 +109,17 @@
 >
 > Each edited file gets a `.auto-bumper-bak` backup first — review with `git diff` afterwards.
 
+> ### 🚀 Want to bring all your Java dependencies up to date?
+>
+> `fix --latest` (Maven/Gradle) goes beyond security fixes — it bumps **every directly declared dependency** to the newest non-prerelease available in the project's repositories (falling back to Maven Central), even when there are zero vulnerabilities. Prereleases/SNAPSHOTS are excluded, qualifier suffixes are preserved (`guava 33.6.0-jre` → `33.7.2-jre`), major bumps still require `--allow-major`, and targets that don't resolve in the project repositories are rolled back automatically instead of breaking the build:
+>
+> ```bash
+> bunx --package @elephantseed/auto-bumper fix -- ./my-project --latest --dry-run
+> bunx --package @elephantseed/auto-bumper fix -- ./my-project --latest --apply --allow-major
+> ```
+>
+> Requires network access (cannot combine with `--offline`). Preview with `--dry-run` first, then run your build/test suite.
+
 Bins ship **inside** the package — not separate npm packages. Use `bunx` or `npx` with `--package`. **Both require [Bun](https://bun.sh) installed** — bins are `#!/usr/bin/env bun` TypeScript, not precompiled Node binaries.
 
 ```bash
@@ -126,6 +137,7 @@ bunx --package @elephantseed/auto-bumper fix -- ./my-project --dry-run
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --yolo --allow-renames
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply --allow-major --allow-renames --allow-source-migrations
+bunx --package @elephantseed/auto-bumper fix -- ./my-project --latest --apply
 bunx --package @elephantseed/auto-bumper update-db
 ```
 
@@ -164,7 +176,7 @@ bun run security:fix -- . --dry-run
 
 **npm / Rust:** re-scans overlay direct deps from `package.json` / `Cargo.toml` onto the lockfile tree so bump loops progress without `npm install`. Transitive-only fixes still need a lock refresh after.
 
-`fix --latest` (Maven/Gradle) goes beyond vulnerability fixes: it bumps every **directly declared** dependency to the newest non-prerelease in the project's repositories (falling back to Maven Central). Prereleases/SNAPSHOTS are excluded, qualifier suffixes are preserved (`33.6.0-jre` → `33.7.2-jre`), majors still need `--allow-major`, and targets that don't exist in the project repositories are rolled back automatically instead of breaking the build.
+**`--latest`** (Maven/Gradle) bulk-updates every directly declared dependency to its newest non-prerelease in addition to vulnerability fixes — see the 🚀 callout above.
 
 After large **coordinate migrations**, later passes may pin transitive deps via managed constraints. Results are deterministic for a fixed OSV cache and resolved dependency tree; Gradle re-resolve can surface new findings mid-run.
 
@@ -298,7 +310,7 @@ fix [path] [options]
 | `--dry-run` | false | Show plan without modifying files |
 | `--apply` | false | Write changes to manifest files |
 | `--yolo` | false | Implies `--apply`; bump loop until clean or stalled (`--max-iterations` default 10). Exits 1 if not clean. Cannot combine with `--dry-run`. **Experimental** |
-| `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back |
+| `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back. Requires network (not with `--offline`) |
 | `--allow-major` | false | Skip interactive prompts for major bumps |
 | `--allow-renames` | false | Skip prompts for Maven coordinate renames (group:artifact migrations from OSV / known group moves) |
 | `--allow-source-migrations` | false | Apply known source rewrites for applied rename clusters (Java, JS/TS, Python, Rust) |
