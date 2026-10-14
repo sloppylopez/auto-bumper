@@ -79,7 +79,7 @@
 │        │                                                            │
 │        ▼                                                            │
 │  Gates: major (--allow-major) | rename (--allow-renames)            │
-│  --apply: re-scan until clean or stalled (default cap 5)            │
+│  --apply: re-scan until clean or stalled (default cap 10)           │
 │    dry-run shows plan; TTY prompts; CI skips risky                  │
 │        │                                                            │
 │        ▼                                                            │
@@ -169,7 +169,7 @@ bun run security:scan -- .
 bun run security:fix -- . --dry-run
 ```
 
-`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 5, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain; add `--strict` to exit 1.
+`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain; add `--strict` to exit 1.
 
 **npm / Rust:** re-scans overlay direct deps from `package.json` / `Cargo.toml` onto the lockfile tree so bump loops progress without `npm install`. Transitive-only fixes still need a lock refresh after.
 
@@ -305,13 +305,13 @@ fix [path] [options]
 |--------|---------|-------------|
 | `[path]` | `.` | Project directory |
 | `--dry-run` | false | Show plan without modifying files |
-| `--apply` | false | Write changes, then re-scan until clean or stalled (`--max-iterations`, default 5) |
+| `--apply` | false | Write changes, then re-scan until clean or stalled (`--max-iterations`, default 10) |
 | `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back. Requires network (not with `--offline`) |
 | `--allow-major` | false | Skip interactive prompts for major bumps |
 | `--allow-renames` | false | Skip prompts for Maven coordinate renames (group:artifact migrations from OSV / known group moves) |
 | `--allow-source-migrations` | false | Apply known source rewrites for applied rename clusters (Java, JS/TS, Python, Rust) |
 | `--ecosystem=<name>` | *(all)* | Limit to one ecosystem |
-| `--max-iterations=N` | `5` | Safety cap on apply re-scan loops |
+| `--max-iterations=N` | `10` | Safety cap on apply re-scan loops |
 | `--strict` | false | Exit `1` when vulnerabilities remain after the run |
 | `--exclude=group:pkg` | *(none)* | Packages to skip (repeatable) |
 | `--offline` | false | No network access during re-scans |

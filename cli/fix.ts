@@ -125,7 +125,7 @@ const outputFormat = formatFlag ? formatFlag.split("=")[1] : "markdown";
 const maxIterFlag = args.find(a => a.startsWith("--max-iterations"));
 const maxIterations = maxIterFlag
   ? Number.parseInt(maxIterFlag.split("=")[1]!, 10)
-  : 5;
+  : 10;
 const excludeArgs = args.filter(a => a.startsWith("--exclude=")).map(a => a.split("=")[1]!);
 const ecosystemFlag = args.find(a => a.startsWith("--ecosystem="));
 const ecosystemFilter = ecosystemFlag ? ecosystemFlag.split("=")[1]?.toLowerCase() : null;

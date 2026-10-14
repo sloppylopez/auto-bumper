@@ -32,6 +32,7 @@ First release under the new name — rebranded from `@elephantseed/auto-depender
 - Gradle health warnings for mixed Maven groups and managed constraints
 
 ### Changed
+- `fix --apply` re-scan cap defaults to 10 (`--max-iterations` to change)
 - Rebranded from `@elephantseed/auto-depender` to `@elephantseed/auto-bumper`; version numbering restarts at 0.0.1
 - Maven cross-major fixes on unchanged coordinates (e.g. guava `32.1.3-jre` → `33.7.2-jre`) are now planned as major bumps instead of being reported unfixable, and go through the same consent gate as npm (`--allow-major`, TTY prompt, skipped in dry-run/CI). Coordinate renames still take precedence when OSV provides them
 - `--allow-java-imports` deprecated (still works as alias with stderr warning)
