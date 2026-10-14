@@ -3,7 +3,7 @@
  * Auto-Bumper Fix — Polyglot auto-remediation for Java, npm, Rust, Python.
  *
  * Usage:
- *   fix [path] [--dry-run] [--apply] [--yolo] [--allow-major] [--allow-renames] [--allow-source-migrations] [--latest] [--offline] [options]
+ *   fix [path] [--dry-run] [--apply] [--allow-major] [--allow-renames] [--allow-source-migrations] [--latest] [--offline] [options]
  *   bun cli/fix.ts [path] [options]   (local dev)
  */
 import fs from "node:fs";
@@ -93,16 +93,18 @@ import {
 import {
   overlayManifestDirectDeps,
   MANIFEST_OVERLAY_WARNING,
-  yoloSkipPrompts,
   fixLoopBlockedMessage,
 } from "../src/lib/manifest-overlay.ts";
 import { renameNeedsSourceMigration } from "../src/lib/rename-source-gate.ts";
 
 const args = process.argv.slice(2);
 const targetPath = args.find(a => !a.startsWith("--")) || ".";
-const yoloFlag = args.includes("--yolo");
+if (args.includes("--yolo")) {
+  console.error("Error: --yolo was removed. Use --apply. Add --strict to exit 1 if vulnerabilities remain.");
+  process.exit(2);
+}
 const dryRun = args.includes("--dry-run");
-const applyFlag = args.includes("--apply") || yoloFlag;
+const applyFlag = args.includes("--apply");
 const allowMajor = args.includes("--allow-major");
 const allowRenames = args.includes("--allow-renames");
 const deprecatedJavaImports = args.includes("--allow-java-imports");
@@ -121,14 +123,9 @@ const strictExit = args.includes("--strict");
 const formatFlag = args.find(a => a.startsWith("--format"));
 const outputFormat = formatFlag ? formatFlag.split("=")[1] : "markdown";
 const maxIterFlag = args.find(a => a.startsWith("--max-iterations"));
-let maxIterations: number;
-if (maxIterFlag) {
-  maxIterations = Number.parseInt(maxIterFlag.split("=")[1]!, 10);
-} else if (yoloFlag) {
-  maxIterations = 10;
-} else {
-  maxIterations = 5;
-}
+const maxIterations = maxIterFlag
+  ? Number.parseInt(maxIterFlag.split("=")[1]!, 10)
+  : 5;
 const excludeArgs = args.filter(a => a.startsWith("--exclude=")).map(a => a.split("=")[1]!);
 const ecosystemFlag = args.find(a => a.startsWith("--ecosystem="));
 const ecosystemFilter = ecosystemFlag ? ecosystemFlag.split("=")[1]?.toLowerCase() : null;
@@ -337,7 +334,7 @@ function planMarkdown(plan: FixPlan, opts: PlanReportOptions): string {
   return lines.join("\n");
 }
 
-async function filterByMajorGate(candidates: FixCandidate[], iteration: number) {
+async function filterByMajorGate(candidates: FixCandidate[]) {
   const approved: FixCandidate[] = [];
   const skipped: FixCandidate[] = [];
 
@@ -350,7 +347,7 @@ async function filterByMajorGate(candidates: FixCandidate[], iteration: number) 
       approved.push(c);
       continue;
     }
-    if (dryRun || yoloSkipPrompts(yoloFlag, iteration)) {
+    if (dryRun) {
       skipped.push(c);
       continue;
     }
@@ -368,7 +365,7 @@ async function filterByMajorGate(candidates: FixCandidate[], iteration: number) 
   return { approved, skipped };
 }
 
-async function filterByRenameGate(candidates: FixCandidate[], iteration: number) {
+async function filterByRenameGate(candidates: FixCandidate[]) {
   const approved: FixCandidate[] = [];
   const skipped: FixCandidate[] = [];
 
@@ -377,7 +374,7 @@ async function filterByRenameGate(candidates: FixCandidate[], iteration: number)
       approved.push(c);
       continue;
     }
-    if (dryRun || yoloSkipPrompts(yoloFlag, iteration)) {
+    if (dryRun) {
       skipped.push(c);
       continue;
     }
@@ -398,13 +395,12 @@ async function filterByRenameGate(candidates: FixCandidate[], iteration: number)
 async function filterBySourceGate(
   renames: FixCandidate[],
   hasApprovedRenames: boolean,
-  iteration: number,
 ): Promise<{ approved: boolean }> {
   const config = sourceMigrationsForAppliedRenames(renamesForSourceMigrations(renames));
   if (!config || !hasApprovedRenames) return { approved: false };
 
   if (allowSourceMigrations) return { approved: true };
-  if (dryRun || yoloSkipPrompts(yoloFlag, iteration)) return { approved: false };
+  if (dryRun) return { approved: false };
   if (isTTY) {
     const ok = await ask("Apply source migrations for renamed coordinates? [y/N] ");
     return { approved: ok };
@@ -945,7 +941,7 @@ function reportCleanExit(ctx: FixLoopContext): never {
   }
   for (const p of ctx.projects) discardManifestBackup(p);
   discardSourceMigrationBackups(ctx.allSourceChanged);
-  process.exit(ctx.allSkippedUnresolvable.length > 0 && (yoloFlag || strictExit) ? 1 : 0);
+  process.exit(ctx.allSkippedUnresolvable.length > 0 && strictExit ? 1 : 0);
 }
 
 /** Plan + gate decisions for one pass. */
@@ -976,9 +972,9 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
   ctx.lastHealthWarnings = healthWarnings;
   ctx.lastUnfixable = plan.unfixable;
 
-  const { approved, skipped } = await filterByMajorGate(plan.fixable, ctx.iteration);
+  const { approved, skipped } = await filterByMajorGate(plan.fixable);
   ctx.allSkippedMajors.push(...skipped);
-  const { approved: approvedRenames, skipped: skippedRenames } = await filterByRenameGate(plan.renames, ctx.iteration);
+  const { approved: approvedRenames, skipped: skippedRenames } = await filterByRenameGate(plan.renames);
   ctx.allSkippedRenames.push(...skippedRenames);
 
   const manifestPaths = ctx.projects.map(p => p.manifestPath);
@@ -1280,20 +1276,10 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   if (finalFindings.length > 0) console.log(`Remaining vulnerabilities: ${finalFindings.length}`);
   if (ctx.allSkippedUnresolvable.length > 0) console.log(`Rolled back fixes: ${ctx.allSkippedUnresolvable.length} — target version not resolvable from project repositories.`);
   if (reportApplied.length > 0) console.log("Bumps were applied. Re-run scan to verify, or use --exclude=group:artifact for unfixable OSV noise.");
-  const exitOnRemaining = yoloFlag || strictExit;
-  process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0) && exitOnRemaining ? 1 : 0);
-}
-/** Fail fast on incompatible CLI flag combinations. */
-function validateCliFlags(): void {
-  if (yoloFlag && dryRun) {
-    console.error("Error: --yolo cannot be used with --dry-run.");
-    process.exit(2);
-  }
+  process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0) && strictExit ? 1 : 0);
 }
 
 async function main() {
-  validateCliFlags();
-
   const resolvedTarget = normalizeCliPath(targetPath);
   const projects = findProjects(resolvedTarget, ecosystemFilter);
   sessionProjects = projects;
@@ -1346,7 +1332,7 @@ async function main() {
 
     const plannedSourceMigrations = plannedSourceMigrationsFor(pass);
     const batch = buildApplyBatch(pass, scan.findings);
-    const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0, ctx.iteration);
+    const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0);
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
     const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0);

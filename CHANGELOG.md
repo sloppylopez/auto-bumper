@@ -13,8 +13,8 @@ First release under the new name — rebranded from `@elephantseed/auto-depender
 - `fix --apply` re-targets bumps whose target version cannot be resolved from the project repositories (e.g. yanked releases): after Gradle reports a `FAILED` tree node, auto-bumper queries the repository's `maven-metadata.xml` for the smallest available non-SNAPSHOT version above the failed one and bumps to that instead (`~ re-targeted … using X instead`)
 - When no such version exists, the bump is rolled back — Gradle restores the exact declared version (downgrade-capable, which a normal bump cannot do) — and the fix is reported under "Skipped — target not resolvable" instead of leaving a broken build
 - Manifest overlay on fix-loop re-scan (npm `package.json`, Rust `Cargo.toml` direct deps)
-- Clear YOLO stall messages when `--allow-major` / `--allow-renames` block progress
-- `test/yolo-loop.test.ts`
+- Clear fix-loop stall messages when `--allow-major` / `--allow-renames` block progress
+- `test/manifest-overlay.test.ts`
 - Package rename detection for npm, PyPI, and crates.io from OSV advisories
 - Manifest renames in `package.json`, `Cargo.toml`, `requirements.txt`, `pyproject.toml`
 - Source migrations for JavaScript/TypeScript, Python, and Rust import lines
@@ -69,11 +69,9 @@ First release under the new name — rebranded from `@elephantseed/auto-depender
 - `--ecosystem=gradle` no longer returns false clean (0 packages) — Gradle tree uses maven coords + `build.gradle` manifest path
 - `fix` on Gradle projects now scans with `--ecosystem=gradle` (was `maven`, same false clean)
 - Scan/fix exit error when ecosystem filter matches zero packages
-- YOLO: no TTY re-prompts on iteration 2+ (respects allow flags only)
-- YOLO: plan-signature stall detection consolidated in `fixLoopStopReason`
-- YOLO: `lastAppliedCount` tracks actual file changes only
+- Fix loop: plan-signature stall detection consolidated in `fixLoopStopReason`
+- Fix loop: `lastAppliedCount` tracks actual file changes only
 - Dedupe applied-bump reporting across loop passes
-- `--yolo` exits non-zero when vulnerabilities remain
 - `collectFixedVersions` now scopes fix versions to the matching `affected` package block (multi-package advisories)
 - Jackson 3 migration keeps `jackson-annotations` 2.x on classpath; no exclude/rename for annotations coord
 - Mixed-classpath Gradle projects always keep rename steps in fix plan
