@@ -1,0 +1,66 @@
+{
+  "name": "@elephantseed/auto-bumper",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Local offline polyglot dependency vulnerability scanner and auto-fixer (Java, npm, Rust, Python)",
+  "license": "MIT",
+  "author": "Elephant Seed (https://www.npmjs.com/org/elephantseed)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sloppylopez/auto-bumper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sloppylopez/auto-bumper/issues"
+  },
+  "homepage": "https://github.com/sloppylopez/auto-bumper#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "security",
+    "vulnerability",
+    "osv",
+    "dependabot",
+    "scanner",
+    "gradle",
+    "maven",
+    "npm",
+    "bun",
+    "offline"
+  ],
+  "bin": {
+    "scan": "./cli/scan.ts",
+    "fix": "./cli/fix.ts",
+    "update-db": "./cli/update-db.ts",
+    "auto-bumper-scan": "./cli/scan.ts",
+    "auto-bumper-fix": "./cli/fix.ts",
+    "auto-bumper-update-db": "./cli/update-db.ts"
+  },
+  "files": [
+    "cli/",
+    "src/",
+    "local-advisories/",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./scan": "./src/scan.ts"
+  },
+  "scripts": {
+    "scan": "bun cli/scan.ts",
+    "fix": "bun cli/fix.ts",
+    "update-db": "bun cli/update-db.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "prepublishOnly": "bun run typecheck"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

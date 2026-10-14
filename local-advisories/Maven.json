@@ -1,0 +1,473 @@
+[
+  {
+    "id": "CVE-2026-18036",
+    "aliases": [
+      "CVE-2026-18036"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, NTRU reduced secret values with the % operator in three helpers whose reference implementations are deliberately division-free, so each reduction was carried out by an integer division whose latency depends on the secret operand. Polynomial.modQ divided by a variable divisor, which a compiler cannot strength-reduce to a multiply the way it can a constant one, so it emitted a division on every call including on the decapsulation path where the dividend derives from the private key; Polynomial.mod3 and NTRUSampling.mod3 divided the secret key polynomials f and g during key generation, the message polynomials r and m during encapsulation, and coefficients recovered during decapsulation. An attacker able to measure that timing can recover information about the NTRU private key. modQ now masks, which is exact because q is always a power of two, and mod3 uses the reference implementation's division-free fold and select; the results are unchanged.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "8.2"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcprov-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-18036"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-18040",
+    "aliases": [
+      "CVE-2026-18040"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, HQC leaked secret-derived data through two side channels: its GF(2^8) arithmetic used lookup tables indexed by field elements, making the cache line touched a function of the operand, and its fixed-weight support sampler left its duplicate scan as soon as a collision was found and stored accepted positions at a secret index. Both run on secret inputs during encapsulation and decapsulation, and the sampler re-expands the secret key from its seed on every decapsulation, so an attacker able to observe cache behaviour or decapsulation timing can recover information about the HQC private key. The field arithmetic is now table-free and the sampler branch-free within a batch of candidates, with output and randomness consumption unchanged.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "5.9"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcprov-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-18040"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-97873",
+    "aliases": [
+      "CVE-2026-97873"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, the raw JCA provider's legacy PBES1 (PKCS#5 scheme 1) and PKCS#12 PBE families ran their password-based key derivation with an iteration count taken from untrusted input without bounding it, so a small input could dictate an arbitrary amount of work before anything could be verified. The AlgorithmParameters implementations (PKCS12PBE and its object identifier aliases, and PBKDF1) accepted any count from an encoded PKCS12PBEParams or PBEParameter, narrowing a value beyond the int range with intValue(), and every Cipher, Mac and SecretKeyFactory in these families derived with whatever count it was given, including one decoded by another provider's AlgorithmParameters, as when javax.crypto.EncryptedPrivateKeyInfo.getKeySpec() decrypts a PKCS#12 PBE-protected private key with BC. Both the parameter parse and the derivations now reject a negative or over-limit count under the org.bouncycastle.pbe.max_iteration_count property (default 10,000,000) that already bounded PBKDF2 (CVE-2026-17508), and the parse rejects a count beyond the int range rather than narrowing it. This issue also affects Bouncy Castle for Java LTS before 2.73.13.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "5.3"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcprov-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-97873"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-71891",
+    "aliases": [
+      "CVE-2026-71891"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, BLS12_381BasicScheme.keyValidate, and so BLSPublicKeyParameters and every BasicScheme, MessageAugmentation and ProofOfPossession verify and aggregateVerify that gate on it, accepted a public key built on a foreign ECCurve that merely shares BLS12-381's field characteristic. The prime-order subgroup check trusts a point's own curve to name its cofactor, since ECPoint.satisfiesOrder returns true outright when the curve's cofactor is one, so a point on a curve with a different equation and a cofactor forged to one passed keyValidate despite not being a G1 point at all. In BC's pairing implementation such a point contributes the identity in the target group, so an aggregate signature verified against a set of public keys including it is accepted even though it contains no signature for that key and message pair, admitting a phantom signer. keyValidate now first confirms that the point's curve carries exactly the canonical G1 field, equation, order and cofactor before any subgroup check. The issue is reachable only where an application constructs an ECPoint on an explicit, non-canonical curve and accepts it as an authority-bearing key; the standard 48-byte compressed-point decoder always supplies the canonical curve and was never affected.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "7.1"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcprov-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-71891"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-71889",
+    "aliases": [
+      "CVE-2026-71889"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, neither copy of PKIXCertPathReviewer - org.bouncycastle.pkix.jcajce.PKIXCertPathReviewer nor the legacy org.bouncycastle.x509.PKIXCertPathReviewer - applied X.509 name constraints to the end-entity certificate. checkNameConstraints walked the path with a loop bound of index greater than zero, which is the bound the CA-only steps require, but index zero is the target certificate under the standard CertPath ordering, so the permitted and excluded subtree checks of RFC 5280 sec. 6.1.3 (b) and (c) never ran against the leaf's subject DN or its subjectAltName. A chain whose leaf violated a NameConstraints extension imposed by its own issuing CA therefore reported isValidCertPath() true with an empty error list, while CertPathValidator.getInstance(\"PKIX\", \"BC\"), which shares no code with the reviewer, rejected the identical chain against the identical trust anchor. An application using the reviewer to make the trust decision rather than for diagnostics alongside a real validation accepted a certificate the constrained CA was never authorised to issue. Both copies now check every certificate in the path including the target, waive the sec. 4.2.1.10 self-issued exemption for the final certificate as sec. 6.1.3 requires, and skip the sec. 6.1.4 (g) constraint-accumulation step for the target. This issue also affects Bouncy Castle for Java LTS before 2.73.13, which carries only the org.bouncycastle.pkix.jcajce copy of the reviewer. It also affects Bouncy Castle for Java FIPS (BC-FJA) before bcpkix-fips 1.0.13 (1.0.X series), 2.0.13 (2.0.X series) and 2.1.13 (2.1.X series).",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "8.7"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcpkix-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-71889"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-71888",
+    "aliases": [
+      "CVE-2026-71888"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, the streaming CMS AuthenticatedData parser accepted a message whose digestAlgorithm and authAttrs fields disagreed about whether authenticated attributes were present. RFC 5652 sec. 9.1 pairs the two, requiring that authAttrs be present whenever digestAlgorithm is, and sec. 9.2 makes the MAC cover the DER encoding of authAttrs when they are present and the eContent OCTET STRING directly when they are not. CMSAuthenticatedDataParser has to choose between those two in its constructor, before it can reach authAttrs, which comes later in the SEQUENCE, so it chose on digestAlgorithm alone: for a message with digestAlgorithm absent but authAttrs present it verified the content MAC and then returned the attributes through getAuthAttrs() as though they had been authenticated, when the MAC had never covered them. An attacker able to modify a message in transit could insert an authenticated attribute, such as an RFC 2634 ESSSecurityLabel, into an otherwise valid message while holding neither the key-encryption key nor the content-MAC key, and an application taking an authorization, routing or labelling decision from those attributes would act on attacker-chosen values. The content itself remained MAC-bound. asn1.cms.AuthenticatedData now rejects the mismatched pairing when parsing and CMSAuthenticatedDataParser cross-checks the two fields once authAttrs is read. This is a variant of CVE-2026-59642, which bound the content to the MAC for messages that legitimately carry authAttrs, and which does not address this case. This issue also affects Bouncy Castle for Java LTS before 2.73.13, and Bouncy Castle for Java FIPS (BC-FJA) before bcpkix-fips 1.0.13 (1.0.X series), 2.0.13 (2.0.X series) and 2.1.13 (2.1.X series), and bcutil-fips 2.0.8 (2.0.X series) and 2.1.8 (2.1.X series).",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "8.7"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcpkix-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-71888"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-17508",
+    "aliases": [
+      "CVE-2026-17508"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, several password-based key derivation entry points ran the KDF with cost parameters taken from the untrusted input being processed, without bounding them, so a small input could dictate an arbitrary amount of work before any password or integrity check could reject it. The affected paths are the RFC 9579 PBMAC1 MAC calculator builders, which took the PBKDF2 iteration count and derived-key length straight out of PBMAC1Params (JcePBMac1CalculatorBuilder, and PKCS12PBEUtils.createPBMac1Calculator reached from PKCS12PfxPdu.isMacValid); the scrypt parallelization parameter p in the PKCS#8 and PKCS#12 cost guards, which bounded only the cost parameter N and the block size r even though the scratch buffer scales with r times p, so the configured memory ceiling could be evaded entirely; the raw JCA PBKDF2 provider (org.bouncycastle.jcajce.provider.symmetric.PBEPBKDF2); and the bcrypt round count read from an encrypted OpenSSH v1 private key's own kdfoptions. Each now bounds the parameter before deriving, in line with the caps already applied elsewhere in the tree, with the OpenSSH round count configurable through the new org.bouncycastle.openssh.max_rounds property. This completes the bounding begun in 1.85 for the PKCS#8 / PBES2 decryptors (CVE-2026-15055). This issue also affects Bouncy Castle for Java LTS before 2.73.13, and Bouncy Castle for Java FIPS (BC-FJA) before bcpkix-fips 1.0.13 (1.0.X series), 2.0.13 (2.0.X series) and 2.1.13 (2.1.X series).",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "5.3"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcpkix-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-17508"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-71892",
+    "aliases": [
+      "CVE-2026-71892"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Bouncy Castle for Java before 1.86, the opt-in key-size validation on CMS key-transport recipients, org.bouncycastle.cms.jcajce.JceKeyTransRecipient.setKeySizeValidation(true), never ran for a message using RFC 9709 content-encryption key derivation (id-alg-cek-hkdf-sha256). The branch that should have selected the actual content-encryption algorithm carried in the key derivation AlgorithmIdentifier's parameters compared the encrypted-key byte array against the id-alg-cek-hkdf-sha256 object identifier, a comparison between a byte array and an ASN1ObjectIdentifier that is false for every possible input, so the check fell through to a key-size lookup on the outer wrapper OID. That OID identifies a key-derivation construction rather than a cipher and has no registered key size, so the size comparison was skipped entirely. A key-transport EnvelopedData or AuthEnvelopedData whose transported, HKDF-derived content-encryption key did not match the key size of the advertised content-encryption algorithm was therefore accepted even with validation explicitly enabled, silently defeating the only mechanism the API offers for enforcing recovered key size. The recipient now dispatches on the content-encryption AlgorithmIdentifier's algorithm OID, so validation checks the recovered key against the inner content-encryption algorithm. Messages with a matching key size, non-HKDF messages, and recipients that do not enable validation are unaffected. This issue also affects Bouncy Castle for Java FIPS (BC-FJA) before bcpkix-fips 2.0.13 (2.0.X series) and 2.1.13 (2.1.X series).",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "6.9"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.bouncycastle:bcpkix-jdk18on",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.86"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-71892"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-104721",
+    "aliases": [
+      "CVE-2026-104721"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "Path-traversal vulnerability in QOS.CH Sarl Logback-classic on Java (logback-classic module). An MDC-based discriminator value flows unsanitized into a nested FileAppender path, letting an attacker who influences that MDC value (e.g. via an HTTP header) create and append log files outside the intended directory. This issue affects Logback-classic from 0.9.14 through 1.6.4. Similar to CVE-2026-19880 but involves other attack techniques.",
+    "severity": [
+      {
+        "type": "CVSS_V4_0",
+        "score": "6.3"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "ch.qos.logback:logback-classic",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0.9.14"
+              },
+              {
+                "fixed": "1.6.5"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-104721"
+      },
+      {
+        "url": "https://logback.qos.ch/news.html#1.6.5"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-102554",
+    "aliases": [
+      "CVE-2026-102554",
+      "GHSA-xxph-c9ww-hj94",
+      "SNYK-JAVA-COMGOOGLEGUAVA-20825054"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In Google Guava for Java before 33.7.2-jre, deserializing an attacker-controlled stream with ObjectInputStream.readObject on the compact map and set implementations (CompactHashMap, CompactHashSet, and MapMakerInternalMap) allowed a crafted payload to grow internal node arrays far beyond the declared element count, exhausting heap memory (CWE-770). A remote or local caller able to pass such a stream to an application that deserializes untrusted data could trigger an out-of-memory condition and denial of service. The compact containers now bound their growth during readObject so a malicious payload can no longer inflate memory usage.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "8.2"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "com.google.guava:guava",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "33.7.2-jre"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102554"
+      },
+      {
+        "url": "https://github.com/advisories/GHSA-xxph-c9ww-hj94"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-92877",
+    "aliases": [
+      "CVE-2026-92877",
+      "SNYK-JAVA-ORGGLASSFISHJAXB-20883142"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "In GlassFish JAXB (org.glassfish.jaxb:jaxb-core) 4.0.0-M4 and later, XmlFactory.createParserFactory and XmlFactory.createDocumentBuilderFactory build their underlying XML parsers without disabling external entity resolution, so parsing an attacker-controlled document can trigger XML External Entity (XXE) attacks such as disclosure of local files or server-side request forgery (CWE-611). Applications using these factory methods to parse untrusted input are affected. The fix, which sets the non-validating secure processing properties on both factories, is on the jaxb-ri master branch and has not been released in a 4.x artifact yet.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "8.3"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.glassfish.jaxb:jaxb-core",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "4.0.0-M4"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-92877"
+      },
+      {
+        "url": "https://github.com/eclipse-ee4j/jaxb-ri/pull/2013"
+      }
+    ]
+  }
+]

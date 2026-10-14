@@ -1,0 +1,12 @@
+node_modules/
+.auto-bumper/
+.auto-depender/
+.pi-subagents/
+.pi-sonarqube/
+.scannerwork/
+.jerricky/
+llm-wiki/
+*.auto-bumper-bak
+*.depender-bak
+bun.lockb
+.idea/
