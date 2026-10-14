@@ -20,13 +20,13 @@ const { loadRepoAdvisories, getWatchedRepos, ghsaToOsv, parseGhsaRange, DEFAULT_
   "../src/lib/github-repo-advisories.ts"
 );
 const { matchVulnerabilities } = await import("../src/lib/matcher.ts");
+const { getOsvDbDir } = await import("../src/path.ts");
 const { DB_DIR, runAutoBumperScan } = await import("../src/scan.ts");
 
-// scan.ts freezes its cache dir at first evaluation (bun test shares one module registry across
-// files), so the Maven bulk cache and the watchlist file live under that frozen dir. The
-// repo-advisories cache is resolved from env at call time, so it stays in tmpRoot/db/osv.
+// scan.ts freezes DB_DIR at first evaluation. getWatchedRepos() reads ghsa-repos.json from
+// getOsvDbDir() at call time, which follows AUTO_BUMPER_CACHE_DIR. Write the override there.
 const scanDbDir = DB_DIR;
-const watchlistFile = path.resolve(DB_DIR, "..", "..", "ghsa-repos.json");
+const watchlistFile = path.resolve(getOsvDbDir(), "..", "..", "ghsa-repos.json");
 
 // Limit the watchlist to one repo so every test hits a single API endpoint.
 fs.mkdirSync(path.dirname(watchlistFile), { recursive: true });
