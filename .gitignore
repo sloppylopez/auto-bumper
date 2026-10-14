@@ -1,4 +1,5 @@
 node_modules/
+.env
 .auto-bumper/
 .auto-depender/
 .pi-subagents/
