@@ -70,9 +70,10 @@ export function fixLoopStopReason(input: FixLoopStopInput): FixLoopStopReason {
     findingCountHistory.length >= 2 &&
     lastAppliedCount > 0
   ) {
+    // Current count is already in the history, so one hit is this pass, not a bounce.
     const repeats = findingCountHistory.filter(c => c === findingCount).length;
     const hasDifferent = findingCountHistory.some(c => c !== findingCount);
-    if (repeats >= 1 && hasDifferent) {
+    if (repeats >= 2 && hasDifferent) {
       return "oscillation";
     }
   }

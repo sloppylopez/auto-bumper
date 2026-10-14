@@ -79,7 +79,7 @@
 │        │                                                            │
 │        ▼                                                            │
 │  Gates: major (--allow-major) | rename (--allow-renames)            │
-│  --yolo: loop apply until clean (combine with gates as needed)      │
+│  --apply: re-scan until clean or stalled (default cap 10)           │
 │    dry-run shows plan; TTY prompts; CI skips risky                  │
 │        │                                                            │
 │        ▼                                                            │
@@ -135,7 +135,6 @@ bunx --package @elephantseed/auto-bumper scan -- ./my-project --ecosystem=npm
 bunx --package @elephantseed/auto-bumper scan -- ./my-project --format=json
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --dry-run
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply
-bunx --package @elephantseed/auto-bumper fix -- ./my-project --yolo --allow-renames
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply --allow-major --allow-renames --allow-source-migrations
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --latest --apply
 bunx --package @elephantseed/auto-bumper update-db
@@ -146,7 +145,7 @@ Windows:
 ```powershell
 bunx --package @elephantseed/auto-bumper scan -- C:\dev\code\my-app
 bunx --package @elephantseed/auto-bumper fix -- C:\dev\code\my-app --dry-run
-bunx --package @elephantseed/auto-bumper fix -- C:\dev\code\my-app --yolo --allow-renames
+bunx --package @elephantseed/auto-bumper fix -- C:\dev\code\my-app --apply --allow-major --allow-renames --allow-source-migrations
 ```
 
 **Local install** (optional):
@@ -170,9 +169,7 @@ bun run security:scan -- .
 bun run security:fix -- . --dry-run
 ```
 
-`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), edits files, re-scans; restores backup on failure. **Fix re-scans use `runtimeClasspath` only** (not test deps) to keep yolo loops faster — use `scan` for full runtime+test coverage.
-
-`fix --yolo` implies `--apply` and loops re-scan/apply for **same-package bumps** until clean or stalled (default cap: 10 passes). Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations` when dry-run shows them. On pass 2+, YOLO does not re-prompt — flags only. Exits **non-zero** if vulnerabilities remain.
+`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain; add `--strict` to exit 1.
 
 **npm / Rust:** re-scans overlay direct deps from `package.json` / `Cargo.toml` onto the lockfile tree so bump loops progress without `npm install`. Transitive-only fixes still need a lock refresh after.
 
@@ -180,7 +177,7 @@ bun run security:fix -- . --dry-run
 
 After large **coordinate migrations**, later passes may pin transitive deps via managed constraints. Results are deterministic for a fixed OSV cache and resolved dependency tree; Gradle re-resolve can surface new findings mid-run.
 
-**YOLO is still wet behind the ears** — mixed classpaths, coordinate migrations, and Gradle managed blocks can still stall. Stall messages now say if `--allow-major` or `--allow-renames` blocked progress. Prefer `--dry-run` first; run your build/test suite after.
+The re-scan loop can still stall on mixed classpaths, coordinate migrations, and Gradle managed blocks. Stall messages say if `--allow-major` or `--allow-renames` blocked progress. Prefer `--dry-run` first; run your build/test suite after.
 
 ### Coordinate migrations
 
@@ -239,7 +236,7 @@ scan [path] [options]
 | `--format=markdown\|json` | `markdown` | Output format |
 | `--ecosystem=<name>` | *(all)* | Filter: `npm`, `crates.io`, `pypi`, `maven`, `gradle` (Gradle = deps from `build.gradle` via `gradlew`) |
 
-**Gradle scan scope:** `runtimeClasspath` + `testRuntimeClasspath` via `gradlew dependencies` (285 pkgs typical Spring app). Not scanned: Gradle plugin classpath, custom configs (e.g. `jaxb` in applied scripts), `annotationProcessor` deps. **`fix --yolo`** uses `runtimeClasspath` only (215 pkgs) — use plain `scan` for full coverage.
+**Gradle scan scope:** `runtimeClasspath` + `testRuntimeClasspath` via `gradlew dependencies` (285 pkgs typical Spring app). Not scanned: Gradle plugin classpath, custom configs (e.g. `jaxb` in applied scripts), `annotationProcessor` deps. `scan` and `fix` use the same two configurations.
 | `--offline` | false | No network access at all; use cached advisory DB only |
 | `--json` | — | Deprecated alias for `--format=json` (prints a warning) |
 
@@ -308,15 +305,14 @@ fix [path] [options]
 |--------|---------|-------------|
 | `[path]` | `.` | Project directory |
 | `--dry-run` | false | Show plan without modifying files |
-| `--apply` | false | Write changes to manifest files |
-| `--yolo` | false | Implies `--apply`; bump loop until clean or stalled (`--max-iterations` default 10). Exits 1 if not clean. Cannot combine with `--dry-run`. **Experimental** |
+| `--apply` | false | Write changes, then re-scan until clean or stalled (`--max-iterations`, default 10) |
 | `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back. Requires network (not with `--offline`) |
 | `--allow-major` | false | Skip interactive prompts for major bumps |
 | `--allow-renames` | false | Skip prompts for Maven coordinate renames (group:artifact migrations from OSV / known group moves) |
 | `--allow-source-migrations` | false | Apply known source rewrites for applied rename clusters (Java, JS/TS, Python, Rust) |
 | `--ecosystem=<name>` | *(all)* | Limit to one ecosystem |
-| `--max-iterations=N` | `5` (`10` with `--yolo`) | Safety cap on apply re-scan loops |
-| `--strict` | false | Exit `1` when vulnerabilities remain after the run (without `--yolo`) |
+| `--max-iterations=N` | `10` | Safety cap on apply re-scan loops |
+| `--strict` | false | Exit `1` when vulnerabilities remain after the run |
 | `--exclude=group:pkg` | *(none)* | Packages to skip (repeatable) |
 | `--offline` | false | No network access during re-scans |
 | `--format=markdown\|json` | `markdown` | Output format |
@@ -327,7 +323,7 @@ fix [path] [options]
 - Backup discarded after successful full resolution
 - Dry-run mode does not write manifests
 
-**CI note:** non-TTY environments skip interactive prompts. Use `fix --apply` (or `--yolo`) explicitly — `fix` alone in CI only prints the plan and exits.
+**CI note:** non-TTY environments skip interactive prompts. Use `fix --apply` explicitly — `fix` alone in CI only prints the plan and exits.
 
 ### `update-db`
 

@@ -1,7 +1,6 @@
 import {
   overlayManifestDirectDeps,
   readNpmManifestDirectDeps,
-  yoloSkipPrompts,
   fixLoopBlockedMessage,
 } from "../src/lib/manifest-overlay.ts";
 import { fixLoopStopReason } from "../src/lib/fix-loop.ts";
@@ -74,14 +73,6 @@ describe("readNpmManifestDirectDeps", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  });
-});
-
-describe("yoloSkipPrompts", () => {
-  it("skips prompts on yolo iteration 2+", () => {
-    expect(yoloSkipPrompts(true, 1)).toBe(false);
-    expect(yoloSkipPrompts(true, 2)).toBe(true);
-    expect(yoloSkipPrompts(false, 2)).toBe(false);
   });
 });
 

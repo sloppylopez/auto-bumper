@@ -1,6 +1,6 @@
 /**
  * Overlay manifest direct-dependency versions onto lockfile scan results.
- * Used in fix-loop re-scans so npm/Rust YOLO sees bumped package.json / Cargo.toml.
+ * Used in fix-loop re-scans so npm/Rust apply passes see bumped package.json / Cargo.toml.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -95,11 +95,6 @@ export function overlayManifestDirectDeps(
   });
 
   return { packages: next, overlaid };
-}
-
-/** Skip TTY prompts on YOLO passes after the first iteration. */
-export function yoloSkipPrompts(yolo: boolean, iteration: number): boolean {
-  return yolo && iteration > 1;
 }
 
 export function fixLoopBlockedMessage(opts: {

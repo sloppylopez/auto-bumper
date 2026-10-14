@@ -75,6 +75,17 @@ describe("fixLoopStopReason", () => {
     })).toBe("oscillation");
   });
 
+  it("continues when the count dropped but has not bounced", () => {
+    expect(fixLoopStopReason({
+      ...base,
+      findingCount: 4,
+      findingSig: "a@2:GHSA-1",
+      prevFindingSig: "a@1:GHSA-1|b@1:GHSA-2",
+      findingCountHistory: [10, 4],
+      lastAppliedCount: 1,
+    })).toBeNull();
+  });
+
   it("returns stall when same plan signature repeats", () => {
     expect(fixLoopStopReason({
       ...base,

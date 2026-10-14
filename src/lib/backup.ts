@@ -6,7 +6,7 @@ export function backupPath(filePath: string): string {
 }
 
 /**
- * Snapshot original file once. Later calls keep the first bak so yolo / multi-file
+ * Snapshot original file once. Later calls keep the first bak so later
  * passes can still restore the pre-session content.
  */
 export function backupFile(filePath: string): string {
