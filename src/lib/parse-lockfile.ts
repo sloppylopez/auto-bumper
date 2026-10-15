@@ -1606,7 +1606,7 @@ function gradleDepVersion(
 /** Collect excluded group:module pairs from Groovy and Kotlin exclude syntaxes. */
 function collectGradleExcludes(content: string): Set<string> {
   const excludes = new Set<string>();
-  for (const em of content.matchAll(/exclude\s+group:\s*"([^"]+)",\s*module:\s*"([^"]+)"/g)) {
+  for (const em of content.matchAll(/exclude\s+group:\s*["']([^"']+)[\"'],\s*module:\s*["']([^"']+)["']/g)) {
     excludes.add(em[1].toLowerCase() + ":" + em[2].toLowerCase());
   }
   // Kotlin form: normalize `group = "x", module = "y"` labels away before matching

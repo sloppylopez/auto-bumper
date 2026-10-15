@@ -2,6 +2,14 @@
 
 All notable changes to `@elephantseed/auto-bumper`.
 
+## [Unreleased]
+
+### Added
+- `fix --apply-excludes` (Maven/Gradle): unfixable packages (no fixed version in OSV) are excluded from the dependency graph instead of being left reported — Gradle gets a managed `configurations.all { exclude … }` block, Maven attaches `<exclusion>` to the parent dependency. Exclusions are recorded only when every touched project actually wrote them; a Maven direct dependency cannot be excluded and is reported with manual-removal advice instead
+
+### Fixed
+- Direct-parse of Gradle excludes missed single-quoted `exclude group: '…', module: '…'` (the form gradle-editor writes, and idiomatic Groovy), so already-excluded coordinates were re-detected on every fresh session; both quote styles are now collected
+
 ## [0.0.1] - 2026-10-14
 
 First release under the new name — rebranded from `@elephantseed/auto-depender`, with version numbering restarting at 0.0.1. Ships everything accumulated in the auto-depender lineage (July–October 2026):

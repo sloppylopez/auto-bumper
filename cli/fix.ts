@@ -3,7 +3,7 @@
  * Auto-Bumper Fix — Polyglot auto-remediation for Java, npm, Rust, Python.
  *
  * Usage:
- *   fix [path] [--dry-run] [--apply] [--allow-major] [--allow-renames] [--allow-source-migrations] [--latest] [--offline] [options]
+ *   fix [path] [--dry-run] [--apply] [--allow-major] [--allow-renames] [--allow-source-migrations] [--apply-excludes] [--latest] [--offline] [options]
  *   bun cli/fix.ts [path] [options]   (local dev)
  */
 import fs from "node:fs";
@@ -107,6 +107,7 @@ const dryRun = args.includes("--dry-run");
 const applyFlag = args.includes("--apply");
 const allowMajor = args.includes("--allow-major");
 const allowRenames = args.includes("--allow-renames");
+const applyExcludes = args.includes("--apply-excludes");
 const deprecatedJavaImports = args.includes("--allow-java-imports");
 const allowSourceMigrations = args.includes("--allow-source-migrations") || deprecatedJavaImports;
 if (deprecatedJavaImports) {
@@ -232,6 +233,7 @@ function ask(question: string): Promise<boolean> {
 interface PlanReportOptions {
   applied: AppliedBump[];
   unfixableRemaining: FixCandidate[];
+  excludeFailed?: Set<string>;
   labels: string[];
   skippedMajors: FixCandidate[];
   remainingFindings?: Array<{ packageName: string; installedVersion: string; id: string; aliases: string[] }>;
@@ -317,7 +319,7 @@ function pushSkippedUnresolvable(lines: string[], skippedUnresolvable: AppliedBu
   lines.push("");
 }
 
-function pushUnfixable(lines: string[], unfixable: FixCandidate[], unfixableRemaining: FixCandidate[]): void {
+function pushUnfixable(lines: string[], unfixable: FixCandidate[], unfixableRemaining: FixCandidate[], excludeFailed?: Set<string>): void {
   if (unfixable.length === 0 && unfixableRemaining.length === 0) return;
   const seen = new Set<string>();
   const all: FixCandidate[] = [];
@@ -329,7 +331,11 @@ function pushUnfixable(lines: string[], unfixable: FixCandidate[], unfixableRema
   }
   lines.push(`## Unfixable (${all.length})`, "");
   for (const u of all) {
-    lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV (consider --exclude=${u.packageName})`);
+    if (excludeFailed?.has(u.packageName)) {
+      lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV, and it cannot be excluded (likely a direct dependency) — remove it from the manifest manually, or use --exclude=${u.packageName}`);
+    } else {
+      lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV (consider --exclude=${u.packageName}, or re-run with --apply-excludes)`);
+    }
   }
   lines.push("");
 }
@@ -355,7 +361,7 @@ function planMarkdown(plan: FixPlan, opts: PlanReportOptions): string {
   pushSkippedRenames(lines, opts.skippedRenames ?? []);
   pushSkippedMajors(lines, opts.skippedMajors);
   pushSkippedUnresolvable(lines, opts.skippedUnresolvable ?? []);
-  pushUnfixable(lines, plan.unfixable, opts.unfixableRemaining);
+  pushUnfixable(lines, plan.unfixable, opts.unfixableRemaining, opts.excludeFailed);
   pushRemainingFindings(lines, opts.remainingFindings ?? []);
   return lines.join("\n");
 }
@@ -416,6 +422,33 @@ async function filterByRenameGate(candidates: FixCandidate[]) {
   }
 
   return { approved, skipped };
+}
+
+/** Gate for unfixable packages: exclude them from the dependency graph when approved. Exclusions are only expressible in Maven/Gradle manifests. */
+async function filterByExcludeGate(unfixable: FixCandidate[], projects: ProjectInfo[], preApproved: Set<string>, failed: Set<string>) {
+  const approved: FixCandidate[] = [];
+  if (!projects.some(isMavenLike)) return { approved };
+  const seen = new Set<string>();
+  for (const c of unfixable) {
+    if (c.ecosystem && c.ecosystem !== "maven") continue;
+    if (!c.packageName.includes(":")) continue;
+    if (seen.has(c.packageName)) continue;
+    seen.add(c.packageName);
+    if (failed.has(c.packageName)) continue;
+    if (dryRun) continue;
+    if (applyExcludes || preApproved.has(c.packageName)) {
+      approved.push(c);
+      continue;
+    }
+    if (isTTY) {
+      const ok = await ask(
+        `Exclude ${c.packageName}@${c.installedVersion} from the dependency graph (no fix version exists)? It is removed at runtime — verify no code path needs it. [y/N] `,
+      );
+      if (ok) approved.push(c);
+    }
+  }
+
+  return { approved };
 }
 
 async function filterBySourceGate(
@@ -872,6 +905,8 @@ interface FixLoopContext {
   allSkippedRenames: FixCandidate[];
   allSkippedUnresolvable: AppliedBump[];
   sessionUnresolvable: Set<string>;
+  approvedExcludeCoords: Set<string>;
+  excludeFailedCoords: Set<string>;
   lastUnfixable: FixCandidate[];
   lastHealthWarnings: string[];
   iteration: number;
@@ -922,10 +957,11 @@ function overlayScanResult(
   findings: Finding[],
   advisories: AdvisoryEntry[],
   projectRoot: string,
+  extraExcludes: string[] = [],
 ): { packages: PackageRef[]; findings: Finding[]; overlaid: string[] } {
   const overlay = overlayManifestDirectDeps(packages, projectRoot);
   if (overlay.overlaid.length === 0) return { packages, findings, overlaid: [] };
-  const excluded = new Set(excludeArgs);
+  const excluded = new Set([...excludeArgs, ...extraExcludes]);
   const rematched = matchVulnerabilities(overlay.packages, advisories)
     .filter(f => !excluded.has(f.packageName));
   return { packages: overlay.packages, findings: rematched, overlaid: overlay.overlaid };
@@ -942,7 +978,7 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
       spinnerPrefix: maxIterations > 1 ? `Pass ${ctx.iteration}/${maxIterations}` : undefined,
       gradleConfigurations: GRADLE_ALL_CONFIGURATIONS,
       offline: offlineFlag,
-      excludePackages: excludeArgs,
+      excludePackages: [...excludeArgs, ...ctx.approvedExcludeCoords],
     });
     result.findings.push(...scan.findings);
     result.warnings.push(...scan.warnings);
@@ -956,7 +992,7 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
   for (const u of result.unresolved) ctx.sessionUnresolvable.add(u);
 
   if (ctx.iteration > 1) {
-    const overlay = overlayScanResult(result.packages, result.findings, result.advisories, ctx.resolvedTarget);
+    const overlay = overlayScanResult(result.packages, result.findings, result.advisories, ctx.resolvedTarget, [...ctx.approvedExcludeCoords]);
     result.packages = overlay.packages;
     result.findings = overlay.findings;
     if (overlay.overlaid.length > 0) console.log(`  ${MANIFEST_OVERLAY_WARNING}`);
@@ -973,13 +1009,15 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
 
 /** Report a clean run and exit (all findings fixed, rolled-back fixes, or nothing to do). */
 function reportCleanExit(ctx: FixLoopContext): never {
+  // Successfully excluded packages are reported in the Applied section — do not re-list them as unfixable.
+  const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   if (outputFormat === "json") {
     console.log(JSON.stringify({ status: "clean", applied: ctx.allApplied, skippedMajors: ctx.allSkippedMajors, skippedUnresolvable: ctx.allSkippedUnresolvable }, null, 2));
   } else if (ctx.allSkippedUnresolvable.length > 0) {
-    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
+    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
     console.log(`Remaining issues: ${ctx.allSkippedUnresolvable.length} fix(es) rolled back — target version not resolvable from project repositories.`);
   } else if (ctx.allApplied.length > 0) {
-    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings }));
+    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings }));
     console.log("All vulnerabilities fixed.");
   } else {
     console.log("No vulnerabilities found.");
@@ -998,6 +1036,7 @@ interface PassPlan {
   skippedRenames: FixCandidate[];
   effectiveApproved: FixCandidate[];
   effectiveRenames: FixCandidate[];
+  effectiveExcludes: FixCandidate[];
   policy: RenameApplyPolicy;
 }
 
@@ -1045,6 +1084,8 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
   for (const w of healthWarnings) console.log(`  ! ${w}`);
   ctx.lastHealthWarnings = healthWarnings;
   ctx.lastUnfixable = plan.unfixable;
+  // Approved here; promoted to approvedExcludeCoords only after runApplyPass verifies every touched project wrote the exclusion.
+  const { approved: effectiveExcludes } = await filterByExcludeGate(plan.unfixable, ctx.projects, ctx.approvedExcludeCoords, ctx.excludeFailedCoords);
 
   const { approved, skipped } = await filterByMajorGate(plan.fixable);
   ctx.allSkippedMajors.push(...skipped);
@@ -1061,7 +1102,7 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
   }
   effectiveApproved = await dropUnpublishedTargets(effectiveApproved, ctx.projects, scan.findings);
   const policy = applyPolicyForRenames(effectiveRenames.map(r => ({ fromPackage: r.packageName, toPackage: r.renameTo ?? "" })));
-  return { plan, approved, skippedMajors: skipped, approvedRenames, skippedRenames, effectiveApproved, effectiveRenames, policy };
+  return { plan, approved, skippedMajors: skipped, approvedRenames, skippedRenames, effectiveApproved, effectiveRenames, effectiveExcludes, policy };
 }
 
 /** Nothing left to apply this pass: report and exit, or stop the loop when gates blocked real work. Returns true when the caller must break. */
@@ -1077,14 +1118,15 @@ function handleNothingApproved(ctx: FixLoopContext, pass: PassPlan, findingCount
   }
   const showPlan = dryRun && (pass.plan.fixable.length > 0 || pass.plan.renames.length > 0);
   if (showPlan) {
-    console.log(planMarkdown(pass.plan, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: sourceMigrationsForAppliedRenames(renamesForSourceMigrations(pass.plan.renames)) }));
+    console.log(planMarkdown(pass.plan, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: sourceMigrationsForAppliedRenames(renamesForSourceMigrations(pass.plan.renames)), excludeFailed: ctx.excludeFailedCoords }));
     process.exit(0);
   }
-  console.log(planMarkdown({ ...pass.plan, fixable: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
+  console.log(planMarkdown({ ...pass.plan, fixable: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords }));
   console.log("Nothing to apply.");
   if (pass.skippedMajors.length > 0) console.log(`  - ${pass.skippedMajors.length} major bump(s) skipped — approve at prompt, or use --allow-major`);
   if (pass.skippedRenames.length > 0) console.log(`  - ${pass.skippedRenames.length} rename(s) skipped — approve at prompt, or use --allow-renames`);
-  if (pass.plan.unfixable.length > 0) console.log(`  - ${pass.plan.unfixable.length} package(s) have no OSV fix version — use --exclude=group:artifact to ignore`);
+  if (pass.plan.unfixable.length > 0) console.log(`  - ${pass.plan.unfixable.length} package(s) have no OSV fix version — use --exclude=group:artifact to ignore, or re-run with --apply-excludes to exclude them from the dependency graph`);
+  if (applyExcludes && pass.plan.unfixable.length > 0 && !ctx.projects.some(isMavenLike)) console.log("  - exclusions need a Maven/Gradle manifest — nothing to apply");
   process.exit(dryRun || !strictExit ? 0 : 1);
 }
 
@@ -1131,6 +1173,7 @@ interface ApplyBatch {
   renames: RenameRequest[];
   effectiveApproved: FixCandidate[];
   effectiveRenames: FixCandidate[];
+  effectiveExcludes: FixCandidate[];
   excludes: Array<{ packageName: string }>;
   findings: Finding[];
 }
@@ -1146,9 +1189,10 @@ function buildApplyBatch(pass: PassPlan, findings: Finding[]): ApplyBatch {
   const renames = mapRenames(pass.effectiveRenames);
   const excludes = [
     ...excludeArgs.map(coord => ({ packageName: coord })),
+    ...pass.effectiveExcludes.filter(c => !excludeArgs.includes(c.packageName)).map(c => ({ packageName: c.packageName })),
     ...(pass.policy.excludeOldCoordinates ? pass.effectiveRenames.map(r => ({ packageName: r.packageName })) : []),
   ];
-  return { bumps, renames, effectiveApproved: pass.effectiveApproved, effectiveRenames: pass.effectiveRenames, excludes, findings };
+  return { bumps, renames, effectiveApproved: pass.effectiveApproved, effectiveRenames: pass.effectiveRenames, effectiveExcludes: pass.effectiveExcludes, excludes, findings };
 }
 
 function isRootJavaProject(project: ProjectInfo): boolean {
@@ -1188,7 +1232,7 @@ function bumpsForProject(project: ProjectInfo, batch: ApplyBatch): BumpRequest[]
   });
 }
 
-interface ProjectApplyOutcome { direct: number; constrained: number; fileChanges: number; renamed: boolean }
+interface ProjectApplyOutcome { direct: number; constrained: number; fileChanges: number; renamed: boolean; excludedWritten: string[] }
 
 /** Record one applied bump by method classification and update the outcome counters. */
 function recordBumpOutcome(outcome: ProjectApplyOutcome, method: "direct" | "constrained", c: FixCandidate, ctx: FixLoopContext, project: ProjectInfo): void {
@@ -1224,7 +1268,8 @@ function recordRenameOutcome(outcome: ProjectApplyOutcome, method: "direct" | "c
 /** Apply this project's share of approved bumps and record outcomes by method. */
 function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome): void {
   const projectBumps = bumpsForProject(project, batch);
-  if (projectBumps.length === 0) return;
+  const hasExcludes = isMavenLike(project) && batch.excludes.length > 0;
+  if (projectBumps.length === 0 && !hasExcludes) return;
   const applyResult = applyManifestBumps(project, projectBumps, batch.excludes);
   for (const w of applyResult.warnings) console.log(`  [${project.label}] ${w}`);
   // Record applied bumps by method classification (direct + constrained are both written to disk)
@@ -1232,6 +1277,11 @@ function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoop
     const method = bumpApplyMethod(applyResult, c.packageName);
     if (method === "direct" || method === "constrained") recordBumpOutcome(outcome, method, c, ctx, project);
   }
+  // Exclusions: report which were actually written to this manifest; runApplyPass aggregates across projects before recording.
+  for (const c of batch.effectiveExcludes) {
+    if (applyResult.missed.includes(c.packageName)) outcome.excludedWritten.push(c.packageName);
+  }
+  if (projectBumps.length === 0 && outcome.excludedWritten.length > 0) outcome.fileChanges++;
 }
 
 /** Apply this project's share of approved renames and record outcomes by method. */
@@ -1249,7 +1299,7 @@ function applyProjectRenames(project: ProjectInfo, batch: ApplyBatch, ctx: FixLo
 
 /** Apply this project's share of the batch and record applied entries. */
 function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext): ProjectApplyOutcome {
-  const outcome: ProjectApplyOutcome = { direct: 0, constrained: 0, fileChanges: 0, renamed: false };
+  const outcome: ProjectApplyOutcome = { direct: 0, constrained: 0, fileChanges: 0, renamed: false, excludedWritten: [] };
   applyProjectBumps(project, batch, ctx, outcome);
   applyProjectRenames(project, batch, ctx, outcome);
   return outcome;
@@ -1280,6 +1330,7 @@ interface ApplyPassOutcome { passFileChanges: number; totalDirect: number; total
 /** Transactional apply for one pass: backup touched manifests, apply per project (+ source migrations), restore on failure. */
 function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean): ApplyPassOutcome {
   const outcome: ApplyPassOutcome = { passFileChanges: 0, totalDirect: 0, totalConstrained: 0 };
+  const perOutcomes: ProjectApplyOutcome[] = [];
   let renamesAppliedThisPass = false;
   const applySpinner = defaultSpinnerFactory(
     maxIterations > 1 ? `Pass ${ctx.iteration}/${maxIterations} · Applying fixes...` : "Applying fixes...",
@@ -1293,6 +1344,7 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
       apply: () => {
         for (const project of projectsToTouch) {
           const per = applyProjectFixes(project, batch, ctx);
+          perOutcomes.push(per);
           outcome.passFileChanges += per.fileChanges;
           outcome.totalDirect += per.direct;
           outcome.totalConstrained += per.constrained;
@@ -1310,10 +1362,23 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
     applySpinner.fail("Apply failed — restoring backups.");
     throw applyErr;
   }
+  // An exclusion only counts when every touched project wrote it (Maven cannot exclude a direct dependency).
+  for (const c of batch.effectiveExcludes) {
+    const failedProjects = projectsToTouch.filter((_, i) => !perOutcomes[i]?.excludedWritten.includes(c.packageName));
+    if (failedProjects.length === 0) {
+      ctx.approvedExcludeCoords.add(c.packageName);
+      recordApplied(ctx.allApplied, ctx.appliedKeys, { packageName: c.packageName, from: c.installedVersion, to: "excluded", method: "direct", findingIds: c.findingIds });
+    } else {
+      ctx.excludeFailedCoords.add(c.packageName);
+      console.log(`  ⚠️ could not exclude ${c.packageName} in ${failedProjects.map(p => p.label).join(", ")} — likely a direct dependency, which Maven cannot exclude. Remove it from the manifest manually, or use --exclude=${c.packageName}`);
+    }
+  }
   applySpinner.succeed(
     outcome.passFileChanges > 0
       ? `Applied ${outcome.passFileChanges} file change(s): ${outcome.totalDirect} direct, ${outcome.totalConstrained} constrained.`
-      : `No file changes needed (plan already satisfied).`,
+      : batch.effectiveExcludes.length > 0 && ctx.excludeFailedCoords.size > 0
+        ? "No file changes — approved exclusions could not be written (see warnings)."
+        : `No file changes needed (plan already satisfied).`,
   );
   return outcome;
 }
@@ -1323,16 +1388,16 @@ async function reportOrConfirmApply(ctx: FixLoopContext, pass: PassPlan, planned
   if (dryRun || (!applyFlag && !isTTY)) {
     console.log(planMarkdown(
       { ...pass.plan, fixable: dryRun ? pass.plan.fixable : pass.approved, renames: dryRun ? pass.plan.renames : pass.approvedRenames },
-      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: dryRun ? [] : ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource && !allowSourceMigrations },
+      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: dryRun ? [] : ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource && !allowSourceMigrations, excludeFailed: ctx.excludeFailedCoords },
     ));
     process.exit(0);
   }
   if (!applyFlag && isTTY && ctx.iteration === 1) {
     console.log(planMarkdown(
       { ...pass.plan, fixable: pass.approved, renames: pass.approvedRenames },
-      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource },
+      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource, excludeFailed: ctx.excludeFailedCoords },
     ));
-    const total = pass.approved.length + pass.approvedRenames.length;
+    const total = pass.approved.length + pass.approvedRenames.length + pass.effectiveExcludes.length;
     const proceed = await ask(`Apply ${total} change(s)? [y/N] `);
     if (!proceed) process.exit(1);
   }
@@ -1352,7 +1417,7 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
       spinnerPrefix: "Final check",
       gradleConfigurations: GRADLE_ALL_CONFIGURATIONS,
       offline: offlineFlag,
-      excludePackages: excludeArgs,
+      excludePackages: [...excludeArgs, ...ctx.approvedExcludeCoords],
     });
     findings.push(...result.findings);
     packages.push(...result.packages);
@@ -1361,7 +1426,7 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
       if (!unresolved.includes(u)) unresolved.push(u);
     }
   }
-  const overlay = overlayScanResult(packages, findings, advisories, ctx.resolvedTarget);
+  const overlay = overlayScanResult(packages, findings, advisories, ctx.resolvedTarget, [...ctx.approvedExcludeCoords]);
   if (overlay.overlaid.length > 0) console.log(`  ${MANIFEST_OVERLAY_WARNING}`);
   return { findings: overlay.findings, packages: overlay.packages, unresolved };
 }
@@ -1369,9 +1434,11 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
 /** Final report after the fix loop; always exits. */
 function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   const reportApplied = dedupeApplied(ctx.allApplied);
+  // Successfully excluded packages are reported in the Applied section — do not re-list them as unfixable.
+  const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   console.log(planMarkdown(
-    { fixable: [], unfixable: ctx.lastUnfixable, renames: [] },
-    { applied: reportApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: finalFindings.map(f => ({ packageName: f.packageName, installedVersion: f.installedVersion, id: f.id, aliases: f.aliases })), skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable },
+    { fixable: [], unfixable: unfixableShown, renames: [] },
+    { applied: reportApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: finalFindings.map(f => ({ packageName: f.packageName, installedVersion: f.installedVersion, id: f.id, aliases: f.aliases })), skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords },
   ));
   if (finalFindings.length === 0 && ctx.allSkippedUnresolvable.length === 0) {
     console.log(reportApplied.length > 0 ? "All vulnerabilities fixed." : "No vulnerabilities found.");
@@ -1409,6 +1476,8 @@ async function main() {
     allSkippedRenames: [],
     allSkippedUnresolvable: [],
     sessionUnresolvable: new Set<string>(),
+    approvedExcludeCoords: new Set<string>(),
+    excludeFailedCoords: new Set<string>(),
     lastUnfixable: [],
     lastHealthWarnings: [],
     iteration: 0,
@@ -1431,7 +1500,7 @@ async function main() {
     if (loopStopped(ctx, scan.findings.length, currentSig, true)) break;
 
     const pass = await buildPassPlan(ctx, scan, latestCandidates);
-    if (pass.effectiveApproved.length === 0 && pass.effectiveRenames.length === 0 && handleNothingApproved(ctx, pass, scan.findings.length)) break;
+    if (pass.effectiveApproved.length === 0 && pass.effectiveRenames.length === 0 && pass.effectiveExcludes.length === 0 && handleNothingApproved(ctx, pass, scan.findings.length)) break;
 
     const currentPlanSig = planSignature(pass.effectiveApproved, pass.effectiveRenames);
     if (loopStopped(ctx, scan.findings.length, currentSig, false, currentPlanSig, ctx.prevPlanSig)) break;
@@ -1441,7 +1510,7 @@ async function main() {
     const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0);
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
-    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0);
+    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)));
     const applied = runApplyPass(ctx, projectsToTouch, batch, applySource);
     ctx.lastAppliedCount = applied.passFileChanges;
     ctx.prevPlanSig = currentPlanSig;

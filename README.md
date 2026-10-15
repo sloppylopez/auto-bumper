@@ -79,6 +79,7 @@
 │        │                                                            │
 │        ▼                                                            │
 │  Gates: major (--allow-major) | rename (--allow-renames)            │
+│      unfixable --> --apply-excludes (Maven/Gradle)                  │
 │  --apply: re-scan until clean or stalled (default cap 10)           │
 │    dry-run shows plan; TTY prompts; CI skips risky                  │
 │        │                                                            │
@@ -86,7 +87,7 @@
 │  MANIFEST EDITORS                                                   │
 │    gradle-editor / pom-editor / npm-editor                          │
 │    cargo-editor / python-editor                                     │
-│    backup .auto-bumper-bak before edit                               │
+│    backup .auto-bumper-bak before edit                              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -170,6 +171,8 @@ bun run security:fix -- . --dry-run
 ```
 
 `fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain; add `--strict` to exit 1.
+
+**Unfixable packages** (no fixed version in OSV) are reported, never bumped. Add `--apply-excludes` (Maven/Gradle only) to have the tool exclude them from the dependency graph instead — Gradle gets a managed `configurations.all { exclude … }` block; Maven attaches `<exclusion>` to the parent dependency. An exclusion counts only when every touched project actually wrote it: a Maven *direct* dependency cannot be excluded and is reported with manual-removal advice instead of a false success.
 
 **npm / Rust:** re-scans overlay direct deps from `package.json` / `Cargo.toml` onto the lockfile tree so bump loops progress without `npm install`. Transitive-only fixes still need a lock refresh after.
 
@@ -314,6 +317,7 @@ fix [path] [options]
 | `--max-iterations=N` | `10` | Safety cap on apply re-scan loops |
 | `--strict` | false | Exit `1` when vulnerabilities remain after the run |
 | `--exclude=group:pkg` | *(none)* | Packages to skip (repeatable) |
+| `--apply-excludes` | false | Maven/Gradle only — exclude unfixable packages (no fixed version) from the dependency graph: Gradle gets a managed `configurations.all { exclude … }` block, Maven attaches `<exclusion>` to the parent dependency. Recorded only when every touched project wrote it; a Maven direct dependency cannot be excluded and is reported instead |
 | `--offline` | false | No network access during re-scans |
 | `--format=markdown\|json` | `markdown` | Output format |
 

@@ -58,6 +58,22 @@ export const BRIDGE_PRODUCTS: BridgeProduct[] = [
       return ["com.github.java-json-tools:jackson-coreutils"];
     },
   },
+  {
+    id: "java-json-tools-json-patch",
+    mavenNamePrefixes: ["com.github.java-json-tools:json-patch"],
+    cpeProducts: [],
+    repos: [
+      "https://github.com/java-json-tools/json-patch",
+      "http://github.com/java-json-tools/json-patch",
+      "git://github.com/java-json-tools/json-patch",
+      "https://github.com/java-json-tools/json-patch.git",
+    ],
+    advisoryIdSources: [],
+    knownCveIds: ["CVE-2026-86318", "CVE-2026-86319", "CVE-2026-86512"],
+    resolvePackages() {
+      return ["com.github.java-json-tools:json-patch"];
+    },
+  },
 ];
 
 type OsvAffected = {
