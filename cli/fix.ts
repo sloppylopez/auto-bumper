@@ -95,6 +95,7 @@ import {
   MANIFEST_OVERLAY_WARNING,
   fixLoopBlockedMessage,
 } from "../src/lib/manifest-overlay.ts";
+import { lockRefreshCommands, refreshProjectLocks } from "../src/lib/lockfile-refresh.ts";
 import { renameNeedsSourceMigration } from "../src/lib/rename-source-gate.ts";
 
 const args = process.argv.slice(2);
@@ -914,6 +915,8 @@ interface FixLoopContext {
   prevPlanSig: string | null;
   lastAppliedCount: number;
   findingCountHistory: number[];
+  /** True when a manifest moved but the lockfile was not rewritten. Later scans must trust the lock. */
+  lockUnsynced: boolean;
 }
 
 /** Example manifest names for the "no projects found" error (per ecosystem filter). */
@@ -991,11 +994,13 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
   // Remember every coordinate the build could not resolve — never re-apply a fix targeting it.
   for (const u of result.unresolved) ctx.sessionUnresolvable.add(u);
 
-  if (ctx.iteration > 1) {
+  if (ctx.iteration > 1 && !ctx.lockUnsynced) {
     const overlay = overlayScanResult(result.packages, result.findings, result.advisories, ctx.resolvedTarget, [...ctx.approvedExcludeCoords]);
     result.packages = overlay.packages;
     result.findings = overlay.findings;
     if (overlay.overlaid.length > 0) console.log(`  ${MANIFEST_OVERLAY_WARNING}`);
+  } else if (ctx.iteration > 1 && ctx.lockUnsynced) {
+    console.log("  Lockfile was not updated. Scan uses the lockfile, not the manifest.");
   }
 
   for (const w of Array.from(new Set(result.warnings))) console.log(`  ${w}`);
@@ -1426,9 +1431,32 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
       if (!unresolved.includes(u)) unresolved.push(u);
     }
   }
+  if (ctx.lockUnsynced) {
+    console.log("  Lockfile was not updated. Final check uses the lockfile, not the manifest.");
+    return { findings, packages, unresolved };
+  }
   const overlay = overlayScanResult(packages, findings, advisories, ctx.resolvedTarget, [...ctx.approvedExcludeCoords]);
   if (overlay.overlaid.length > 0) console.log(`  ${MANIFEST_OVERLAY_WARNING}`);
   return { findings: overlay.findings, packages: overlay.packages, unresolved };
+}
+
+/** After a manifest edit, rewrite npm/Cargo/Poetry lockfiles so the next scan sees the new pins. */
+function refreshLocksAfterApply(ctx: FixLoopContext): void {
+  const planned = lockRefreshCommands(ctx.resolvedTarget);
+  if (planned.length === 0) return;
+  if (offlineFlag) {
+    ctx.lockUnsynced = true;
+    console.log("  Lockfile left unchanged (--offline). It may still pin the vulnerable version.");
+    return;
+  }
+  console.log(`  Updating lockfile (${planned.map(c => c.label).join(", ")})...`);
+  for (const result of refreshProjectLocks(ctx.resolvedTarget)) {
+    if (result.ok) console.log(`  Lockfile updated (${result.label}).`);
+    else {
+      ctx.lockUnsynced = true;
+      console.log(`  Lockfile update failed (${result.label}): ${result.detail}`);
+    }
+  }
 }
 
 /** Final report after the fix loop; always exits. */
@@ -1485,6 +1513,7 @@ async function main() {
     prevPlanSig: null,
     lastAppliedCount: 0,
     findingCountHistory: [],
+    lockUnsynced: false,
   };
 
   while (ctx.iteration < maxIterations) {
@@ -1513,6 +1542,7 @@ async function main() {
     const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)));
     const applied = runApplyPass(ctx, projectsToTouch, batch, applySource);
     ctx.lastAppliedCount = applied.passFileChanges;
+    if (applied.passFileChanges > 0) refreshLocksAfterApply(ctx);
     ctx.prevPlanSig = currentPlanSig;
     ctx.prevFindingSig = currentSig;
   }
