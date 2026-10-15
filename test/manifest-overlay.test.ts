@@ -53,6 +53,69 @@ describe("overlayManifestDirectDeps", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("overlays optional, peer, and npm override versions", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-npm-ov-"));
+    fs.writeFileSync(path.join(dir, "package-lock.json"), "{}\n");
+    fs.writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({
+        optionalDependencies: { debug: "4.3.4" },
+        peerDependencies: { react: "18.3.1" },
+        overrides: { minimist: "1.2.8" },
+      }),
+    );
+    try {
+      const packages = [
+        { ecosystem: "npm", name: "debug", version: "4.3.0", manifestPath: "package-lock.json" },
+        { ecosystem: "npm", name: "react", version: "18.2.0", manifestPath: "package-lock.json" },
+        { ecosystem: "npm", name: "minimist", version: "1.2.5", manifestPath: "package-lock.json" },
+      ];
+      const result = overlayManifestDirectDeps(packages, dir);
+      expect(result.packages.map(p => p.version)).toEqual(["4.3.4", "18.3.1", "1.2.8"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("overlays yarn resolutions and pnpm overrides from the matching lockfile", () => {
+    const yarnDir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-yarn-"));
+    const pnpmDir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-pnpm-"));
+    fs.writeFileSync(path.join(yarnDir, "yarn.lock"), "");
+    fs.writeFileSync(path.join(yarnDir, "package.json"), JSON.stringify({ resolutions: { lodash: "4.17.21" } }));
+    fs.writeFileSync(path.join(pnpmDir, "pnpm-lock.yaml"), "");
+    fs.writeFileSync(path.join(pnpmDir, "package.json"), JSON.stringify({ pnpm: { overrides: { lodash: "4.17.21" } } }));
+    try {
+      const locked = [{ ecosystem: "npm", name: "lodash", version: "4.17.20", manifestPath: "lock" }];
+      expect(overlayManifestDirectDeps(locked, yarnDir).packages[0].version).toBe("4.17.21");
+      expect(overlayManifestDirectDeps(locked, pnpmDir).packages[0].version).toBe("4.17.21");
+    } finally {
+      fs.rmSync(yarnDir, { recursive: true, force: true });
+      fs.rmSync(pnpmDir, { recursive: true, force: true });
+    }
+  });
+
+  it("overlays poetry.lock and requirements.txt direct versions", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-py-"));
+    fs.writeFileSync(
+      path.join(dir, "pyproject.toml"),
+      "[tool.poetry.dependencies]\npython = \"^3.11\"\nrequests = \">=2.32.0\"\n",
+    );
+    fs.writeFileSync(path.join(dir, "requirements.txt"), "typing_extensions==4.12.2\nflask<=2.0.0\n");
+    try {
+      const packages = [
+        { ecosystem: "pypi", name: "requests", version: "2.31.0", manifestPath: "poetry.lock" },
+        { ecosystem: "pypi", name: "typing-extensions", version: "4.9.0", manifestPath: "poetry.lock" },
+        { ecosystem: "pypi", name: "flask", version: "1.9.0", manifestPath: "poetry.lock" },
+      ];
+      const result = overlayManifestDirectDeps(packages, dir);
+      expect(result.packages[0].version).toBe("2.32.0");
+      expect(result.packages[1].version).toBe("4.12.2");
+      expect(result.packages[2].version).toBe("1.9.0");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("readNpmManifestDirectDeps", () => {

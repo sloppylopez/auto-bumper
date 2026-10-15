@@ -2,7 +2,7 @@
  * Detect package renames from OSV for npm, PyPI, and crates.io.
  */
 import type { AdvisoryEntry, Finding } from "./types.ts";
-import { compareMavenVersion } from "./matcher.ts";
+import { comparePackageVersion } from "./matcher.ts";
 
 export type RenameEcosystem = "npm" | "pypi" | "crates.io";
 
@@ -20,7 +20,7 @@ function isVersionLike(value: string): boolean {
   return /^\d/.test(v) && !/^[0-9a-f]{8,}$/i.test(v);
 }
 
-function fixedVersionsForAffected(affected: AdvisoryEntry["affected"][number]): string[] {
+function fixedVersionsForAffected(affected: AdvisoryEntry["affected"][number], ecosystem: string): string[] {
   const fixed = new Set<string>();
   for (const r of affected.ranges || []) {
     const range = r as {
@@ -34,12 +34,12 @@ function fixedVersionsForAffected(affected: AdvisoryEntry["affected"][number]): 
       if (ev.fixed && isVersionLike(String(ev.fixed))) fixed.add(String(ev.fixed));
     }
   }
-  return [...fixed].sort((a, b) => compareMavenVersion(a, b));
+  return [...fixed].sort((a, b) => comparePackageVersion(a, b, ecosystem));
 }
 
-function pickRenameTarget(installed: string, fixes: string[]): string | null {
+function pickRenameTarget(installed: string, fixes: string[], ecosystem: string): string | null {
   if (fixes.length === 0) return null;
-  const eligible = fixes.filter(v => compareMavenVersion(v, installed) >= 0);
+  const eligible = fixes.filter(v => comparePackageVersion(v, installed, ecosystem) >= 0);
   if (eligible.length > 0) return eligible[0];
   return fixes.at(-1) ?? null;
 }
@@ -55,7 +55,7 @@ function sameMajorInPlaceFix(finding: Finding): boolean {
   const installedMajor = Number.parseInt(finding.installedVersion.split(".")[0] || "0", 10);
   return (finding.fixedVersions || []).some(v => {
     const fixMajor = Number.parseInt(String(v).split(".")[0] || "0", 10);
-    return compareMavenVersion(v, finding.installedVersion) > 0 && fixMajor === installedMajor;
+    return comparePackageVersion(v, finding.installedVersion, finding.ecosystem) > 0 && fixMajor === installedMajor;
   });
 }
 
@@ -74,8 +74,8 @@ function renameOptionsFromAdvisory(
     const advEco = (affected.package?.ecosystem || "").toLowerCase();
     if (advEco !== ecoLabel && advEco !== ecosystem) continue;
 
-    const fixes = fixedVersionsForAffected(affected);
-    const target = pickRenameTarget(finding.installedVersion, fixes);
+    const fixes = fixedVersionsForAffected(affected, ecosystem);
+    const target = pickRenameTarget(finding.installedVersion, fixes, ecosystem);
     if (target) options.push({ toPackage: name, targetVersion: target });
   }
 
@@ -137,7 +137,7 @@ function collectCandidates(
   for (const advisory of advisoriesForFinding(finding, advisories)) {
     for (const opt of renameOptionsFromAdvisory(finding, advisory, ecosystem)) {
       const prev = candidates.get(opt.toPackage);
-      if (!prev || compareMavenVersion(opt.targetVersion, prev) > 0) {
+      if (!prev || comparePackageVersion(opt.targetVersion, prev, ecosystem) > 0) {
         candidates.set(opt.toPackage, opt.targetVersion);
       }
     }

@@ -17,7 +17,7 @@ import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
 import { findLatestAvailableVersion, findNextAvailableVersion, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
-import { compareMavenVersion } from "../src/lib/matcher.ts";
+import { compareMavenVersion, matchVulnerabilities } from "../src/lib/matcher.ts";
 import {
   applyBumps as applyGradleBumps,
   applyRenames as applyGradleRenames,
@@ -169,12 +169,27 @@ function findProjects(dir: string, filter?: string | null): ProjectInfo[] {
     projects.push({ kind: "crates.io", manifestPath: cargoToml, label: "Rust" });
   }
 
-  // Python
+  // Python — edit every manifest that can declare the pin. A tooling-only
+  // pyproject.toml must not hide requirements.txt, and Poetry needs both.
   const reqTxt = path.join(resolved, "requirements.txt");
   const pyproject = path.join(resolved, "pyproject.toml");
-  if ((fs.existsSync(reqTxt) || fs.existsSync(pyproject)) && (!filter || filter === "pypi")) {
-    const manifest = fs.existsSync(pyproject) ? pyproject : reqTxt;
-    projects.push({ kind: "pypi", manifestPath: manifest, label: "Python" });
+  if (!filter || filter === "pypi") {
+    const hasReq = fs.existsSync(reqTxt);
+    const hasPy = fs.existsSync(pyproject);
+    if (hasReq) {
+      projects.push({
+        kind: "pypi",
+        manifestPath: reqTxt,
+        label: hasPy ? "Python (requirements.txt)" : "Python",
+      });
+    }
+    if (hasPy) {
+      projects.push({
+        kind: "pypi",
+        manifestPath: pyproject,
+        label: hasReq ? "Python (pyproject.toml)" : "Python",
+      });
+    }
   }
 
   const pom = path.join(resolved, "pom.xml");
@@ -887,6 +902,24 @@ interface ScanPassResult {
   unresolved: string[];
 }
 
+/**
+ * Replace lockfile versions with manifest pins, then re-match so a bump is not
+ * still reported only because the lockfile was not regenerated.
+ */
+function overlayScanResult(
+  packages: PackageRef[],
+  findings: Finding[],
+  advisories: AdvisoryEntry[],
+  projectRoot: string,
+): { packages: PackageRef[]; findings: Finding[]; overlaid: string[] } {
+  const overlay = overlayManifestDirectDeps(packages, projectRoot);
+  if (overlay.overlaid.length === 0) return { packages, findings, overlaid: [] };
+  const excluded = new Set(excludeArgs);
+  const rematched = matchVulnerabilities(overlay.packages, advisories)
+    .filter(f => !excluded.has(f.packageName));
+  return { packages: overlay.packages, findings: rematched, overlaid: overlay.overlaid };
+}
+
 /** One scan pass over every project ecosystem, plus per-pass bookkeeping (unresolved set, manifest overlay, warning log). */
 async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
   const result: ScanPassResult = { findings: [], warnings: [], advisories: [], packages: [], unresolved: [] };
@@ -912,8 +945,9 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
   for (const u of result.unresolved) ctx.sessionUnresolvable.add(u);
 
   if (ctx.iteration > 1) {
-    const overlay = overlayManifestDirectDeps(result.packages, ctx.resolvedTarget);
+    const overlay = overlayScanResult(result.packages, result.findings, result.advisories, ctx.resolvedTarget);
     result.packages = overlay.packages;
+    result.findings = overlay.findings;
     if (overlay.overlaid.length > 0) console.log(`  ${MANIFEST_OVERLAY_WARNING}`);
   }
 
@@ -1240,6 +1274,7 @@ async function reportOrConfirmApply(ctx: FixLoopContext, pass: PassPlan, planned
 async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[]; packages: PackageRef[]; unresolved: string[] }> {
   const findings: Finding[] = [];
   const packages: PackageRef[] = [];
+  const advisories: AdvisoryEntry[] = [];
   const unresolved: string[] = [];
   for (const eco of ctx.ecoFilters) {
     const result = await runAutoBumperScan(ctx.resolvedTarget, {
@@ -1253,11 +1288,14 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
     });
     findings.push(...result.findings);
     packages.push(...result.packages);
+    advisories.push(...result.advisories);
     for (const u of result.unresolved ?? []) {
       if (!unresolved.includes(u)) unresolved.push(u);
     }
   }
-  return { findings, packages, unresolved };
+  const overlay = overlayScanResult(packages, findings, advisories, ctx.resolvedTarget);
+  if (overlay.overlaid.length > 0) console.log(`  ${MANIFEST_OVERLAY_WARNING}`);
+  return { findings: overlay.findings, packages: overlay.packages, unresolved };
 }
 
 /** Final report after the fix loop; always exits. */

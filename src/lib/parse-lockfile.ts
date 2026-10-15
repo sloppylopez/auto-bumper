@@ -613,9 +613,9 @@ export function parseCargoLock(lockfilePath: string): ParseResult {
  *   flask>=2.0
  *   numpy
  *
- * Only lines with == constraints are parsed (we need an exact version
- * to match against OSV advisories). Lines without a pinned version
- * are skipped silently.
+ * Exact pins (==, ===) and floors (>=, >, ~=) are recorded. The floor
+ * token is the version we can raise. Ceilings (<, <=) and exclusions
+ * (!=) are not an installed version and are skipped.
  */
 export function parseRequirementsTxt(filePath: string): ParseResult {
   const warnings: string[] = [];
@@ -639,8 +639,10 @@ export function parseRequirementsTxt(filePath: string): ParseResult {
     const commentIdx = line.indexOf("#");
     if (commentIdx > 0) line = line.slice(0, commentIdx).trim();
 
-    const spec = /^(\w[\w.-]*)(?:\[[^\]]+\])?\s*(==|>=|<=|~=|!=|>|<)\s*([^,\s#]+)/.exec(line);
+    const spec = /^(\w[\w.-]*)(?:\[[^\]]+\])?\s*(===|==|>=|<=|~=|!=|>|<)\s*([^,\s#]+)/.exec(line);
     if (!spec) continue;
+    const op = spec[2];
+    if (op === "!=" || op === "<" || op === "<=") continue;
     const version = spec[3].replace(/[*,]/g, "");
     if (!/^\d/.test(version)) continue;
     packages.push({

@@ -14,7 +14,7 @@ import {
   matchesSemverRange,
   matchVulnerabilities,
 } from "../src/lib/matcher.ts";
-import { dedupeResolvedPackages, parseLockfile, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { dedupeResolvedPackages, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
 import { assertNoZipSlip, zipEntryNames } from "../src/lib/osv-export.ts";
 import { extractNextLink } from "../src/lib/github-repo-advisories.ts";
 import { isInsideDir } from "../src/path.ts";
@@ -48,6 +48,38 @@ describe("npm version rewrite", () => {
       expect(result.missed).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("turns an upper bound into a floor and writes yarn or pnpm pins", () => {
+    const dir = tempDir();
+    const file = path.join(dir, "package.json");
+    fs.writeFileSync(path.join(dir, "yarn.lock"), "");
+    fs.writeFileSync(file, JSON.stringify({ dependencies: { leftpad: "<=1.0.0" } }));
+    try {
+      applyNpmBumps(file, [
+        { packageName: "leftpad", targetVersion: "1.1.0", because: [] },
+        { packageName: "minimist", targetVersion: "1.2.8", because: [] },
+      ]);
+      const pkg = JSON.parse(fs.readFileSync(file, "utf-8"));
+      expect(pkg.dependencies.leftpad).toBe(">=1.1.0");
+      expect(pkg.resolutions.minimist).toBe("1.2.8");
+      expect(pkg.overrides).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    const pnpmDir = tempDir();
+    const pnpmFile = path.join(pnpmDir, "package.json");
+    fs.writeFileSync(path.join(pnpmDir, "pnpm-lock.yaml"), "");
+    fs.writeFileSync(pnpmFile, JSON.stringify({ dependencies: {} }));
+    try {
+      applyNpmBumps(pnpmFile, [{ packageName: "minimist", targetVersion: "1.2.8", because: [] }]);
+      const pkg = JSON.parse(fs.readFileSync(pnpmFile, "utf-8"));
+      expect(pkg.pnpm.overrides.minimist).toBe("1.2.8");
+      expect(pkg.overrides).toBeUndefined();
+    } finally {
+      fs.rmSync(pnpmDir, { recursive: true, force: true });
     }
   });
 
@@ -114,6 +146,35 @@ describe("python manifest rewrite", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("turns <= and < into a floor that includes the fix", () => {
+    const dir = tempDir();
+    const req = path.join(dir, "requirements.txt");
+    const py = path.join(dir, "pyproject.toml");
+    fs.writeFileSync(req, "requests<=2.31.0\nflask<2.32.0\n");
+    fs.writeFileSync(py, "[project]\ndependencies = [\n  \"numpy<=1.26.0\",\n  \"click<8.1.0\",\n]\n\n[tool.poetry.dependencies]\nhttpx = \"<0.27.0\"\n");
+    try {
+      applyToRequirementsTxt(req, [
+        { packageName: "requests", targetVersion: "2.32.0", because: [] },
+        { packageName: "flask", targetVersion: "2.32.0", because: [] },
+      ]);
+      applyToPyprojectToml(py, [
+        { packageName: "numpy", targetVersion: "1.26.4", because: [] },
+        { packageName: "click", targetVersion: "8.1.7", because: [] },
+        { packageName: "httpx", targetVersion: "0.27.0", because: [] },
+      ]);
+      const reqText = fs.readFileSync(req, "utf-8");
+      const pyText = fs.readFileSync(py, "utf-8");
+      expect(reqText).toContain("requests>=2.32.0");
+      expect(reqText).toContain("flask>=2.32.0");
+      expect(reqText).not.toContain("<");
+      expect(pyText).toContain("numpy>=1.26.4");
+      expect(pyText).toContain("click>=8.1.7");
+      expect(pyText).toContain("httpx = \">=0.27.0\"");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("cargo rewrite", () => {
@@ -135,6 +196,24 @@ describe("cargo rewrite", () => {
     }
   });
 
+  it("turns an upper bound into a floor that includes the fix", () => {
+    const dir = tempDir();
+    const file = path.join(dir, "Cargo.toml");
+    fs.writeFileSync(file, "[dependencies]\ntokio = \"<1.40.0\"\nserde = \"<=1.0.200\"\n");
+    try {
+      applyCargoBumps(file, [
+        { packageName: "tokio", targetVersion: "1.40.0", because: [] },
+        { packageName: "serde", targetVersion: "1.0.210", because: [] },
+      ]);
+      const text = fs.readFileSync(file, "utf-8");
+      expect(text).toContain("tokio = \">=1.40.0\"");
+      expect(text).toContain("serde = \">=1.0.210\"");
+      expect(text).not.toContain("<");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rename writes the target version", () => {
     const dir = tempDir();
     const file = path.join(dir, "Cargo.toml");
@@ -149,6 +228,26 @@ describe("cargo rewrite", () => {
       const text = fs.readFileSync(file, "utf-8");
       expect(text).toContain("new_crate = \"2.0.0\"");
       expect(text).not.toContain("old_crate");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("requirements.txt installed versions", () => {
+  it("records exact pins and floors, and skips ceilings and exclusions", () => {
+    const dir = tempDir();
+    const file = path.join(dir, "requirements.txt");
+    fs.writeFileSync(file, "requests==2.31.0\nclick===8.1.7\nflask>=2.0.0\nnumpy<=1.26.0\nhttpx<0.27.0\nwerkzeug!=2.2.0\n");
+    try {
+      const parsed = parseRequirementsTxt(file);
+      const byName = new Map(parsed.packages.map(p => [p.name, p.version]));
+      expect(byName.get("requests")).toBe("2.31.0");
+      expect(byName.get("click")).toBe("8.1.7");
+      expect(byName.get("flask")).toBe("2.0.0");
+      expect(byName.has("numpy")).toBe(false);
+      expect(byName.has("httpx")).toBe(false);
+      expect(byName.has("werkzeug")).toBe(false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
