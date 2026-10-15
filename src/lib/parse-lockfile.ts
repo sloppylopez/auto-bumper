@@ -269,10 +269,12 @@ const NESTED_SKIP_DIRS = new Set([
   ".git", ".gradle", ".idea", ".auto-bumper",
 ]);
 
-/** Java manifests below the scan root. The root pom and build files are parsed by the caller. */
-export function listNestedJavaManifests(root: string): Array<{ kind: "maven" | "gradle"; filePath: string }> {
+export type NestedManifestKind = "maven" | "gradle" | "npm" | "crates.io" | "pypi";
+
+/** Manifests below the scan root. Root files are parsed by the caller. */
+export function listNestedManifests(root: string): Array<{ kind: NestedManifestKind; filePath: string }> {
   const rootResolved = path.resolve(root);
-  const found: Array<{ kind: "maven" | "gradle"; filePath: string }> = [];
+  const found: Array<{ kind: NestedManifestKind; filePath: string }> = [];
   walk(rootResolved);
   return found;
 
@@ -288,6 +290,10 @@ export function listNestedJavaManifests(root: string): Array<{ kind: "maven" | "
       if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
       if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
       else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
+      if (names.has("package.json")) found.push({ kind: "npm", filePath: path.join(dir, "package.json") });
+      if (names.has("Cargo.toml")) found.push({ kind: "crates.io", filePath: path.join(dir, "Cargo.toml") });
+      if (names.has("pyproject.toml")) found.push({ kind: "pypi", filePath: path.join(dir, "pyproject.toml") });
+      if (names.has("requirements.txt")) found.push({ kind: "pypi", filePath: path.join(dir, "requirements.txt") });
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || NESTED_SKIP_DIRS.has(entry.name)) continue;
@@ -296,18 +302,45 @@ export function listNestedJavaManifests(root: string): Array<{ kind: "maven" | "
   }
 }
 
-function appendNestedJavaManifests(
+/** Java manifests below the scan root. The root pom and build files are parsed by the caller. */
+export function listNestedJavaManifests(root: string): Array<{ kind: "maven" | "gradle"; filePath: string }> {
+  return listNestedManifests(root).filter((m): m is { kind: "maven" | "gradle"; filePath: string } =>
+    m.kind === "maven" || m.kind === "gradle",
+  );
+}
+
+function parseNestedManifest(manifest: { kind: NestedManifestKind; filePath: string }): ParseResult {
+  switch (manifest.kind) {
+    case "maven":
+      return parsePomXmlDirect(manifest.filePath);
+    case "gradle":
+      return parseBuildGradleDirect(manifest.filePath);
+    case "npm":
+      return parsePackageJsonManifest(manifest.filePath);
+    case "crates.io":
+      return parseCargoManifest(manifest.filePath);
+    case "pypi":
+      return manifest.filePath.endsWith("requirements.txt")
+        ? parseRequirementsTxt(manifest.filePath)
+        : parsePyprojectManifest(manifest.filePath);
+  }
+}
+
+function appendNestedManifests(
   root: string,
   allPackages: PackageRef[],
   warnings: string[],
   allUnresolved: string[] | null,
 ): boolean {
   let found = false;
-  for (const manifest of listNestedJavaManifests(root)) {
-    const result = manifest.kind === "maven"
-      ? parsePomXmlDirect(manifest.filePath)
-      : parseBuildGradleDirect(manifest.filePath);
-    if (result.packages.length === 0 && result.warnings.length === 0) continue;
+  for (const manifest of listNestedManifests(root)) {
+    const result = parseNestedManifest(manifest);
+    const java = manifest.kind === "maven" || manifest.kind === "gradle";
+    if (java) {
+      if (result.packages.length === 0 && result.warnings.length === 0) continue;
+    } else if (result.packages.length === 0) {
+      continue;
+    }
     found = true;
     mergeParseResult(result, allPackages, warnings, allUnresolved);
   }
@@ -339,7 +372,7 @@ export function parseLockfile(dirPath: string): ParseResult {
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
-  if (appendNestedJavaManifests(resolvedDir, allPackages, warnings, null)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, null)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -1495,7 +1528,7 @@ export async function parseLockfileAsync(
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
-  if (appendNestedJavaManifests(resolvedDir, allPackages, warnings, allUnresolved)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, allUnresolved)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(

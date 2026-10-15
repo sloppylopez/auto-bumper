@@ -14,7 +14,7 @@ import {
   matchesSemverRange,
   matchVulnerabilities,
 } from "../src/lib/matcher.ts";
-import { dedupeResolvedPackages, listNestedJavaManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { dedupeResolvedPackages, listNestedJavaManifests, listNestedManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
 import { assertNoZipSlip, zipEntryNames } from "../src/lib/osv-export.ts";
 import { extractNextLink } from "../src/lib/github-repo-advisories.ts";
 import { isInsideDir } from "../src/path.ts";
@@ -55,14 +55,16 @@ describe("npm version rewrite", () => {
     const dir = tempDir();
     const file = path.join(dir, "package.json");
     fs.writeFileSync(path.join(dir, "yarn.lock"), "");
-    fs.writeFileSync(file, JSON.stringify({ dependencies: { leftpad: "<=1.0.0" } }));
+    fs.writeFileSync(file, JSON.stringify({ dependencies: { leftpad: "<=1.0.0", once: ">1.0.0" } }));
     try {
       applyNpmBumps(file, [
         { packageName: "leftpad", targetVersion: "1.1.0", because: [] },
+        { packageName: "once", targetVersion: "1.4.0", because: [] },
         { packageName: "minimist", targetVersion: "1.2.8", because: [] },
       ]);
       const pkg = JSON.parse(fs.readFileSync(file, "utf-8"));
       expect(pkg.dependencies.leftpad).toBe(">=1.1.0");
+      expect(pkg.dependencies.once).toBe(">=1.4.0");
       expect(pkg.resolutions.minimist).toBe("1.2.8");
       expect(pkg.overrides).toBeUndefined();
     } finally {
@@ -151,12 +153,13 @@ describe("python manifest rewrite", () => {
     const dir = tempDir();
     const req = path.join(dir, "requirements.txt");
     const py = path.join(dir, "pyproject.toml");
-    fs.writeFileSync(req, "requests<=2.31.0\nflask<2.32.0\n");
+    fs.writeFileSync(req, "requests<=2.31.0\nflask<2.32.0\nurllib3>1.26.0\n");
     fs.writeFileSync(py, "[project]\ndependencies = [\n  \"numpy<=1.26.0\",\n  \"click<8.1.0\",\n]\n\n[tool.poetry.dependencies]\nhttpx = \"<0.27.0\"\n");
     try {
       applyToRequirementsTxt(req, [
         { packageName: "requests", targetVersion: "2.32.0", because: [] },
         { packageName: "flask", targetVersion: "2.32.0", because: [] },
+        { packageName: "urllib3", targetVersion: "2.2.2", because: [] },
       ]);
       applyToPyprojectToml(py, [
         { packageName: "numpy", targetVersion: "1.26.4", because: [] },
@@ -167,6 +170,7 @@ describe("python manifest rewrite", () => {
       const pyText = fs.readFileSync(py, "utf-8");
       expect(reqText).toContain("requests>=2.32.0");
       expect(reqText).toContain("flask>=2.32.0");
+      expect(reqText).toContain("urllib3>=2.2.2");
       expect(reqText).not.toContain("<");
       expect(pyText).toContain("numpy>=1.26.4");
       expect(pyText).toContain("click>=8.1.7");
@@ -199,16 +203,18 @@ describe("cargo rewrite", () => {
   it("turns an upper bound into a floor that includes the fix", () => {
     const dir = tempDir();
     const file = path.join(dir, "Cargo.toml");
-    fs.writeFileSync(file, "[dependencies]\ntokio = \"<1.40.0\"\nserde = \"<=1.0.200\"\n");
+    fs.writeFileSync(file, "[dependencies]\ntokio = \"<1.40.0\"\nserde = \"<=1.0.200\"\nbytes = \">1.0.0\"\n");
     try {
       applyCargoBumps(file, [
         { packageName: "tokio", targetVersion: "1.40.0", because: [] },
         { packageName: "serde", targetVersion: "1.0.210", because: [] },
+        { packageName: "bytes", targetVersion: "1.7.0", because: [] },
       ]);
       const text = fs.readFileSync(file, "utf-8");
       expect(text).toContain("tokio = \">=1.40.0\"");
       expect(text).toContain("serde = \">=1.0.210\"");
-      expect(text).not.toContain("<");
+      expect(text).toContain("bytes = \">=1.7.0\"");
+      expect(text).not.toContain("\"<");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -234,7 +240,7 @@ describe("cargo rewrite", () => {
   });
 });
 
-describe("nested Java manifests", () => {
+describe("nested manifests", () => {
   it("finds a module pom and skips build output and dependencies", () => {
     const dir = tempDir();
     fs.mkdirSync(path.join(dir, "module"), { recursive: true });
@@ -247,6 +253,32 @@ describe("nested Java manifests", () => {
     try {
       const found = listNestedJavaManifests(dir).map(m => path.basename(path.dirname(m.filePath)));
       expect(found).toEqual(["module"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("finds nested package.json, Cargo.toml, and pyproject.toml", () => {
+    const dir = tempDir();
+    fs.mkdirSync(path.join(dir, "packages", "web"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "crates", "core"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "services", "api"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "node_modules", "lib"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "package.json"), "{}");
+    fs.writeFileSync(path.join(dir, "packages", "web", "package.json"), "{\"dependencies\":{\"leftpad\":\"1.0.0\"}}");
+    fs.writeFileSync(path.join(dir, "crates", "core", "Cargo.toml"), "[dependencies]\ntokio = \"1.0.0\"\n");
+    fs.writeFileSync(path.join(dir, "services", "api", "pyproject.toml"), "[project]\ndependencies = [\"flask>=2.0.0\"]\n");
+    fs.writeFileSync(path.join(dir, "node_modules", "lib", "package.json"), "{}");
+    try {
+      const found = listNestedManifests(dir).map(m => path.relative(dir, m.filePath).replaceAll("\\", "/")).sort();
+      expect(found).toEqual([
+        "crates/core/Cargo.toml",
+        "packages/web/package.json",
+        "services/api/pyproject.toml",
+      ]);
+      const parsed = parseLockfile(dir);
+      const names = parsed.packages.map(p => p.name).sort();
+      expect(names).toEqual(["flask", "leftpad", "tokio"]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

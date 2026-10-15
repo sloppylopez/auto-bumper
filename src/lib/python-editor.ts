@@ -64,9 +64,9 @@ function normalizeName(name: string): string {
 
 const REQ_LINE = /^(\s*)(\w[\w.-]*)(\[[^\]]+\])?(\s*)(===|==|>=|<=|~=|!=|>|<)(\s*)([^\s#,]+)/;
 
-/** Upper bounds still allow the vulnerable release. A fix must be a floor that includes it. */
+/** Upper bounds still allow or exclude the vulnerable release. A fix must be a floor that includes it. */
 function bumpOperator(op: string): string {
-  if (op === "<" || op === "<=") return ">=";
+  if (op === "<" || op === "<=" || op === ">") return ">=";
   return op;
 }
 

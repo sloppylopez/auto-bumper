@@ -119,7 +119,7 @@ describe("applyBumps (Maven pom.xml)", () => {
     });
   });
 
-  it("falls back to a pin when the version property is not defined in the pom", () => {
+  it("defines a parent property locally so the pin is not ignored", () => {
     const pom = basePom.replace(
       "    </dependencies>\n</project>",
       `        <dependency>
@@ -134,10 +134,31 @@ describe("applyBumps (Maven pom.xml)", () => {
       const result = applyBumps(filePath, [
         { packageName: "org.example:parent-managed", targetVersion: "9.9.9", because: ["GHSA-test"] },
       ]);
-      expect(result.constrained).toContain("org.example:parent-managed");
+      expect(result.direct).toContain("org.example:parent-managed");
+      expect(result.constrained).toHaveLength(0);
       const after = readPom(filePath);
-      const markerRegion = after.split(POM_MARKER_BEGIN)[1]?.split(POM_MARKER_END)[0] ?? "";
-      expect(versionOf(markerRegion, "org.example", "parent-managed")).toBe("9.9.9");
+      expect(after).toContain("<parent.managed.version>9.9.9</parent.managed.version>");
+      expect(after).not.toContain(POM_MARKER_BEGIN);
+    });
+  });
+
+  it("writes an explicit version on a direct dependency that a BOM managed", () => {
+    const pom = basePom.replace(
+      "    </dependencies>\n</project>",
+      `        <dependency>
+            <groupId>org.example</groupId>
+            <artifactId>bom-managed</artifactId>
+        </dependency>
+    </dependencies>
+</project>`,
+    );
+    withTempPom(pom, filePath => {
+      const result = applyBumps(filePath, [
+        { packageName: "org.example:bom-managed", targetVersion: "2.0.0", because: ["GHSA-test"] },
+      ]);
+      expect(result.direct).toContain("org.example:bom-managed");
+      const after = readPom(filePath);
+      expect(versionOf(after, "org.example", "bom-managed")).toBe("2.0.0");
     });
   });
 
@@ -163,14 +184,13 @@ ${POM_MARKER_END}
     });
   });
 
-  it("pins BOM-managed dependencies that declare no version", () => {
+  it("writes an explicit version on a BOM-managed direct dependency", () => {
     withTempPom(basePom, filePath => {
       const result = applyBumps(filePath, [
         { packageName: "io.quarkus:quarkus-arc", targetVersion: "3.36.3", because: ["GHSA-test"] },
       ]);
-      expect(result.constrained).toContain("io.quarkus:quarkus-arc");
+      expect(result.direct).toContain("io.quarkus:quarkus-arc");
       const after = readPom(filePath);
-      expect(after).toContain(POM_MARKER_BEGIN);
       expect(versionOf(after, "io.quarkus", "quarkus-arc")).toBe("3.36.3");
     });
   });

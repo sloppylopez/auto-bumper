@@ -95,7 +95,7 @@ function versionWithSameOp(currentVer: string, target: string): string | null {
   const opMatch = /^([=^~><]+)?(\d.*)$/.exec(currentVer);
   if (!opMatch) return null;
   const op = opMatch[1] ?? "";
-  const nextOp = op === "<" || op === "<=" ? ">=" : op;
+  const nextOp = op === "<" || op === "<=" || op === ">" ? ">=" : op;
   return `${nextOp}${target}`;
 }
 

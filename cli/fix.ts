@@ -11,7 +11,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
-import { GRADLE_ALL_CONFIGURATIONS, listNestedJavaManifests, parseBuildGradleDirect, parsePomXmlDirect } from "../src/lib/parse-lockfile.ts";
+import { GRADLE_ALL_CONFIGURATIONS, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect } from "../src/lib/parse-lockfile.ts";
 import { buildFixPlan, majorOf, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
@@ -206,14 +206,21 @@ function findProjects(dir: string, filter?: string | null): ProjectInfo[] {
     projects.push({ kind: "gradle", manifestPath: gradleKts, label: "Gradle" });
   }
 
-  for (const manifest of listNestedJavaManifests(resolved)) {
-    if (manifest.kind === "maven" && filter && filter !== "maven") continue;
-    if (manifest.kind === "gradle" && filter && filter !== "gradle") continue;
+  const nestedLabel: Record<string, string> = {
+    maven: "Maven",
+    gradle: "Gradle",
+    npm: "npm",
+    "crates.io": "Rust",
+    pypi: "Python",
+  };
+  for (const manifest of listNestedManifests(resolved)) {
+    const ecoFilter = manifest.kind === "crates.io" ? "crates.io" : manifest.kind === "pypi" ? "pypi" : manifest.kind;
+    if (filter && filter !== ecoFilter) continue;
     const rel = path.relative(resolved, manifest.filePath).replaceAll("\\", "/");
     projects.push({
       kind: manifest.kind,
       manifestPath: manifest.filePath,
-      label: `${manifest.kind === "maven" ? "Maven" : "Gradle"} (${rel})`,
+      label: `${nestedLabel[manifest.kind] ?? manifest.kind} (${rel})`,
     });
   }
 
@@ -707,7 +714,9 @@ function renamesForProject(
   const eco = projectEcosystemForKind(project.kind);
   return renames.filter(r => {
     const findingEco = findings.find(f => f.packageName === r.fromPackage)?.ecosystem;
-    return findingEco === eco;
+    if (findingEco !== eco) return false;
+    if (isRootProject(project)) return true;
+    return projectDeclaresPackage(project, r.fromPackage);
   });
 }
 
@@ -1200,11 +1209,44 @@ function buildApplyBatch(pass: PassPlan, findings: Finding[]): ApplyBatch {
   return { bumps, renames, effectiveApproved: pass.effectiveApproved, effectiveRenames: pass.effectiveRenames, effectiveExcludes: pass.effectiveExcludes, excludes, findings };
 }
 
-function isRootJavaProject(project: ProjectInfo): boolean {
+function isRootProject(project: ProjectInfo): boolean {
   const dir = path.dirname(project.manifestPath);
   return !sessionProjects.some(other =>
     other.kind === project.kind && path.dirname(other.manifestPath).length < dir.length,
   );
+}
+
+function projectDeclaresPackage(project: ProjectInfo, packageName: string): boolean {
+  if (project.kind === "maven" || project.kind === "gradle") return projectDeclaresCoord(project, packageName);
+  let text: string;
+  try {
+    text = fs.readFileSync(project.manifestPath, "utf-8");
+  } catch {
+    return false;
+  }
+  if (project.kind === "npm") {
+    try {
+      const data = JSON.parse(text) as Record<string, unknown>;
+      for (const section of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+        const deps = data[section];
+        if (deps && typeof deps === "object" && packageName in (deps as Record<string, unknown>)) return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+  if (project.kind === "crates.io") {
+    const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^\\s*${escaped}\\s*=`, "m").test(text);
+  }
+  const norm = packageName.toLowerCase().replace(/[_\s]+/g, "-");
+  return text.split(/\r?\n/).some(line => {
+    const quoted = /["']([A-Za-z0-9_.-]+)/.exec(line);
+    const plain = /^\s*([A-Za-z0-9_.-]+)\s*(===|==|>=|<=|~=|!=|>|<|=)/.exec(line);
+    const name = (quoted?.[1] ?? plain?.[1] ?? "").toLowerCase().replace(/[_\s]+/g, "-");
+    return name === norm;
+  });
 }
 
 function projectDeclaresCoord(project: ProjectInfo, coord: string): boolean {
@@ -1230,10 +1272,12 @@ function bumpsForProject(project: ProjectInfo, batch: ApplyBatch): BumpRequest[]
     const pkgEco = b.ecosystem ?? batch.findings.find(f => f.packageName === b.packageName)?.ecosystem;
     if (project.kind === "maven" || project.kind === "gradle") {
       if (pkgEco !== "maven") return false;
-      if (isRootJavaProject(project)) return true;
+      if (isRootProject(project)) return true;
       return projectDeclaresCoord(project, b.packageName);
     }
-    return pkgEco === project.kind;
+    if (pkgEco !== project.kind) return false;
+    if (isRootProject(project)) return true;
+    return projectDeclaresPackage(project, b.packageName);
   });
 }
 
@@ -1441,20 +1485,26 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
 }
 
 /** After a manifest edit, rewrite npm/Cargo/Poetry lockfiles so the next scan sees the new pins. */
-function refreshLocksAfterApply(ctx: FixLoopContext): void {
-  const planned = lockRefreshCommands(ctx.resolvedTarget);
-  if (planned.length === 0) return;
-  if (offlineFlag) {
-    ctx.lockUnsynced = true;
-    console.log("  Lockfile left unchanged (--offline). It may still pin the vulnerable version.");
-    return;
-  }
-  console.log(`  Updating lockfile (${planned.map(c => c.label).join(", ")})...`);
-  for (const result of refreshProjectLocks(ctx.resolvedTarget)) {
-    if (result.ok) console.log(`  Lockfile updated (${result.label}).`);
-    else {
+function refreshLocksAfterApply(ctx: FixLoopContext, dirs: string[]): void {
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    const resolved = path.resolve(dir);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    const planned = lockRefreshCommands(resolved);
+    if (planned.length === 0) continue;
+    if (offlineFlag) {
       ctx.lockUnsynced = true;
-      console.log(`  Lockfile update failed (${result.label}): ${result.detail}`);
+      console.log(`  Lockfile left unchanged (--offline) in ${resolved}. It may still pin the vulnerable version.`);
+      continue;
+    }
+    console.log(`  Updating lockfile (${planned.map(c => c.label).join(", ")})...`);
+    for (const result of refreshProjectLocks(resolved)) {
+      if (result.ok) console.log(`  Lockfile updated (${result.label}).`);
+      else {
+        ctx.lockUnsynced = true;
+        console.log(`  Lockfile update failed (${result.label}): ${result.detail}`);
+      }
     }
   }
 }
@@ -1542,7 +1592,9 @@ async function main() {
     const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)));
     const applied = runApplyPass(ctx, projectsToTouch, batch, applySource);
     ctx.lastAppliedCount = applied.passFileChanges;
-    if (applied.passFileChanges > 0) refreshLocksAfterApply(ctx);
+    if (applied.passFileChanges > 0) {
+      refreshLocksAfterApply(ctx, projectsToTouch.map(p => path.dirname(p.manifestPath)));
+    }
     ctx.prevPlanSig = currentPlanSig;
     ctx.prevFindingSig = currentSig;
   }

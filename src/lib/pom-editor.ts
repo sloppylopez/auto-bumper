@@ -4,7 +4,7 @@
  * Direct dependencies are rewritten in place. Transitive dependencies get
  * explicit pins inside an auto-bumper managed block (idempotent on re-runs).
  *
- * v1 limitations: no property/BOM inheritance resolution. Exclusions are attached to direct dependencies.
+ * A parent property is copied into this pom so it wins. A versionless direct dependency gets an explicit version so a BOM cannot keep the old pin. Exclusions are attached to direct dependencies.
  */
 import fs from "node:fs";
 import {
@@ -88,6 +88,24 @@ function pickEffectiveBlock(blocks: DepBlock[], group: string, artifact: string)
   return matches.find(b => !b.managed) ?? matches[0];
 }
 
+/** Write a version property in this pom. A local property overrides the same name from a parent. */
+function defineLocalProperty(content: string, propName: string, version: string): string {
+  const propRe = new RegExp(`(<${escapeRegex(propName)}>)([^<]+)(</${escapeRegex(propName)}>)`);
+  if (propRe.test(content)) {
+    return content.replace(propRe, (_m, pre, _old, post) => `${pre}${version}${post}`);
+  }
+  const entry = `        <${propName}>${version}</${propName}>`;
+  const props = /<properties>\s*/.exec(content);
+  if (props) {
+    const idx = props.index + props[0].length;
+    return `${content.slice(0, idx)}${entry}\n${content.slice(idx)}`;
+  }
+  const projectOpen = /<project\b[^>]*>/.exec(content);
+  if (!projectOpen) return content;
+  const idx = projectOpen.index + projectOpen[0].length;
+  return `${content.slice(0, idx)}\n    <properties>\n${entry}\n    </properties>${content.slice(idx)}`;
+}
+
 function rewriteDirect(
   content: string,
   bump: BumpRequest,
@@ -100,20 +118,31 @@ function rewriteDirect(
   }
 
   const effective = pickEffectiveBlock(findDepBlocks(content), group, artifact);
-  if (effective?.version == null) return { content, changed: false };
+  if (!effective) return { content, changed: false };
+
+  if (effective.version == null) {
+    if (effective.managed) return { content, changed: false };
+    const block = content.slice(effective.start, effective.end);
+    const injected = block.replace(
+      /<\/dependency>\s*$/,
+      `  <version>${bump.targetVersion}</version>\n</dependency>`,
+    );
+    content = content.slice(0, effective.start) + injected + content.slice(effective.end);
+    return { content, changed: true };
+  }
 
   if (/\$\{/.test(effective.version)) {
     const propName = effective.version.replace(/^\$\{|\}$/g, "");
-    const propRe = new RegExp(`(<${escapeRegex(propName)}>)([^<]+)(</${escapeRegex(propName)}>)`);
-    if (!propRe.test(content)) {
-      warnings.push(
-        `${bump.packageName}: version property \${${propName}} not found in <properties> — falling back to pin`,
-      );
+    if (!/^[\w.-]+$/.test(propName)) {
+      warnings.push(`${bump.packageName}: version property \${${propName}} is not a local name — falling back to pin`);
       return { content, changed: false };
     }
-    content = content.replace(propRe, (_m, pre, _old, post) => `${pre}${bump.targetVersion}${post}`);
+    const hadProperty = new RegExp(`<${escapeRegex(propName)}>`).test(content);
+    content = defineLocalProperty(content, propName, bump.targetVersion);
     warnings.push(
-      `${bump.packageName}: bumped via property \${${propName}} — other deps using it move too`,
+      hadProperty
+        ? `${bump.packageName}: bumped via property \${${propName}} — other deps using it move too`
+        : `${bump.packageName}: defined \${${propName}} in this pom so it overrides the parent — other deps using it move too`,
     );
     return { content, changed: true };
   }
@@ -295,7 +324,6 @@ function rewriteRename(
 function groupSharedPropertyBumps(
   bumps: BumpRequest[],
   blocks: DepBlock[],
-  content: string,
 ): Map<string, BumpRequest[]> {
   const byProperty = new Map<string, BumpRequest[]>();
   for (const bump of bumps) {
@@ -304,8 +332,7 @@ function groupSharedPropertyBumps(
     const effective = pickEffectiveBlock(blocks, group, artifact);
     if (!effective?.version || !/^\$\{[^}]+\}$/.test(effective.version)) continue;
     const propName = effective.version.slice(2, -1);
-    const propRe = new RegExp(`(<${escapeRegex(propName)}>)([^<]+)(</${escapeRegex(propName)}>)`);
-    if (!propRe.test(content)) continue;
+    if (!/^[\w.-]+$/.test(propName)) continue;
     byProperty.set(propName, [...(byProperty.get(propName) ?? []), bump]);
   }
   return byProperty;
@@ -314,12 +341,6 @@ function groupSharedPropertyBumps(
 /** Highest Maven version among the given targets. */
 function highestMavenTarget(targets: string[]): string {
   return targets.reduce((max, v) => (compareMavenVersion(v, max) > 0 ? v : max), targets[0]);
-}
-
-/** Rewrite one <prop>...</prop> value in place. */
-function rewriteSharedProperty(content: string, propName: string, targetVersion: string): string {
-  const propRe = new RegExp(`(<${escapeRegex(propName)}>)([^<]+)(</${escapeRegex(propName)}>)`);
-  return content.replace(propRe, (_m, pre, _old, post) => `${pre}${targetVersion}${post}`);
 }
 
 /** Rewrite one shared version property to its highest target; no-op when targets conflict across groups. */
@@ -339,10 +360,13 @@ function applySharedPropertyRewrite(
   const maxTarget = highestMavenTarget(groupBumps.map(b => b.targetVersion));
   for (const b of groupBumps) result.direct.push(b.packageName);
   const others = groupBumps.length > 1 ? ` (+${groupBumps.length - 1} shared)` : "";
+  const hadProperty = new RegExp(`<${escapeRegex(propName)}>`).test(content);
   result.warnings.push(
-    `${groupBumps[0].packageName}: bumped via property \${${propName}} to ${maxTarget}${others} — other deps using it move too`,
+    hadProperty
+      ? `${groupBumps[0].packageName}: bumped via property \${${propName}} to ${maxTarget}${others} — other deps using it move too`
+      : `${groupBumps[0].packageName}: defined \${${propName}} in this pom so it overrides the parent — other deps using it move too`,
   );
-  return rewriteSharedProperty(content, propName, maxTarget);
+  return defineLocalProperty(content, propName, maxTarget);
 }
 
 function dependencyManagementSpans(content: string): Array<[number, number]> {
@@ -448,7 +472,7 @@ export function applyBumps(
   // Rewrite each shared property once to the highest target so no later bump
   // regresses an earlier one. Grouping is restricted to a single groupId —
   // over-bumping across vendors could select a nonexistent version.
-  const byProperty = groupSharedPropertyBumps(bumps, blocks, content);
+  const byProperty = groupSharedPropertyBumps(bumps, blocks);
 
   for (const [propName, groupBumps] of byProperty) {
     content = applySharedPropertyRewrite(content, propName, groupBumps, result);

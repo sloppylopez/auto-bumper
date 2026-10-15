@@ -200,9 +200,9 @@ function semverOperator(spec: string): string {
   return m ? m[1] : "";
 }
 
-/** `<` / `<=` still admit the vulnerable release. A fix is a floor that includes the target. */
+/** `<`, `<=`, and `>` still admit or exclude the fix. A fix is a floor that includes the target. */
 function inclusiveFloorOperator(op: string): string {
-  if (op === "<" || op === "<=") return ">=";
+  if (op === "<" || op === "<=" || op === ">") return ">=";
   return op;
 }
 
