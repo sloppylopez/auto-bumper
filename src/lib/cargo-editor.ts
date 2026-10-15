@@ -94,7 +94,9 @@ function tryApplyBump(content: string, name: string, target: string): BumpResult
 function versionWithSameOp(currentVer: string, target: string): string | null {
   const opMatch = /^([=^~><]+)?(\d.*)$/.exec(currentVer);
   if (!opMatch) return null;
-  return `${opMatch[1] ?? ""}${target}`;
+  const op = opMatch[1] ?? "";
+  const nextOp = op === "<" || op === "<=" || op === ">" ? ">=" : op;
+  return `${nextOp}${target}`;
 }
 
 function applyIndexedEdits(content: string, edits: Array<{ start: number; end: number; text: string }>): string {

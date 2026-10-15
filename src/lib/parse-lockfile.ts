@@ -264,6 +264,89 @@ function mergeParseResult(
  * Detect and parse all supported lockfiles in the given directory.
  * Supports npm (package-lock / yarn / pnpm), Rust, Python, Maven, Gradle.
  */
+const NESTED_SKIP_DIRS = new Set([
+  "node_modules", "target", "build", "dist", "out", "vendor",
+  ".git", ".gradle", ".idea", ".auto-bumper",
+]);
+
+export type NestedManifestKind = "maven" | "gradle" | "npm" | "crates.io" | "pypi";
+
+/** Manifests below the scan root. Root files are parsed by the caller. */
+export function listNestedManifests(root: string): Array<{ kind: NestedManifestKind; filePath: string }> {
+  const rootResolved = path.resolve(root);
+  const found: Array<{ kind: NestedManifestKind; filePath: string }> = [];
+  walk(rootResolved);
+  return found;
+
+  function walk(dir: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (dir !== rootResolved) {
+      const names = new Set(entries.filter(entry => entry.isFile()).map(entry => entry.name));
+      if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
+      if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
+      else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
+      if (names.has("package.json")) found.push({ kind: "npm", filePath: path.join(dir, "package.json") });
+      if (names.has("Cargo.toml")) found.push({ kind: "crates.io", filePath: path.join(dir, "Cargo.toml") });
+      if (names.has("pyproject.toml")) found.push({ kind: "pypi", filePath: path.join(dir, "pyproject.toml") });
+      if (names.has("requirements.txt")) found.push({ kind: "pypi", filePath: path.join(dir, "requirements.txt") });
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || NESTED_SKIP_DIRS.has(entry.name)) continue;
+      walk(path.join(dir, entry.name));
+    }
+  }
+}
+
+/** Java manifests below the scan root. The root pom and build files are parsed by the caller. */
+export function listNestedJavaManifests(root: string): Array<{ kind: "maven" | "gradle"; filePath: string }> {
+  return listNestedManifests(root).filter((m): m is { kind: "maven" | "gradle"; filePath: string } =>
+    m.kind === "maven" || m.kind === "gradle",
+  );
+}
+
+function parseNestedManifest(manifest: { kind: NestedManifestKind; filePath: string }): ParseResult {
+  switch (manifest.kind) {
+    case "maven":
+      return parsePomXmlDirect(manifest.filePath);
+    case "gradle":
+      return parseBuildGradleDirect(manifest.filePath);
+    case "npm":
+      return parsePackageJsonManifest(manifest.filePath);
+    case "crates.io":
+      return parseCargoManifest(manifest.filePath);
+    case "pypi":
+      return manifest.filePath.endsWith("requirements.txt")
+        ? parseRequirementsTxt(manifest.filePath)
+        : parsePyprojectManifest(manifest.filePath);
+  }
+}
+
+function appendNestedManifests(
+  root: string,
+  allPackages: PackageRef[],
+  warnings: string[],
+  allUnresolved: string[] | null,
+): boolean {
+  let found = false;
+  for (const manifest of listNestedManifests(root)) {
+    const result = parseNestedManifest(manifest);
+    const java = manifest.kind === "maven" || manifest.kind === "gradle";
+    if (java) {
+      if (result.packages.length === 0 && result.warnings.length === 0) continue;
+    } else if (result.packages.length === 0) {
+      continue;
+    }
+    found = true;
+    mergeParseResult(result, allPackages, warnings, allUnresolved);
+  }
+  return found;
+}
+
 export function parseLockfile(dirPath: string): ParseResult {
   const allPackages: PackageRef[] = [];
   const warnings: string[] = [];
@@ -289,6 +372,7 @@ export function parseLockfile(dirPath: string): ParseResult {
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, null)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -613,9 +697,9 @@ export function parseCargoLock(lockfilePath: string): ParseResult {
  *   flask>=2.0
  *   numpy
  *
- * Only lines with == constraints are parsed (we need an exact version
- * to match against OSV advisories). Lines without a pinned version
- * are skipped silently.
+ * Exact pins (==, ===) and floors (>=, >, ~=) are recorded. The floor
+ * token is the version we can raise. Ceilings (<, <=) and exclusions
+ * (!=) are not an installed version and are skipped.
  */
 export function parseRequirementsTxt(filePath: string): ParseResult {
   const warnings: string[] = [];
@@ -639,8 +723,10 @@ export function parseRequirementsTxt(filePath: string): ParseResult {
     const commentIdx = line.indexOf("#");
     if (commentIdx > 0) line = line.slice(0, commentIdx).trim();
 
-    const spec = /^(\w[\w.-]*)(?:\[[^\]]+\])?\s*(==|>=|<=|~=|!=|>|<)\s*([^,\s#]+)/.exec(line);
+    const spec = /^(\w[\w.-]*)(?:\[[^\]]+\])?\s*(===|==|>=|<=|~=|!=|>|<)\s*([^,\s#]+)/.exec(line);
     if (!spec) continue;
+    const op = spec[2];
+    if (op === "!=" || op === "<" || op === "<=") continue;
     const version = spec[3].replace(/[*,]/g, "");
     if (!/^\d/.test(version)) continue;
     packages.push({
@@ -1442,6 +1528,7 @@ export async function parseLockfileAsync(
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, allUnresolved)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -1552,7 +1639,7 @@ function gradleDepVersion(
 /** Collect excluded group:module pairs from Groovy and Kotlin exclude syntaxes. */
 function collectGradleExcludes(content: string): Set<string> {
   const excludes = new Set<string>();
-  for (const em of content.matchAll(/exclude\s+group:\s*"([^"]+)",\s*module:\s*"([^"]+)"/g)) {
+  for (const em of content.matchAll(/exclude\s+group:\s*["']([^"']+)[\"'],\s*module:\s*["']([^"']+)["']/g)) {
     excludes.add(em[1].toLowerCase() + ":" + em[2].toLowerCase());
   }
   // Kotlin form: normalize `group = "x", module = "y"` labels away before matching

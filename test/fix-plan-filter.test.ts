@@ -65,6 +65,36 @@ describe("filterRedundantFixes", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("keeps an npm prerelease bump that maven order would call already done", () => {
+    const fixable: FixCandidate[] = [{
+      packageName: "left-pad",
+      installedVersion: "2.0.0-1",
+      targetVersion: "2.0.0",
+      isMajor: false,
+      findingIds: ["GHSA-x"],
+      severity: "HIGH",
+      ecosystem: "npm",
+    }];
+    const { fixable: out, skipped } = filterRedundantFixes(fixable, [], []);
+    expect(out).toHaveLength(1);
+    expect(skipped).toEqual([]);
+  });
+
+  it("keeps a pypi post-release bump that maven order would call already done", () => {
+    const fixable: FixCandidate[] = [{
+      packageName: "requests",
+      installedVersion: "1.0",
+      targetVersion: "1.0.post1",
+      isMajor: false,
+      findingIds: ["GHSA-x"],
+      severity: "HIGH",
+      ecosystem: "pypi",
+    }];
+    const { fixable: out, skipped } = filterRedundantFixes(fixable, [], []);
+    expect(out).toHaveLength(1);
+    expect(skipped).toEqual([]);
+  });
 });
 
 describe("planSignature", () => {

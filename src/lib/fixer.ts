@@ -31,6 +31,8 @@ export interface FixCandidate {
   isRename?: boolean;
   /** True for preemptive --latest bumps (no advisory finding behind them). */
   latest?: boolean;
+  /** Inclusive last-affected version when OSV has no fixed version. */
+  lastAffected?: string;
 }
 
 export interface FixPlan {
@@ -174,6 +176,33 @@ function buildCandidate(pkgFindings: Finding[]): FixCandidate {
     findingIds,
     severity,
     ecosystem,
+    lastAffected: highestLastAffected(pkgFindings),
+  };
+}
+
+/** Highest inclusive last-affected bound among findings that have one. */
+function highestLastAffected(findings: Finding[]): string | undefined {
+  let best: string | undefined;
+  const eco = findings[0].ecosystem;
+  for (const finding of findings) {
+    if (!finding.lastAffected) continue;
+    if (!best || cmp(finding.lastAffected, best, eco) > 0) best = finding.lastAffected;
+  }
+  return best;
+}
+
+/**
+ * A published version strictly after `lastAffected` is the fix when OSV has no `fixed` event.
+ * `lastAffected` itself stays vulnerable and is never the target.
+ */
+export function withNextFixVersion(candidate: FixCandidate, nextVersion: string | null): FixCandidate | null {
+  if (candidate.targetVersion || !candidate.lastAffected || !nextVersion) return null;
+  const eco = candidate.ecosystem || "maven";
+  if (cmp(nextVersion, candidate.lastAffected, eco) <= 0) return null;
+  return {
+    ...candidate,
+    targetVersion: nextVersion,
+    isMajor: majorOf(nextVersion) !== majorOf(candidate.installedVersion),
   };
 }
 

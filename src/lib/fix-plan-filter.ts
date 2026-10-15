@@ -2,7 +2,7 @@
  * Drop fix-plan items already satisfied on classpath or in build.gradle.
  */
 import fs from "node:fs";
-import { compareMavenVersion } from "./matcher.ts";
+import { compareMavenVersion, comparePackageVersion } from "./matcher.ts";
 import type { FixCandidate } from "./fixer.ts";
 import type { PackageRef } from "./types.ts";
 import {
@@ -81,7 +81,7 @@ export function filterRedundantFixes(
 
   const outFixable = fixable.filter(f => {
     if (!f.targetVersion) return true;
-    if (compareMavenVersion(f.installedVersion, f.targetVersion) >= 0) {
+    if (comparePackageVersion(f.installedVersion, f.targetVersion, f.ecosystem || "maven") >= 0) {
       skipped.push(`bump ${f.packageName} (already at ${f.installedVersion})`);
       return false;
     }

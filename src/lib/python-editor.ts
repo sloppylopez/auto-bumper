@@ -62,7 +62,13 @@ function normalizeName(name: string): string {
   return name.trim().toLowerCase().replace(/[\s_-]+/g, "-");
 }
 
-const REQ_LINE = /^(\s*)(\w[\w.-]*)(\[[^\]]+\])?(\s*)(==|>=|<=|~=|!=|>|<)(\s*)([^\s#,]+)/;
+const REQ_LINE = /^(\s*)(\w[\w.-]*)(\[[^\]]+\])?(\s*)(===|==|>=|<=|~=|!=|>|<)(\s*)([^\s#,]+)/;
+
+/** Upper bounds still allow or exclude the vulnerable release. A fix must be a floor that includes it. */
+function bumpOperator(op: string): string {
+  if (op === "<" || op === "<=" || op === ">") return ">=";
+  return op;
+}
 
 /**
  * Apply version bumps to a requirements.txt file.
@@ -93,9 +99,10 @@ export function applyToRequirementsTxt(filePath: string, bumps: BumpRequest[], _
         skippedExclusion = true;
         return match;
       }
+      const nextOp = bumpOperator(op);
       bumped.push(`${bump.packageName}: ${version} -> ${target}`);
       replaced = true;
-      return `${indent}${name}${extras || ""}${gap}${op}${opGap}${target}`;
+      return `${indent}${name}${extras || ""}${gap}${nextOp}${opGap}${target}`;
     });
 
     if (skippedExclusion) warnings.push(`${bump.packageName}: left != constraint unchanged`);
@@ -121,7 +128,7 @@ function matchRequirementLine(line: string): { indent: string; name: string; ext
   const pre = /^(\s*"?)(\w[\w.-]*)/.exec(line);
   if (!pre) return null;
   const rest1 = line.slice(pre[0].length);
-  const mid = /^(\[[^\]]+\])?(\s*)(==|>=|<=|~=|!=|>|<)(\s*)/.exec(rest1);
+  const mid = /^(\[[^\]]+\])?(\s*)(===|==|>=|<=|~=|!=|>|<)(\s*)/.exec(rest1);
   if (!mid) return null;
   const rest2 = rest1.slice(mid[0].length);
   const verM = /^([^"<\s,]+)/.exec(rest2);
@@ -145,9 +152,9 @@ function bumpDependencyLine(line: string, section: string, pending: Map<string, 
     if (assign) {
       const bump = pending.get(normalizeName(assign[2]));
       if (!bump) return line;
-      const op = /^(==|>=|<=|~=|!=|>|<|\^|~)/.exec(assign[4]);
+      const op = /^(===|==|>=|<=|~=|!=|>|<|\^|~)/.exec(assign[4]);
       if (op?.[1] === "!=") return line;
-      const prefix = op ? op[1] : "";
+      const prefix = bumpOperator(op ? op[1] : "");
       bumped.push(`${bump.packageName}: -> ${prefix}${bump.targetVersion}`);
       pending.delete(normalizeName(assign[2]));
       return `${assign[1]}${assign[2]}${assign[3]}${prefix}${bump.targetVersion}${assign[5]}`;
@@ -157,9 +164,10 @@ function bumpDependencyLine(line: string, section: string, pending: Map<string, 
   if (!req) return line;
   const bump = pending.get(normalizeName(req.name));
   if (!bump || req.op === "!=") return line;
-  bumped.push(`${bump.packageName}: -> ${req.op}${bump.targetVersion}`);
+  const nextOp = bumpOperator(req.op);
+  bumped.push(`${bump.packageName}: -> ${nextOp}${bump.targetVersion}`);
   pending.delete(normalizeName(req.name));
-  return `${req.indent}${req.name}${req.extras || ""}${req.gap}${req.op}${req.opGap}${bump.targetVersion}${req.tail}`;
+  return `${req.indent}${req.name}${req.extras || ""}${req.gap}${nextOp}${req.opGap}${bump.targetVersion}${req.tail}`;
 }
 
 /** Rewrite dependency lines inside poetry / PEP 621 tables only. */
@@ -219,7 +227,7 @@ export function applyRenamesToRequirementsTxt(filePath: string, renames: RenameR
       if (normalizeName(name) !== fromNorm || op === "!=") return match;
       bumped.push(`${rename.fromPackage} -> ${rename.toPackage}`);
       replaced = true;
-      return `${indent}${rename.toPackage}${extras || ""}${gap}${op}${opGap}${rename.targetVersion}`;
+      return `${indent}${rename.toPackage}${extras || ""}${gap}${bumpOperator(op)}${opGap}${rename.targetVersion}`;
     });
     if (!replaced) missed.push(rename.fromPackage);
   }
@@ -243,7 +251,7 @@ function renameInDepTables(content: string, fromNorm: string, toPackage: string,
     if (!isPep621DepSection(section) && !isPoetryDepSection(section)) continue;
     const req = matchRequirementLine(lines[i]);
     if (!req || normalizeName(req.name) !== fromNorm || req.op === "!=") continue;
-    lines[i] = `${req.indent}${toPackage}${req.extras || ""}${req.gap}${req.op}${req.opGap}${targetVersion}${req.tail}`;
+    lines[i] = `${req.indent}${toPackage}${req.extras || ""}${req.gap}${bumpOperator(req.op)}${req.opGap}${targetVersion}${req.tail}`;
     replaced = true;
   }
 

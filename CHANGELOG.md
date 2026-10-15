@@ -2,6 +2,21 @@
 
 All notable changes to `@elephantseed/auto-bumper`.
 
+## [0.0.4] - 2026-10-15
+
+### Added
+- `fix --apply-excludes` (Maven/Gradle): unfixable packages (no fixed version in OSV) are excluded from the dependency graph instead of being left reported — Gradle gets a managed `configurations.all { exclude … }` block, Maven attaches `<exclusion>` to the parent dependency. Exclusions are recorded only when every touched project actually wrote them; a Maven direct dependency cannot be excluded and is reported with manual-removal advice instead
+- `fix --apply` rewrites the lockfile after a manifest edit so the next scan sees the new pins: `npm install --package-lock-only --ignore-scripts`, `yarn install --ignore-scripts`, `pnpm install --lockfile-only --ignore-scripts`, `bun install --lockfile-only`, `cargo update`, `poetry lock`. `--offline` or a failed refresh leaves the lock unchanged; later scans then trust the lockfile and say so
+- Nested manifests below the scan root are included for Maven (`pom.xml`), Gradle (`build.gradle` / `build.gradle.kts`), npm (`package.json`), Cargo (`Cargo.toml`), and Python (`pyproject.toml`, `requirements.txt`). Root files stay parsed by the caller. `node_modules`, `target`, `build`, `dist`, `out`, `vendor`, and VCS/tool dirs are skipped
+- Maven candidates with no OSV fixed version but an inclusive last-affected bound are promoted to the next published release after that bound. The last-affected version itself stays vulnerable and is never the target. Skipped when `--offline`
+- Fix-loop re-scan overlay now reads Python direct deps (`pyproject.toml`, `requirements.txt`) and npm overrides, so a bumped manifest is visible before the lockfile moves
+
+### Changed
+- npm and Python bumps turn ceilings (`<`, `<=`) and a bare `>` into an inclusive floor (`>=`) so the fix version is admitted. Existing floors and exact pins keep their operator
+
+### Fixed
+- Direct-parse of Gradle excludes missed single-quoted `exclude group: '…', module: '…'` (the form gradle-editor writes, and idiomatic Groovy), so already-excluded coordinates were re-detected on every fresh session; both quote styles are now collected
+
 ## [0.0.1] - 2026-10-14
 
 First release under the new name — rebranded from `@elephantseed/auto-depender`, with version numbering restarting at 0.0.1. Ships everything accumulated in the auto-depender lineage (July–October 2026):

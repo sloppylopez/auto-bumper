@@ -607,11 +607,12 @@ export function restoreDeclaredVersion(
   return !unexpected;
 }
 
-/**
- * Apply bumps (and optional excludes) to build.gradle. Direct declarations
- /** True when the build uses enforcedPlatform, platform(), or mavenBom (all can downgrade explicit versions). */
+/** True when a BOM or the Spring dependency plugin can downgrade an explicit version. */
 export function hasEnforcedPlatform(content: string): boolean {
-  return /(?:enforcedPlatform|platform)\s*\(/.test(content) || /mavenBom/.test(content);
+  return /(?:enforcedPlatform|platform)\s*\(/.test(content)
+    || /mavenBom/.test(content)
+    || /io\.spring\.dependency-management/.test(content)
+    || /org\.springframework\.boot/.test(content);
 }
 
 /**
@@ -813,7 +814,7 @@ export function applyBumps(
   if (forces.length > 0) {
     result.forced.push(...forces.map(f => f.packageName));
     result.warnings.push(
-      `enforcedPlatform detected — added resolutionStrategy.force for ${forces.length} package(s) so BOM cannot downgrade fixes`,
+      `BOM or Spring dependency management detected — added resolutionStrategy.force for ${forces.length} package(s) so the BOM cannot downgrade fixes`,
     );
   }
 

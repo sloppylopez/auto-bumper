@@ -287,6 +287,11 @@ dependencies {
       expect(hasEnforcedPlatform('mavenBom "org.springframework.cloud:spring-cloud-dependencies:2025.0.0"')).toBe(true);
     });
 
+    it("detects the Spring Boot plugin", () => {
+      expect(hasEnforcedPlatform("id 'org.springframework.boot' version '3.3.0'")).toBe(true);
+      expect(hasEnforcedPlatform('id("io.spring.dependency-management") version "1.1.6"')).toBe(true);
+    });
+
     it("returns false when no BOM present", () => {
       expect(hasEnforcedPlatform('dependencies {\n    implementation "commons-io:commons-io:2.19.0"\n}')).toBe(false);
     });

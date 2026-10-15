@@ -76,10 +76,11 @@ export function applyBumps(packageJsonPath: string, bumps: BumpRequest[], _exclu
 
   const content = fs.readFileSync(packageJsonPath, "utf-8");
   const pkg = JSON.parse(content) as PackageJsonShape;
+  const style = detectOverrideStyle(packageJsonPath);
   let dirty = false;
 
   for (const bump of bumps) {
-    const result = processSingleBump(pkg, bump.packageName, bump.targetVersion);
+    const result = processSingleBump(pkg, bump.packageName, bump.targetVersion, style);
     if (result.warning) warnings.push(result.warning);
     if (!result.changed || !result.change) {
       missed.push(bump.packageName);
@@ -102,6 +103,45 @@ interface PackageJsonShape {
   optionalDependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
   overrides?: Record<string, string>;
+  resolutions?: Record<string, string>;
+  pnpm?: { overrides?: Record<string, string> };
+}
+
+type OverrideStyle = "npm" | "yarn" | "pnpm";
+
+/** Lockfile beside package.json decides which transitive pin install will honor. */
+function detectOverrideStyle(packageJsonPath: string): OverrideStyle {
+  const dir = path.dirname(packageJsonPath);
+  const has = (name: string) => fs.existsSync(path.join(dir, name));
+  if (has("package-lock.json")) return "npm";
+  if (has("yarn.lock")) return "yarn";
+  if (has("pnpm-lock.yaml")) return "pnpm";
+  return "npm";
+}
+
+function writeTransitiveOverride(
+  pkg: PackageJsonShape,
+  name: string,
+  target: string,
+  style: OverrideStyle,
+): { changed: boolean; label: string } {
+  if (style === "yarn") {
+    pkg.resolutions = pkg.resolutions || {};
+    if (pkg.resolutions[name] === target) return { changed: false, label: "resolution" };
+    pkg.resolutions[name] = target;
+    return { changed: true, label: "resolution" };
+  }
+  if (style === "pnpm") {
+    pkg.pnpm = pkg.pnpm || {};
+    pkg.pnpm.overrides = pkg.pnpm.overrides || {};
+    if (pkg.pnpm.overrides[name] === target) return { changed: false, label: "pnpm override" };
+    pkg.pnpm.overrides[name] = target;
+    return { changed: true, label: "pnpm override" };
+  }
+  pkg.overrides = pkg.overrides || {};
+  if (pkg.overrides[name] === target) return { changed: false, label: "override" };
+  pkg.overrides[name] = target;
+  return { changed: true, label: "override" };
 }
 
 const DEP_SECTIONS: DepSection[] = [
@@ -116,13 +156,13 @@ function processSingleBump(
   pkg: PackageJsonShape,
   name: string,
   target: string,
+  style: OverrideStyle,
 ): { changed: boolean; change?: string; warning?: string } {
   const section = findDependencySection(pkg, name);
   if (!section) {
-    pkg.overrides = pkg.overrides || {};
-    if (pkg.overrides[name] === target) return { changed: false };
-    pkg.overrides[name] = target;
-    return { changed: true, change: `${name}: override -> ${target}` };
+    const written = writeTransitiveOverride(pkg, name, target, style);
+    if (!written.changed) return { changed: false };
+    return { changed: true, change: `${name}: ${written.label} -> ${target}` };
   }
 
   const currentVer = getDependencyVersion(pkg, section, name);
@@ -160,6 +200,12 @@ function semverOperator(spec: string): string {
   return m ? m[1] : "";
 }
 
+/** `<`, `<=`, and `>` still admit or exclude the fix. A fix is a floor that includes the target. */
+function inclusiveFloorOperator(op: string): string {
+  if (op === "<" || op === "<=" || op === ">") return ">=";
+  return op;
+}
+
 /** Parse an `npm:name@version` alias spec (null when not an alias). */
 function parseNpmAlias(spec: string): { name: string; version: string } | null {
   if (!spec.startsWith("npm:")) return null;
@@ -171,8 +217,8 @@ function parseNpmAlias(spec: string): { name: string; version: string } | null {
 
 function computeNewVersion(currentVer: string, target: string): string {
   const alias = parseNpmAlias(currentVer);
-  if (alias) return `npm:${alias.name}@${semverOperator(alias.version)}${target}`;
-  return `${semverOperator(currentVer)}${target}`;
+  if (alias) return `npm:${alias.name}@${inclusiveFloorOperator(semverOperator(alias.version))}${target}`;
+  return `${inclusiveFloorOperator(semverOperator(currentVer))}${target}`;
 }
 
 /** Rename dependency keys in package.json. */

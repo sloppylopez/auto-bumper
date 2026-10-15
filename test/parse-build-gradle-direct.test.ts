@@ -50,17 +50,19 @@ describe("parseBuildGradleDirect (quoted coordinate idioms)", () => {
     ).toBe(true);
   });
 
-  it("skips coordinates listed in the excludes block", () => {
+  it("skips coordinates listed in the excludes block (double and single quoted)", () => {
     const file = path.join(dir, "build-exclude.gradle");
     fs.writeFileSync(
       file,
       [
         "dependencies {",
         '    implementation "com.google.guava:guava:33.4.0-jre"',
+        "    implementation 'org.apache.httpcomponents:httpclient:4.5.14'",
         "}",
         "",
         "configurations.all {",
         '    exclude group: "com.google.guava", module: "guava"',
+        "    exclude group: 'org.apache.httpcomponents', module: 'httpclient'",
         "}",
         "",
       ].join("\n"),
@@ -68,6 +70,7 @@ describe("parseBuildGradleDirect (quoted coordinate idioms)", () => {
 
     const result = parseBuildGradleDirect(file);
     expect(result.packages.find((p) => p.name === "com.google.guava:guava")).toBeUndefined();
+    expect(result.packages.find((p) => p.name === "org.apache.httpcomponents:httpclient")).toBeUndefined();
   });
 
   it("resolves camelCase and uppercase version variable names", () => {
