@@ -308,3 +308,50 @@ ${POM_MARKER_END}
   });
 });
 
+describe("applyBumps Maven exclusions", () => {
+  const pom = `<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>app</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.example</groupId>
+        <artifactId>managed</artifactId>
+        <version>1.0.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+`;
+
+  it("adds an exclusion on a direct dependency and does not duplicate it", () => {
+    withTempPom(pom, filePath => {
+      const first = applyBumps(filePath, [], [{ packageName: "org.bad:lib" }]);
+      const once = readPom(filePath);
+      expect(first.excluded).toEqual(["org.bad:lib"]);
+      expect(once).toContain("<groupId>org.bad</groupId>");
+      expect(once).toContain("<artifactId>lib</artifactId>");
+      const managed = once.slice(once.indexOf("<dependencyManagement>"));
+      expect(managed).not.toContain("org.bad");
+      applyBumps(filePath, [], [{ packageName: "org.bad:lib" }]);
+      const twice = readPom(filePath);
+      expect(twice.match(/<exclusion>/g)?.length).toBe(1);
+    });
+  });
+
+  it("warns when there is no direct dependency to attach", () => {
+    const bare = `<?xml version="1.0" encoding="UTF-8"?>\n<project>\n  <dependencyManagement>\n    <dependencies>\n      <dependency>\n        <groupId>com.example</groupId>\n        <artifactId>managed</artifactId>\n        <version>1.0.0</version>\n      </dependency>\n    </dependencies>\n  </dependencyManagement>\n</project>\n`;
+    withTempPom(bare, filePath => {
+      const result = applyBumps(filePath, [], [{ packageName: "org.bad:lib" }]);
+      expect(result.excluded).toEqual([]);
+      expect(result.warnings.some(w => w.includes("no direct dependency"))).toBe(true);
+    });
+  });
+});
+

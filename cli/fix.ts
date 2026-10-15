@@ -11,8 +11,8 @@ import path from "node:path";
 import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
-import { GRADLE_ALL_CONFIGURATIONS, parseBuildGradleDirect, parsePomXmlDirect } from "../src/lib/parse-lockfile.ts";
-import { buildFixPlan, majorOf } from "../src/lib/fixer.ts";
+import { GRADLE_ALL_CONFIGURATIONS, listNestedJavaManifests, parseBuildGradleDirect, parsePomXmlDirect } from "../src/lib/parse-lockfile.ts";
+import { buildFixPlan, majorOf, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
@@ -202,6 +202,17 @@ function findProjects(dir: string, filter?: string | null): ProjectInfo[] {
     projects.push({ kind: "gradle", manifestPath: gradle, label: "Gradle" });
   } else if (fs.existsSync(gradleKts) && (!filter || filter === "gradle")) {
     projects.push({ kind: "gradle", manifestPath: gradleKts, label: "Gradle" });
+  }
+
+  for (const manifest of listNestedJavaManifests(resolved)) {
+    if (manifest.kind === "maven" && filter && filter !== "maven") continue;
+    if (manifest.kind === "gradle" && filter && filter !== "gradle") continue;
+    const rel = path.relative(resolved, manifest.filePath).replaceAll("\\", "/");
+    projects.push({
+      kind: manifest.kind,
+      manifestPath: manifest.filePath,
+      label: `${manifest.kind === "maven" ? "Maven" : "Gradle"} (${rel})`,
+    });
   }
 
   return projects;
@@ -990,8 +1001,37 @@ interface PassPlan {
   policy: RenameApplyPolicy;
 }
 
+/** When OSV only has last_affected, pin the next release published in the project's repositories. */
+async function promoteLastAffectedFixes(plan: FixPlan, projects: ProjectInfo[]): Promise<void> {
+  const project = projects.find(isMavenLike);
+  if (!project || offlineFlag) return;
+  const still: FixCandidate[] = [];
+  for (const candidate of plan.unfixable) {
+    if ((candidate.ecosystem || "maven") !== "maven" || !candidate.lastAffected) {
+      still.push(candidate);
+      continue;
+    }
+    const next = await findNextAvailableVersion(
+      project.manifestPath,
+      project.kind,
+      candidate.packageName,
+      candidate.lastAffected,
+    );
+    const promoted = withNextFixVersion(candidate, next);
+    if (!promoted) {
+      console.log(`  ~ ${candidate.packageName}: no published release after ${candidate.lastAffected}`);
+      still.push(candidate);
+      continue;
+    }
+    console.log(`  ~ ${candidate.packageName}: last affected ${candidate.lastAffected}, using next published ${promoted.targetVersion}`);
+    plan.fixable.push(promoted);
+  }
+  plan.unfixable = still;
+}
+
 async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCandidates: FixCandidate[]): Promise<PassPlan> {
   const plan = buildFixPlan(scan.findings, dedupeAdvisories(scan.advisories));
+  await promoteLastAffectedFixes(plan, ctx.projects);
   plan.renames = expandRenameBundle(plan.renames, scan.packages);
   if (latestFlag && latestCandidates.length > 0) mergeLatestCandidates(plan.fixable, latestCandidates);
 
@@ -1111,11 +1151,39 @@ function buildApplyBatch(pass: PassPlan, findings: Finding[]): ApplyBatch {
   return { bumps, renames, effectiveApproved: pass.effectiveApproved, effectiveRenames: pass.effectiveRenames, excludes, findings };
 }
 
+function isRootJavaProject(project: ProjectInfo): boolean {
+  const dir = path.dirname(project.manifestPath);
+  return !sessionProjects.some(other =>
+    other.kind === project.kind && path.dirname(other.manifestPath).length < dir.length,
+  );
+}
+
+function projectDeclaresCoord(project: ProjectInfo, coord: string): boolean {
+  let text: string;
+  try {
+    text = fs.readFileSync(project.manifestPath, "utf-8");
+  } catch {
+    return false;
+  }
+  const [group, artifact] = coord.split(":");
+  if (!group || !artifact) return text.includes(coord);
+  if (text.includes(`${group}:${artifact}`)) return true;
+  if (project.kind !== "maven") return false;
+  const blocks = text.match(/<dependency>[\s\S]*?<\/dependency>/g) || [];
+  return blocks.some(block =>
+    block.includes(`<groupId>${group}</groupId>`) && block.includes(`<artifactId>${artifact}</artifactId>`),
+  );
+}
+
 /** Bumps belonging to one project (maven/gradle share the maven ecosystem). */
 function bumpsForProject(project: ProjectInfo, batch: ApplyBatch): BumpRequest[] {
   return batch.bumps.filter(b => {
     const pkgEco = b.ecosystem ?? batch.findings.find(f => f.packageName === b.packageName)?.ecosystem;
-    if (project.kind === "maven" || project.kind === "gradle") return pkgEco === "maven";
+    if (project.kind === "maven" || project.kind === "gradle") {
+      if (pkgEco !== "maven") return false;
+      if (isRootJavaProject(project)) return true;
+      return projectDeclaresCoord(project, b.packageName);
+    }
     return pkgEco === project.kind;
   });
 }

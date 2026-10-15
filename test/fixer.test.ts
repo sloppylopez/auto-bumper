@@ -1,5 +1,5 @@
 import type { Finding } from "../src/lib/types.ts";
-import { buildFixPlan } from "../src/lib/fixer.ts";
+import { buildFixPlan, withNextFixVersion } from "../src/lib/fixer.ts";
 
 const makeFinding = (overrides: Partial<Finding>): Finding => ({
   id: "GHSA-test",
@@ -148,5 +148,29 @@ describe("buildFixPlan", () => {
   it("sets ecosystem on fixable candidates", () => {
     const plan = buildFixPlan([makeFinding({ ecosystem: "npm", fixedVersions: ["4.6.0"] })]);
     expect(plan.fixable[0].ecosystem).toBe("npm");
+  });
+});
+
+describe("withNextFixVersion", () => {
+  const candidate = {
+    packageName: "org.example:lib",
+    installedVersion: "1.5",
+    targetVersion: null,
+    isMajor: false,
+    findingIds: ["CVE-INCLUSIVE"],
+    severity: "HIGH" as const,
+    ecosystem: "maven",
+    lastAffected: "1.9",
+  };
+
+  it("uses the next published release and never the inclusive bound", () => {
+    const promoted = withNextFixVersion(candidate, "1.10");
+    expect(promoted?.targetVersion).toBe("1.10");
+    expect(promoted?.targetVersion).not.toBe("1.9");
+  });
+
+  it("stays unfixable when nothing newer is published", () => {
+    expect(withNextFixVersion(candidate, null)).toBeNull();
+    expect(withNextFixVersion(candidate, "1.9")).toBeNull();
   });
 });

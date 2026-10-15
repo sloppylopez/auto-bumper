@@ -610,9 +610,12 @@ describe("inclusive Maven range is not a fix", () => {
     const findings = matchVulnerabilities(pkg("1.5"), [inclusive]);
     expect(findings).toHaveLength(1);
     expect(findings[0].fixedVersions).not.toContain("1.9");
+    expect(findings[0].lastAffected).toBe("1.9");
     expect(matchVulnerabilities(pkg("1.9"), [inclusive])).toHaveLength(1);
     const plan = buildFixPlan(findings, [inclusive]);
     expect(plan.fixable.map(c => c.targetVersion)).not.toContain("1.9");
+    expect(plan.unfixable[0]?.lastAffected).toBe("1.9");
+    expect(plan.unfixable[0]?.targetVersion).toBeNull();
   });
 
   it("still treats an exclusive upper bound as the fix", () => {

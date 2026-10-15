@@ -4,7 +4,7 @@
  * Direct dependencies are rewritten in place. Transitive dependencies get
  * explicit pins inside an auto-bumper managed block (idempotent on re-runs).
  *
- * v1 limitations: no property/BOM inheritance resolution, excludes warn-only.
+ * v1 limitations: no property/BOM inheritance resolution. Exclusions are attached to direct dependencies.
  */
 import fs from "node:fs";
 import {
@@ -345,6 +345,92 @@ function applySharedPropertyRewrite(
   return rewriteSharedProperty(content, propName, maxTarget);
 }
 
+function dependencyManagementSpans(content: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const re = /<dependencyManagement>[\s\S]*?<\/dependencyManagement>/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    spans.push([match.index, match.index + match[0].length]);
+  }
+  return spans;
+}
+
+function insideSpan(index: number, spans: Array<[number, number]>): boolean {
+  return spans.some(([start, end]) => index >= start && index < end);
+}
+
+function blockHasExclusion(block: string, group: string, artifact: string): boolean {
+  const re = new RegExp(
+    String.raw`<exclusion>[\s\S]*?<groupId>\s*${escapeRegex(group)}\s*</groupId>[\s\S]*?<artifactId>\s*${escapeRegex(artifact)}\s*</artifactId>[\s\S]*?</exclusion>`,
+  );
+  return re.test(block);
+}
+
+function blockCoordinates(block: string): string | null {
+  const group = /<groupId>([^<]+)<\/groupId>/.exec(block)?.[1]?.trim();
+  const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(block)?.[1]?.trim();
+  if (!group || !artifact) return null;
+  return `${group}:${artifact}`;
+}
+
+function insertExclusion(block: string, group: string, artifact: string): string {
+  const exclusion = [
+    "      <exclusion>",
+    `        <groupId>${group}</groupId>`,
+    `        <artifactId>${artifact}</artifactId>`,
+    "      </exclusion>",
+  ].join("\n");
+  if (/<exclusions>/.test(block)) {
+    return block.replace("<exclusions>", `<exclusions>\n${exclusion}`);
+  }
+  return block.replace(
+    "</dependency>",
+    `    <exclusions>\n${exclusion}\n    </exclusions>\n  </dependency>`,
+  );
+}
+
+/** Attach each coordinate as an <exclusion> on direct dependencies. dependencyManagement cannot exclude transitives. */
+function applyMavenExclusions(content: string, excludes: ExcludeRequest[], result: ApplyResult): string {
+  if (excludes.length === 0) return content;
+  const spans = dependencyManagementSpans(content);
+  let next = content;
+
+  for (const ex of excludes) {
+    const [group, artifact] = ex.packageName.split(":");
+    if (!group || !artifact) {
+      result.warnings.push(`${ex.packageName}: not a valid group:artifact exclusion`);
+      continue;
+    }
+    const re = /<dependency>[\s\S]*?<\/dependency>/g;
+    const edits: Array<{ start: number; end: number; text: string }> = [];
+    let already = false;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(next)) !== null) {
+      if (insideSpan(match.index, spans)) continue;
+      const block = match[0];
+      if (blockCoordinates(block) === ex.packageName) continue;
+      if (blockHasExclusion(block, group, artifact)) {
+        already = true;
+        continue;
+      }
+      edits.push({
+        start: match.index,
+        end: match.index + block.length,
+        text: insertExclusion(block, group, artifact),
+      });
+    }
+    if (edits.length === 0 && !already) {
+      result.warnings.push(`${ex.packageName}: no direct dependency to attach <exclusion> to`);
+      continue;
+    }
+    for (const edit of edits.sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
+    }
+    result.excluded.push(ex.packageName);
+  }
+  return next;
+}
+
 export function applyBumps(
   filePath: string,
   bumps: BumpRequest[],
@@ -353,13 +439,8 @@ export function applyBumps(
   const result: ApplyResult = { direct: [], constrained: [], excluded: [], forced: [], warnings: [] };
   if (bumps.length === 0 && excludes.length === 0) return result;
 
-  for (const ex of excludes) {
-    result.warnings.push(
-      `${ex.packageName}: Maven exclude not supported yet — add <exclusion> manually if needed`,
-    );
-  }
-
   let content = fs.readFileSync(filePath, "utf-8");
+  content = applyMavenExclusions(content, excludes, result);
   const pins: BumpRequest[] = [];
   const blocks = findDepBlocks(content);
 

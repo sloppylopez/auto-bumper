@@ -28,6 +28,8 @@ export interface Finding {
   vulnerableRange: string;
   /** Known fixed versions */
   fixedVersions: string[];
+  /** Inclusive last affected version when the advisory has no `fixed` event. */
+  lastAffected?: string;
   /** Severity level */
   severity: "LOW" | "MODERATE" | "HIGH" | "CRITICAL" | "UNKNOWN";
   /** Short description of the vulnerability */

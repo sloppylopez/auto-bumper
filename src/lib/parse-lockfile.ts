@@ -264,6 +264,56 @@ function mergeParseResult(
  * Detect and parse all supported lockfiles in the given directory.
  * Supports npm (package-lock / yarn / pnpm), Rust, Python, Maven, Gradle.
  */
+const NESTED_SKIP_DIRS = new Set([
+  "node_modules", "target", "build", "dist", "out", "vendor",
+  ".git", ".gradle", ".idea", ".auto-bumper",
+]);
+
+/** Java manifests below the scan root. The root pom and build files are parsed by the caller. */
+export function listNestedJavaManifests(root: string): Array<{ kind: "maven" | "gradle"; filePath: string }> {
+  const rootResolved = path.resolve(root);
+  const found: Array<{ kind: "maven" | "gradle"; filePath: string }> = [];
+  walk(rootResolved);
+  return found;
+
+  function walk(dir: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (dir !== rootResolved) {
+      const names = new Set(entries.filter(entry => entry.isFile()).map(entry => entry.name));
+      if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
+      if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
+      else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || NESTED_SKIP_DIRS.has(entry.name)) continue;
+      walk(path.join(dir, entry.name));
+    }
+  }
+}
+
+function appendNestedJavaManifests(
+  root: string,
+  allPackages: PackageRef[],
+  warnings: string[],
+  allUnresolved: string[] | null,
+): boolean {
+  let found = false;
+  for (const manifest of listNestedJavaManifests(root)) {
+    const result = manifest.kind === "maven"
+      ? parsePomXmlDirect(manifest.filePath)
+      : parseBuildGradleDirect(manifest.filePath);
+    if (result.packages.length === 0 && result.warnings.length === 0) continue;
+    found = true;
+    mergeParseResult(result, allPackages, warnings, allUnresolved);
+  }
+  return found;
+}
+
 export function parseLockfile(dirPath: string): ParseResult {
   const allPackages: PackageRef[] = [];
   const warnings: string[] = [];
@@ -289,6 +339,7 @@ export function parseLockfile(dirPath: string): ParseResult {
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
+  if (appendNestedJavaManifests(resolvedDir, allPackages, warnings, null)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -1444,6 +1495,7 @@ export async function parseLockfileAsync(
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
+  if (appendNestedJavaManifests(resolvedDir, allPackages, warnings, allUnresolved)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(

@@ -14,7 +14,7 @@ import {
   matchesSemverRange,
   matchVulnerabilities,
 } from "../src/lib/matcher.ts";
-import { dedupeResolvedPackages, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { dedupeResolvedPackages, listNestedJavaManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
 import { assertNoZipSlip, zipEntryNames } from "../src/lib/osv-export.ts";
 import { extractNextLink } from "../src/lib/github-repo-advisories.ts";
 import { isInsideDir } from "../src/path.ts";
@@ -228,6 +228,25 @@ describe("cargo rewrite", () => {
       const text = fs.readFileSync(file, "utf-8");
       expect(text).toContain("new_crate = \"2.0.0\"");
       expect(text).not.toContain("old_crate");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("nested Java manifests", () => {
+  it("finds a module pom and skips build output and dependencies", () => {
+    const dir = tempDir();
+    fs.mkdirSync(path.join(dir, "module"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "target", "nested"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "node_modules", "lib"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "pom.xml"), "<project></project>");
+    fs.writeFileSync(path.join(dir, "module", "pom.xml"), "<project></project>");
+    fs.writeFileSync(path.join(dir, "target", "nested", "pom.xml"), "<project></project>");
+    fs.writeFileSync(path.join(dir, "node_modules", "lib", "pom.xml"), "<project></project>");
+    try {
+      const found = listNestedJavaManifests(dir).map(m => path.basename(path.dirname(m.filePath)));
+      expect(found).toEqual(["module"]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

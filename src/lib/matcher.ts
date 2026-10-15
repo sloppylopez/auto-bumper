@@ -92,6 +92,7 @@ export function matchVulnerabilities(packages: PackageRef[], osvData: any[]): Fi
         installedVersion: pkg.version,
         vulnerableRange: result.range || `=${pkg.version}`,
         fixedVersions,
+        lastAffected: result.lastAffected,
         severity,
         summary: entry.summary || `${pkg.name}@${pkg.version} has a known vulnerability`,
         references: extractReferences(entry),
@@ -118,6 +119,8 @@ function matchesEcosystem(entry: any, ecosystem: string): boolean {
 interface AffectedResult {
   isAffected: boolean;
   range?: string;
+  /** Inclusive end of the matching window. Not a fixed version. */
+  lastAffected?: string;
 }
 
 /** Check if a specific version falls within the affected range of an OSV entry */
@@ -216,9 +219,8 @@ function matchSingleRepresentation(version: string, rangeStr: string, rangeType:
       : { isAffected: false };
   }
   if (eco === "maven") {
-    return matchesMavenRange(version, rangeStr)
-      ? { isAffected: true, range: rangeStr }
-      : { isAffected: false };
+    if (!matchesMavenRange(version, rangeStr)) return { isAffected: false };
+    return { isAffected: true, range: rangeStr, lastAffected: inclusiveMavenUpper(rangeStr) };
   }
   // npm, crates.io, Go → semver
   if (rangeType === "SEMVER" && matchesSemverRange(version, rangeStr)) {
@@ -535,6 +537,7 @@ function checkLowerBound(m: RegExpMatchArray, version: string): boolean {
 interface AffectedEventResult {
   isAffected: boolean;
   range?: string;
+  lastAffected?: string;
 }
 
 /** Compare versions for ECOSYSTEM event ranges (and fix planning). */
@@ -610,7 +613,8 @@ function matchesEcosystemEvents(
   for (const segment of segments) {
     if (!versionInEventSegment(version, segment, ecosystem)) continue;
     const range = buildSegmentRange(segment);
-    return { isAffected: true, range };
+    const lastAffected = segment.last_affected ?? undefined;
+    return { isAffected: true, range, lastAffected };
   }
   return { isAffected: false };
 }
@@ -887,6 +891,18 @@ function addFixedFromRange(fixedSet: Set<string>, rangeStr: string) {
   if (ltMatch) fixedSet.add(ltMatch[1].trim());
 }
 
+/** Inclusive upper bound of a Maven range. That version is still affected, so it is not a fix. */
+function inclusiveMavenUpper(range: string): string | undefined {
+  let upper: string | undefined;
+  for (const interval of splitMavenRangeIntervals(range.trim())) {
+    const match = /^([[(])([^,]*),([^)\]]*)([)\]])$/.exec(interval);
+    if (match?.[4] !== "]") continue;
+    const hi = match[3].trim();
+    if (hi) upper = hi;
+  }
+  return upper;
+}
+
 /** Upper version of one bracketed Maven interval, only when the bound is exclusive. */
 function exclusiveMavenUpperBound(interval: string): string | null {
   const match = /^([[(])([^,]*),([^)\]]*)([)\]])$/.exec(interval);
@@ -1019,5 +1035,9 @@ function mergeFinding(existing: Finding, candidate: Finding) {
     if (!existing.aliases.includes(a)) {
       existing.aliases.push(a);
     }
+  }
+  if (!candidate.lastAffected) return;
+  if (!existing.lastAffected || comparePackageVersion(candidate.lastAffected, existing.lastAffected, existing.ecosystem) > 0) {
+    existing.lastAffected = candidate.lastAffected;
   }
 }
