@@ -1,6 +1,6 @@
 {
   "name": "@elephantseed/auto-bumper",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "type": "module",
   "description": "Local offline polyglot dependency vulnerability scanner and auto-fixer (Java, npm, Rust, Python)",
   "license": "MIT",
