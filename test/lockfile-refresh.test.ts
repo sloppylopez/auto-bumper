@@ -27,18 +27,41 @@ describe("lockfile refresh commands", () => {
     expect(lockRefreshCommands(pnpm).map(c => c.label)).toEqual(["pnpm install --lockfile-only"]);
     const bunDir = tempDir();
     fs.writeFileSync(path.join(bunDir, "bun.lock"), "");
-    expect(lockRefreshCommands(bunDir).map(c => c.label)).toEqual(["bun install --lockfile-only"]);
+    expect(lockRefreshCommands(bunDir).map(c => c.label)).toEqual(["bun install --lockfile-only --ignore-scripts"]);
     fs.rmSync(yarn, { recursive: true, force: true });
     fs.rmSync(pnpm, { recursive: true, force: true });
     fs.rmSync(bunDir, { recursive: true, force: true });
   });
 
-  it("refreshes Cargo.lock and poetry.lock together", () => {
+  it("refreshes named crates and poetry without a full upgrade", () => {
     const dir = tempDir();
     fs.writeFileSync(path.join(dir, "Cargo.lock"), "");
     fs.writeFileSync(path.join(dir, "poetry.lock"), "");
-    expect(lockRefreshCommands(dir).map(c => c.label)).toEqual(["cargo update", "poetry lock"]);
+    expect(lockRefreshCommands(dir, { cargoPackages: ["serde"] }).map(c => c.label)).toEqual([
+      "cargo update -p serde",
+      "poetry lock --no-update",
+    ]);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not run cargo update when no crate was bumped", () => {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "Cargo.lock"), "");
+    expect(lockRefreshCommands(dir).map(c => c.label)).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("uses yarn lockfile-only mode for Berry and warns on classic", () => {
+    const berry = tempDir();
+    fs.writeFileSync(path.join(berry, "yarn.lock"), "__metadata:\n  version: 6\n");
+    expect(lockRefreshCommands(berry).map(c => c.label)).toEqual(["yarn install --mode=update-lockfile"]);
+    const classic = tempDir();
+    fs.writeFileSync(path.join(classic, "yarn.lock"), "# yarn lockfile v1\n");
+    const classicCmds = lockRefreshCommands(classic);
+    expect(classicCmds.map(c => c.label)).toEqual(["yarn install --ignore-scripts"]);
+    expect(classicCmds[0]?.warn).toContain("Yarn classic");
+    fs.rmSync(berry, { recursive: true, force: true });
+    fs.rmSync(classic, { recursive: true, force: true });
   });
 
   it("does nothing when the manifest has no lockfile", () => {

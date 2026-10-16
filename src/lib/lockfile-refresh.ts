@@ -14,12 +14,20 @@ export interface LockRefreshCommand {
   args: string[];
   /** Human-readable command, without a shell. */
   label: string;
+  warn?: string;
 }
 
 export interface LockRefreshResult {
   label: string;
   ok: boolean;
   detail: string;
+  /** Set when the command is broader than a lockfile-only rewrite. */
+  warn?: string;
+}
+
+export interface LockRefreshOptions {
+  /** Crates to pass to `cargo update -p`. Empty skips Cargo so the whole lock is not rewritten. */
+  cargoPackages?: string[];
 }
 
 function binName(name: string): string {
@@ -29,8 +37,20 @@ function binName(name: string): string {
   return name;
 }
 
+/** Yarn Berry lock (v2+) can update the lockfile without installing. Classic cannot. */
+function yarnBerryLock(dir: string): boolean {
+  if (fs.existsSync(path.join(dir, ".yarnrc.yml"))) return true;
+  try {
+    const head = fs.readFileSync(path.join(dir, "yarn.lock"), "utf8").slice(0, 800);
+    if (/yarn lockfile v1/.test(head)) return false;
+    return /__metadata:/.test(head);
+  } catch {
+    return false;
+  }
+}
+
 /** Commands for lockfiles that already exist in dir. One JS manager, then Cargo and Poetry. */
-export function lockRefreshCommands(dir: string): LockRefreshCommand[] {
+export function lockRefreshCommands(dir: string, opts: LockRefreshOptions = {}): LockRefreshCommand[] {
   const has = (name: string) => fs.existsSync(path.join(dir, name));
   const commands: LockRefreshCommand[] = [];
   if (has("package-lock.json")) {
@@ -40,11 +60,20 @@ export function lockRefreshCommands(dir: string): LockRefreshCommand[] {
       label: "npm install --package-lock-only",
     });
   } else if (has("yarn.lock")) {
-    commands.push({
-      bin: binName("yarn"),
-      args: ["install", "--ignore-scripts"],
-      label: "yarn install --ignore-scripts",
-    });
+    if (yarnBerryLock(dir)) {
+      commands.push({
+        bin: binName("yarn"),
+        args: ["install", "--mode=update-lockfile"],
+        label: "yarn install --mode=update-lockfile",
+      });
+    } else {
+      commands.push({
+        bin: binName("yarn"),
+        args: ["install", "--ignore-scripts"],
+        label: "yarn install --ignore-scripts",
+        warn: "Yarn classic has no lockfile-only install; this runs a full install with scripts ignored.",
+      });
+    }
   } else if (has("pnpm-lock.yaml")) {
     commands.push({
       bin: binName("pnpm"),
@@ -54,15 +83,27 @@ export function lockRefreshCommands(dir: string): LockRefreshCommand[] {
   } else if (has("bun.lock")) {
     commands.push({
       bin: binName("bun"),
-      args: ["install", "--lockfile-only"],
-      label: "bun install --lockfile-only",
+      args: ["install", "--lockfile-only", "--ignore-scripts"],
+      label: "bun install --lockfile-only --ignore-scripts",
     });
   }
   if (has("Cargo.lock")) {
-    commands.push({ bin: binName("cargo"), args: ["update"], label: "cargo update" });
+    const crates = [...new Set((opts.cargoPackages ?? []).filter(Boolean))];
+    if (crates.length > 0) {
+      const flags = crates.flatMap(name => ["-p", name]);
+      commands.push({
+        bin: binName("cargo"),
+        args: ["update", ...flags],
+        label: `cargo update ${flags.join(" ")}`,
+      });
+    }
   }
   if (has("poetry.lock")) {
-    commands.push({ bin: binName("poetry"), args: ["lock"], label: "poetry lock" });
+    commands.push({
+      bin: binName("poetry"),
+      args: ["lock", "--no-update"],
+      label: "poetry lock --no-update",
+    });
   }
   return commands;
 }
@@ -98,10 +139,11 @@ function failureDetail(result: childProcess.SpawnSyncReturns<string>): string {
 }
 
 /** Run every lock refresh for dir. Empty when the project has no lockfile. */
-export function refreshProjectLocks(dir: string, timeoutMs = 300_000): LockRefreshResult[] {
-  return lockRefreshCommands(dir).map(command => {
+export function refreshProjectLocks(dir: string, timeoutMs = 300_000, opts: LockRefreshOptions = {}): LockRefreshResult[] {
+  return lockRefreshCommands(dir, opts).map(command => {
     const result = spawnCaptured(command.bin, command.args, { cwd: dir, timeout: timeoutMs });
-    if (result.status === 0 && !result.error) return { label: command.label, ok: true, detail: "" };
-    return { label: command.label, ok: false, detail: failureDetail(result) };
+    const warn = command.warn;
+    if (result.status === 0 && !result.error) return { label: command.label, ok: true, detail: "", ...(warn ? { warn } : {}) };
+    return { label: command.label, ok: false, detail: failureDetail(result), ...(warn ? { warn } : {}) };
   });
 }

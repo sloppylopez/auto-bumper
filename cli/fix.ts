@@ -926,6 +926,8 @@ interface FixLoopContext {
   findingCountHistory: number[];
   /** True when a manifest moved but the lockfile was not rewritten. Later scans must trust the lock. */
   lockUnsynced: boolean;
+  /** True when a Java tree or the GHSA cache was missing, so a zero-finding result is not clean. */
+  incompleteScan: boolean;
 }
 
 /** Example manifest names for the "no projects found" error (per ecosystem filter). */
@@ -999,6 +1001,7 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
     for (const u of scan.unresolved ?? []) {
       if (!result.unresolved.includes(u)) result.unresolved.push(u);
     }
+    if (scan.incomplete) ctx.incompleteScan = true;
   }
   // Remember every coordinate the build could not resolve — never re-apply a fix targeting it.
   for (const u of result.unresolved) ctx.sessionUnresolvable.add(u);
@@ -1023,6 +1026,10 @@ async function runScanPass(ctx: FixLoopContext): Promise<ScanPassResult> {
 
 /** Report a clean run and exit (all findings fixed, rolled-back fixes, or nothing to do). */
 function reportCleanExit(ctx: FixLoopContext): never {
+  if (ctx.incompleteScan) {
+    console.error("Scan incomplete: dependency tree or advisory data was not fully loaded. Not reporting a clean result.");
+    process.exit(2);
+  }
   // Successfully excluded packages are reported in the Applied section — do not re-list them as unfixable.
   const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   if (outputFormat === "json") {
@@ -1474,6 +1481,7 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
     for (const u of result.unresolved ?? []) {
       if (!unresolved.includes(u)) unresolved.push(u);
     }
+    if (result.incomplete) ctx.incompleteScan = true;
   }
   if (ctx.lockUnsynced) {
     console.log("  Lockfile was not updated. Final check uses the lockfile, not the manifest.");
@@ -1484,6 +1492,21 @@ async function runFinalScan(ctx: FixLoopContext): Promise<{ findings: Finding[];
   return { findings: overlay.findings, packages: overlay.packages, unresolved };
 }
 
+/** Crate names applied in dir. Renames use the new name (`to` is `name@version`). */
+function cargoPackageNames(ctx: FixLoopContext, dir: string): string[] {
+  const resolved = path.resolve(dir);
+  const names: string[] = [];
+  for (const bump of ctx.allApplied) {
+    if (!bump.manifestPath) continue;
+    if (path.resolve(path.dirname(bump.manifestPath)) !== resolved) continue;
+    if (!bump.manifestPath.replaceAll("\\", "/").endsWith("Cargo.toml")) continue;
+    const at = bump.to.lastIndexOf("@");
+    const name = bump.isRename && at > 0 ? bump.to.slice(0, at) : bump.packageName;
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
 /** After a manifest edit, rewrite npm/Cargo/Poetry lockfiles so the next scan sees the new pins. */
 function refreshLocksAfterApply(ctx: FixLoopContext, dirs: string[]): void {
   const seen = new Set<string>();
@@ -1491,7 +1514,8 @@ function refreshLocksAfterApply(ctx: FixLoopContext, dirs: string[]): void {
     const resolved = path.resolve(dir);
     if (seen.has(resolved)) continue;
     seen.add(resolved);
-    const planned = lockRefreshCommands(resolved);
+    const cargoPackages = cargoPackageNames(ctx, resolved);
+    const planned = lockRefreshCommands(resolved, { cargoPackages });
     if (planned.length === 0) continue;
     if (offlineFlag) {
       ctx.lockUnsynced = true;
@@ -1499,7 +1523,8 @@ function refreshLocksAfterApply(ctx: FixLoopContext, dirs: string[]): void {
       continue;
     }
     console.log(`  Updating lockfile (${planned.map(c => c.label).join(", ")})...`);
-    for (const result of refreshProjectLocks(resolved)) {
+    for (const result of refreshProjectLocks(resolved, 300_000, { cargoPackages })) {
+      if (result.warn) console.log(`  ${result.warn}`);
       if (result.ok) console.log(`  Lockfile updated (${result.label}).`);
       else {
         ctx.lockUnsynced = true;
@@ -1518,7 +1543,15 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
     { fixable: [], unfixable: unfixableShown, renames: [] },
     { applied: reportApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: finalFindings.map(f => ({ packageName: f.packageName, installedVersion: f.installedVersion, id: f.id, aliases: f.aliases })), skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords },
   ));
+  if (ctx.lockUnsynced && reportApplied.length > 0) {
+    console.error("Lockfile was not updated after apply. The lock may still pin the vulnerable version.");
+    process.exit(1);
+  }
   if (finalFindings.length === 0 && ctx.allSkippedUnresolvable.length === 0) {
+    if (ctx.incompleteScan) {
+      console.error("Scan incomplete: dependency tree or advisory data was not fully loaded. Not reporting a clean result.");
+      process.exit(2);
+    }
     console.log(reportApplied.length > 0 ? "All vulnerabilities fixed." : "No vulnerabilities found.");
     for (const p of ctx.projects) discardManifestBackup(p);
     discardSourceMigrationBackups(ctx.allSourceChanged);
@@ -1564,6 +1597,7 @@ async function main() {
     lastAppliedCount: 0,
     findingCountHistory: [],
     lockUnsynced: false,
+    incompleteScan: false,
   };
 
   while (ctx.iteration < maxIterations) {

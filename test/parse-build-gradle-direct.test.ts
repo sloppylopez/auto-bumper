@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseBuildGradleDirect } from "../src/lib/parse-lockfile.ts";
+import { parseBuildGradle, parseBuildGradleDirect } from "../src/lib/parse-lockfile.ts";
 
 describe("parseBuildGradleDirect (quoted coordinate idioms)", () => {
   let dir: string;
@@ -143,5 +143,18 @@ describe("parseBuildGradleDirect (quoted coordinate idioms)", () => {
     expect(found.get("com.example:single")).toBe("9.9.9");
     // Unresolvable variable still skipped
     expect(result.packages.find((p) => p.name === "com.example:lib")).toBeUndefined();
+  });
+});
+
+describe("parseBuildGradle without gradlew", () => {
+  it("keeps direct coords and marks the tree incomplete", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-incomplete-"));
+    const file = path.join(dir, "build.gradle");
+    fs.writeFileSync(file, 'dependencies {\n    implementation "com.google.guava:guava:31.1-jre"\n}\n');
+    const result = parseBuildGradle(file);
+    expect(result.packages.map((p) => p.name)).toContain("com.google.guava:guava");
+    expect(result.incompleteTree).toBe(true);
+    expect(result.warnings.some((w) => w.includes("gradlew was not found"))).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

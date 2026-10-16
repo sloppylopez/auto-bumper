@@ -193,6 +193,20 @@ export interface RepoAdvisoriesOptions {
   forceRefresh?: boolean;
   /** Spinner text updater (e.g. "GHSA advisories: netty/netty") */
   setText?: (msg: string) => void;
+  /** Read the local cache only. Does not call the GitHub API. */
+  offline?: boolean;
+  /** Non-fatal notes (stale cache, missing offline cache). */
+  onWarning?: (msg: string) => void;
+}
+
+function githubHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "User-Agent": "auto-bumper",
+    Accept: "application/vnd.github+json",
+  };
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
 }
 
 /** Fetch all pages of repo-published advisories for one repo. */
@@ -203,7 +217,7 @@ async function fetchRepoAdvisories(repo: string, setText?: (msg: string) => void
     setText?.(`GHSA advisories: ${repo}`);
     const resp = await fetchWithRetry(
       url,
-      { headers: { "User-Agent": "auto-bumper", Accept: "application/vnd.github+json" } },
+      { headers: githubHeaders() },
       { label: `GitHub GHSA ${repo}`, retries: 3 },
     );
     if (!resp.ok) throw new Error(`GitHub API HTTP ${resp.status} for ${repo}`);
@@ -220,18 +234,33 @@ async function fetchRepoAdvisories(repo: string, setText?: (msg: string) => void
 
 /** Fetch repo-published advisories for all watched repos and cache them. */
 export async function loadRepoAdvisories(opts: RepoAdvisoriesOptions = {}): Promise<AdvisoryEntry[]> {
-  const { forceRefresh = false, setText } = opts;
+  const { forceRefresh = false, setText, offline = false, onWarning } = opts;
+  const cached = readCacheFile(GHSA_REPO_CACHE);
+  if (offline) {
+    if (cached === null) {
+      onWarning?.("GitHub repo advisories cache missing; vendor GHSAs were not matched. Run a scan online once.");
+      return [];
+    }
+    return cached;
+  }
   if (!forceRefresh) {
-    const cached = readCacheFile(GHSA_REPO_CACHE);
     const age = getCacheAgeMs(GHSA_REPO_CACHE);
     if (cached !== null && age !== null && age < CACHE_TTL_MS) return cached;
   }
 
-  const records: AdvisoryEntry[] = [];
-  for (const repo of getWatchedRepos()) {
-    for (const rec of await fetchRepoAdvisories(repo, setText)) records.push(rec);
+  try {
+    const records: AdvisoryEntry[] = [];
+    for (const repo of getWatchedRepos()) {
+      for (const rec of await fetchRepoAdvisories(repo, setText)) records.push(rec);
+    }
+    writeCacheFile(GHSA_REPO_CACHE, records);
+    return records;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (cached !== null) {
+      onWarning?.(`GitHub repo advisories unavailable (${msg}); using cached copy`);
+      return cached;
+    }
+    throw new Error(`GitHub repo advisories unavailable (${msg}) and no cache exists`);
   }
-
-  writeCacheFile(GHSA_REPO_CACHE, records);
-  return records;
 }

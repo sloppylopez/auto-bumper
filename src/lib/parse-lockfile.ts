@@ -13,6 +13,8 @@ export interface ParseResult {
   warnings: string[];
   /** Coordinates that failed to resolve (e.g. yanked versions): "group:name@requestedVersion". */
   unresolved?: string[];
+  /** True when a Java manifest was read without a resolved dependency tree. */
+  incompleteTree?: boolean;
 }
 
 /** OSV ecosystem identifier for each internal ecosystem key (used for DB filenames). */
@@ -248,16 +250,26 @@ function mergeParseResult(
   allPackages: PackageRef[],
   warnings: string[],
   allUnresolved: string[] | null,
+  flags?: { incompleteTree: boolean },
 ): void {
   allPackages.push(...result.packages);
   for (const w of result.warnings) {
     if (!warnings.includes(w)) warnings.push(w);
   }
+  if (result.incompleteTree && flags) flags.incompleteTree = true;
   if (allUnresolved) {
     for (const u of result.unresolved ?? []) {
       if (!allUnresolved.includes(u)) allUnresolved.push(u);
     }
   }
+}
+
+/** Direct-manifest fallback is not a full tree. Callers must not treat the scan as clean. */
+function noteIncompleteTree(result: ParseResult, reason: string): ParseResult {
+  result.incompleteTree = true;
+  const msg = `Incomplete dependency tree (${reason}): transitive dependencies were not resolved`;
+  if (!result.warnings.includes(msg)) result.warnings.push(msg);
+  return result;
 }
 
 /**
@@ -287,19 +299,26 @@ export function listNestedManifests(root: string): Array<{ kind: NestedManifestK
     }
     if (dir !== rootResolved) {
       const names = new Set(entries.filter(entry => entry.isFile()).map(entry => entry.name));
-      if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
-      if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
-      else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
-      if (names.has("package.json")) found.push({ kind: "npm", filePath: path.join(dir, "package.json") });
-      if (names.has("Cargo.toml")) found.push({ kind: "crates.io", filePath: path.join(dir, "Cargo.toml") });
-      if (names.has("pyproject.toml")) found.push({ kind: "pypi", filePath: path.join(dir, "pyproject.toml") });
-      if (names.has("requirements.txt")) found.push({ kind: "pypi", filePath: path.join(dir, "requirements.txt") });
+      found.push(...dirManifests(dir, names));
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || NESTED_SKIP_DIRS.has(entry.name)) continue;
       walk(path.join(dir, entry.name));
     }
   }
+}
+
+/** Manifests present in one directory. build.gradle takes precedence over build.gradle.kts. */
+function dirManifests(dir: string, names: Set<string>): Array<{ kind: NestedManifestKind; filePath: string }> {
+  const found: Array<{ kind: NestedManifestKind; filePath: string }> = [];
+  if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
+  if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
+  else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
+  if (names.has("package.json")) found.push({ kind: "npm", filePath: path.join(dir, "package.json") });
+  if (names.has("Cargo.toml")) found.push({ kind: "crates.io", filePath: path.join(dir, "Cargo.toml") });
+  if (names.has("pyproject.toml")) found.push({ kind: "pypi", filePath: path.join(dir, "pyproject.toml") });
+  if (names.has("requirements.txt")) found.push({ kind: "pypi", filePath: path.join(dir, "requirements.txt") });
+  return found;
 }
 
 /** Java manifests below the scan root. The root pom and build files are parsed by the caller. */
@@ -361,6 +380,7 @@ export function parseLockfile(dirPath: string): ParseResult {
     );
   }
 
+  const treeFlags = { incompleteTree: false };
   for (const spec of LOCKFILES) {
     const filePath = path.join(resolvedDir, spec.filename);
     if (!fs.existsSync(filePath)) continue;
@@ -368,7 +388,7 @@ export function parseLockfile(dirPath: string): ParseResult {
 
     foundAny = true;
     const result = spec.ecosystem === "gradle" ? parseBuildGradle(filePath) : parseNonGradleSpec(spec, filePath, warnings);
-    mergeParseResult(result, allPackages, warnings, null);
+    mergeParseResult(result, allPackages, warnings, null, treeFlags);
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
@@ -380,7 +400,9 @@ export function parseLockfile(dirPath: string): ParseResult {
     );
   }
 
-  return { packages: allPackages, warnings };
+  const out: ParseResult = { packages: allPackages, warnings };
+  if (treeFlags.incompleteTree) out.incompleteTree = true;
+  return out;
 }
 
 interface PackageLockData {
@@ -812,9 +834,10 @@ export function parsePomXml(filePath: string): ParseResult {
     if (result.warnings.length > 0) {
       warnings.push(...result.warnings);
     }
+    return noteIncompleteTree(parsePomXmlDirect(filePath, warnings), "mvn dependency:tree returned no packages");
   }
 
-  return parsePomXmlDirect(filePath, warnings);
+  return noteIncompleteTree(parsePomXmlDirect(filePath, warnings), "mvn was not found");
 }
 
 /**
@@ -1226,12 +1249,14 @@ export function parseBuildGradle(filePath: string): ParseResult {
     if (result.warnings.length > 0) {
       warnings.push(...result.warnings);
     }
+    const direct = parseBuildGradleDirect(filePath);
+    if (gradleUnresolved && gradleUnresolved.length > 0) direct.unresolved = gradleUnresolved;
+    return noteIncompleteTree(direct, "gradlew dependencies returned no packages");
   }
 
   // Fallback: parse build.gradle directly (only explicit deps)
   const direct = parseBuildGradleDirect(filePath);
-  if (gradleUnresolved && gradleUnresolved.length > 0) direct.unresolved = gradleUnresolved;
-  return direct;
+  return noteIncompleteTree(direct, "gradlew was not found");
 }
 
 /** Find gradlew. Search stops at the git root so a parent outside the repo is not executed. */
@@ -1488,12 +1513,15 @@ export async function parseBuildGradleAsync(
     if (result.warnings.length > 0) {
       warnings.push(...result.warnings);
     }
+    onProgress?.("Parsing build.gradle...");
+    const failedDirect = parseBuildGradleDirect(filePath);
+    if (gradleUnresolved && gradleUnresolved.length > 0) failedDirect.unresolved = gradleUnresolved;
+    return noteIncompleteTree(failedDirect, "gradlew dependencies returned no packages");
   }
 
   onProgress?.("Parsing build.gradle...");
   const direct = parseBuildGradleDirect(filePath);
-  if (gradleUnresolved && gradleUnresolved.length > 0) direct.unresolved = gradleUnresolved;
-  return direct;
+  return noteIncompleteTree(direct, "gradlew was not found");
 }
 
 export async function parseLockfileAsync(
@@ -1507,6 +1535,7 @@ export async function parseLockfileAsync(
   const resolvedDir = path.resolve(dirPath);
 
   let foundAny = false;
+  const treeFlags = { incompleteTree: false };
 
   const flags = detectLockfiles(resolvedDir);
   if (flags.hasPomXml && (flags.hasBuildGradle || flags.hasBuildGradleKts)) {
@@ -1524,7 +1553,7 @@ export async function parseLockfileAsync(
     const result = spec.ecosystem === "gradle"
       ? await parseBuildGradleAsync(filePath, onProgress, options)
       : parseNonGradleSpec(spec, filePath, warnings);
-    mergeParseResult(result, allPackages, warnings, allUnresolved);
+    mergeParseResult(result, allPackages, warnings, allUnresolved, treeFlags);
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
@@ -1538,6 +1567,7 @@ export async function parseLockfileAsync(
 
   const out: ParseResult = { packages: allPackages, warnings };
   if (allUnresolved.length > 0) out.unresolved = allUnresolved;
+  if (treeFlags.incompleteTree) out.incompleteTree = true;
   return out;
 }
 
@@ -1639,7 +1669,7 @@ function gradleDepVersion(
 /** Collect excluded group:module pairs from Groovy and Kotlin exclude syntaxes. */
 function collectGradleExcludes(content: string): Set<string> {
   const excludes = new Set<string>();
-  for (const em of content.matchAll(/exclude\s+group:\s*["']([^"']+)[\"'],\s*module:\s*["']([^"']+)["']/g)) {
+  for (const em of content.matchAll(/exclude\s+group:\s*["']([^"']+)["'],\s*module:\s*["']([^"']+)["']/g)) {
     excludes.add(em[1].toLowerCase() + ":" + em[2].toLowerCase());
   }
   // Kotlin form: normalize `group = "x", module = "y"` labels away before matching

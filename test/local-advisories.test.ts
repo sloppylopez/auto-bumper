@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadLocalAdvisories, getLocalAdvisoriesDir } from "../src/lib/local-advisories.ts";
+import { loadLocalAdvisories, loadLocalAdvisoriesForTarget, getLocalAdvisoriesDir } from "../src/lib/local-advisories.ts";
 import { matchVulnerabilities } from "../src/lib/matcher.ts";
 import type { PackageRef } from "../src/lib/types.ts";
 
@@ -40,6 +40,26 @@ describe("loadLocalAdvisories", () => {
     fs.writeFileSync(path.join(dir, "good.json"), JSON.stringify([{ id: "CVE-9", ecosystems: ["Maven"] }]));
 
     expect(loadLocalAdvisories(dir).map((e) => e.id)).toEqual(["CVE-9"]);
+  });
+
+  it("loads project local-advisories and lets the same id override the package copy", () => {
+    const target = tempDir();
+    const dir = path.join(target, "local-advisories");
+    fs.mkdirSync(dir);
+    const packaged = loadLocalAdvisories(getLocalAdvisoriesDir());
+    const sample = packaged[0];
+    expect(sample?.id).toBeTruthy();
+    fs.writeFileSync(
+      path.join(dir, "extra.json"),
+      JSON.stringify([
+        { id: sample!.id, summary: "project override", ecosystems: ["Maven"] },
+        { id: "CVE-PROJECT-ONLY", ecosystems: ["Maven"] },
+      ]),
+    );
+    const loaded = loadLocalAdvisoriesForTarget(target);
+    expect(loaded.find((e) => e.id === sample!.id)?.summary).toBe("project override");
+    expect(loaded.some((e) => e.id === "CVE-PROJECT-ONLY")).toBe(true);
+    fs.rmSync(target, { recursive: true, force: true });
   });
 });
 

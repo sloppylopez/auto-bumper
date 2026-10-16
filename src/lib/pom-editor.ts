@@ -418,40 +418,52 @@ function applyMavenExclusions(content: string, excludes: ExcludeRequest[], resul
   if (excludes.length === 0) return content;
   const spans = dependencyManagementSpans(content);
   let next = content;
-
   for (const ex of excludes) {
-    const [group, artifact] = ex.packageName.split(":");
-    if (!group || !artifact) {
-      result.warnings.push(`${ex.packageName}: not a valid group:artifact exclusion`);
-      continue;
-    }
-    const re = /<dependency>[\s\S]*?<\/dependency>/g;
-    const edits: Array<{ start: number; end: number; text: string }> = [];
-    let already = false;
-    let match: RegExpExecArray | null;
-    while ((match = re.exec(next)) !== null) {
-      if (insideSpan(match.index, spans)) continue;
-      const block = match[0];
-      if (blockCoordinates(block) === ex.packageName) continue;
-      if (blockHasExclusion(block, group, artifact)) {
-        already = true;
-        continue;
-      }
-      edits.push({
-        start: match.index,
-        end: match.index + block.length,
-        text: insertExclusion(block, group, artifact),
-      });
-    }
-    if (edits.length === 0 && !already) {
-      result.warnings.push(`${ex.packageName}: no direct dependency to attach <exclusion> to`);
-      continue;
-    }
-    for (const edit of edits.sort((a, b) => b.start - a.start)) {
-      next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
-    }
-    result.excluded.push(ex.packageName);
+    next = applyOneExclusion(next, ex, spans, result);
   }
+  return next;
+}
+
+/** Attach one exclusion to every direct dependency block outside dependencyManagement. */
+function applyOneExclusion(
+  content: string,
+  ex: ExcludeRequest,
+  spans: Array<[number, number]>,
+  result: ApplyResult,
+): string {
+  const [group, artifact] = ex.packageName.split(":");
+  if (!group || !artifact) {
+    result.warnings.push(`${ex.packageName}: not a valid group:artifact exclusion`);
+    return content;
+  }
+  const re = /<dependency>[\s\S]*?<\/dependency>/g;
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  let already = false;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    if (insideSpan(match.index, spans)) continue;
+    const block = match[0];
+    if (blockCoordinates(block) === ex.packageName) continue;
+    if (blockHasExclusion(block, group, artifact)) {
+      already = true;
+      continue;
+    }
+    edits.push({
+      start: match.index,
+      end: match.index + block.length,
+      text: insertExclusion(block, group, artifact),
+    });
+  }
+  if (edits.length === 0 && !already) {
+    result.warnings.push(`${ex.packageName}: no direct dependency to attach <exclusion> to`);
+    return content;
+  }
+  edits.sort((a, b) => b.start - a.start);
+  let next = content;
+  for (const edit of edits) {
+    next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
+  }
+  result.excluded.push(ex.packageName);
   return next;
 }
 

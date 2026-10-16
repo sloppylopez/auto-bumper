@@ -12,7 +12,7 @@ import { downloadOsvEcosystemDump, checkRemoteEtag } from "./lib/osv-export.ts";
 import { loadRepoAdvisories } from "./lib/github-repo-advisories.ts";
 import { packagesNeedOrphanBridge } from "./lib/osv-package-bridge.ts";
 import { loadOrphanBridgedAdvisories } from "./lib/osv-orphan-cves.ts";
-import { loadLocalAdvisories } from "./lib/local-advisories.ts";
+import { loadLocalAdvisoriesForTarget } from "./lib/local-advisories.ts";
 import { readCacheFile, writeCacheFile, getCacheAgeMs, readCacheEtag, writeCacheEtag } from "./lib/osv-cache.ts";
 
 export { normalizeCliPath, pathHint, repairMangledCliPath, CACHE_DIR, getOsvDbDir } from "./path.ts";
@@ -32,6 +32,8 @@ export interface ScanResult {
   resolvedTarget?: string;
   /** Coordinates that failed to resolve in the build (e.g. yanked versions). */
   unresolved?: string[];
+  /** True when a clean result would hide a missing tree or a missing advisory cache. */
+  incomplete?: boolean;
 }
 
 export interface ScanOptions {
@@ -60,8 +62,13 @@ export async function loadAdvisoriesForEcosystem(
   const logFn = makeLogFn(spinner);
 
   const cachedData = readCacheFile(osvName);
+  if (offline) {
+    if (cachedData === null) {
+      throw new Error(`No cached ${osvName} advisory DB. Run update-db while online, then retry --offline.`);
+    }
+    return cachedData;
+  }
   if (cachedData === null) return downloadAndCache(osvName, logFn, spinner);
-  if (offline) return cachedData;
 
   // Online: probe the remote dump; re-download only when it changed since we cached it.
   const remoteEtag = await checkRemoteEtag(osvName);
@@ -126,7 +133,9 @@ export async function prefetchMissingCaches(
   detectedEcosystems: string[],
   oraFactory: SpinnerFactory,
   sharedSpinner?: Spinner,
+  offline = false,
 ): Promise<void> {
+  if (offline) return;
   const missing = findMissingEcosystems(detectedEcosystems);
   if (missing.length === 0) return;
 
@@ -249,10 +258,10 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   const setText = makeSetText(spinner, spinnerPrefix);
 
   // Phase 1: Parse & filter packages
-  const { packages, warnings, unresolved } = await parseAndFilter(resolvedTarget, setText, ecosystemFilter, opts);
+  const { packages, warnings, unresolved, incompleteTree } = await parseAndFilter(resolvedTarget, setText, ecosystemFilter, opts);
   if (packages.length === 0) {
     spinner?.stop();
-    return { packages: [], findings: [], warnings, advisories: [], ...(unresolved ? { unresolved } : {}) };
+    return { packages: [], findings: [], warnings, advisories: [], incomplete: incompleteTree, ...(unresolved ? { unresolved } : {}) };
   }
 
   // Phase 2: Load advisories
@@ -267,17 +276,21 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
 
   // Phase 3: Load repo-published advisories (vendor GHSAs missing from bulk OSV dumps)
   let repoAdvisories: AdvisoryEntry[] = [];
-  if (!opts.offline) {
-    try {
-      setText("Loading repo-published advisories...");
-      repoAdvisories = await loadRepoAdvisories({ setText });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`GitHub repo advisories unavailable: ${msg}`);
-    }
+  let advisoryIncomplete = false;
+  try {
+    setText(opts.offline ? "Loading cached repo advisories..." : "Loading repo-published advisories...");
+    repoAdvisories = await loadRepoAdvisories({
+      setText,
+      offline: opts.offline,
+      onWarning: (msg) => warnings.push(msg),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    warnings.push(`GitHub repo advisories unavailable: ${msg}`);
+    advisoryIncomplete = true;
   }
-  // Phase 3b: Merge locally-vendored advisories (offline; disclosures not yet in OSV dumps)
-  const localAdvisories = loadLocalAdvisories();
+  // Phase 3b: Merge locally-vendored advisories (package dir + <target>/local-advisories)
+  const localAdvisories = loadLocalAdvisoriesForTarget(resolvedTarget);
   if (localAdvisories.length > 0) {
     setText(`Loaded ${localAdvisories.length} locally-vendored advisories`);
   }
@@ -295,7 +308,15 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   const gradleScopeNote = gradleScanScopeNote(packages, opts.gradleConfigurations);
   reportStatus(spinner, findings, packages, allAdvData.length, gradleScopeNote);
 
-  return { packages, findings, warnings: uniqueWarnings, advisories: combinedData, resolvedTarget, ...(unresolved ? { unresolved } : {}) };
+  return {
+    packages,
+    findings,
+    warnings: uniqueWarnings,
+    advisories: combinedData,
+    resolvedTarget,
+    incomplete: incompleteTree || advisoryIncomplete,
+    ...(unresolved ? { unresolved } : {}),
+  };
 }
 
 /** Resolve the spinner factory from options */
@@ -317,7 +338,7 @@ async function parseAndFilter(
   setText: (msg: string) => void,
   ecosystemFilter: string | null,
   opts: { gradleConfigurations?: readonly string[] },
-): Promise<{ packages: PackageRef[]; warnings: string[]; unresolved?: string[] }> {
+): Promise<{ packages: PackageRef[]; warnings: string[]; unresolved?: string[]; incompleteTree: boolean }> {
   const parseResult = await parseLockfileAsync(
     resolvedTarget,
     setText,
@@ -326,6 +347,7 @@ async function parseAndFilter(
   let packages = parseResult.packages;
   const warnings = [...parseResult.warnings];
   const unresolved = parseResult.unresolved;
+  const incompleteTree = parseResult.incompleteTree === true;
 
   if (ecosystemFilter) {
     packages = filterPackagesByEcosystem(packages, ecosystemFilter);
@@ -336,7 +358,7 @@ async function parseAndFilter(
     }
   }
 
-  return { packages, warnings, ...(unresolved ? { unresolved } : {}) };
+  return { packages, warnings, incompleteTree, ...(unresolved ? { unresolved } : {}) };
 }
 
 /** Load cached + live advisories across all ecosystems */
@@ -376,7 +398,7 @@ async function loadAllAdvisories(
     }
   }
 
-  if (oraFactory) await prefetchMissingCaches(detectedEcosystems, oraFactory, spinner);
+  if (oraFactory) await prefetchMissingCaches(detectedEcosystems, oraFactory, spinner, offline);
 
   setText("Loading vulnerability database...");
   const allAdvData = await loadAdvisoriesForEcosystems(detectedEcosystems, oraFactory, spinner, offline);

@@ -131,27 +131,30 @@ function isPep621DepSection(section: string): boolean {
 function collectPyprojectDeps(content: string, out: Map<string, string>): void {
   let section = "";
   for (const line of content.split("\n")) {
-    const header = /^\s*\[([^\]]+)\]\s*$/.exec(line);
-    if (header) {
-      section = header[1].trim();
-      continue;
-    }
-    if (!isPoetryDepSection(section) && !isPep621DepSection(section)) continue;
-    if (isPoetryDepSection(section)) {
-      const assign = /^\s*(\w[\w.-]*)\s*=\s*"([^"]*)"/.exec(line);
-      if (assign) {
-        const op = /^(===|==|>=|<=|~=|!=|>|<|\^|~)/.exec(assign[2]);
-        if (op?.[1] === "!=" || op?.[1] === "<" || op?.[1] === "<=") continue;
-        const ver = op ? assign[2].slice(op[1].length) : assign[2];
-        putPypiVersion(out, assign[1], ver);
-        continue;
-      }
-    }
-    const req = /^\s*"?(\w[\w.-]*)(?:\[[^\]]+\])?\s*(===|==|>=|<=|~=|!=|>|<)\s*([^"<\s,]+)/.exec(line);
-    if (!req) continue;
-    if (req[2] === "!=" || req[2] === "<" || req[2] === "<=") continue;
-    putPypiVersion(out, req[1], req[3]);
+    section = processPyprojectLine(line, section, out);
   }
+}
+
+/** Handle one pyproject.toml line; returns the current dependency-section name. */
+function processPyprojectLine(line: string, section: string, out: Map<string, string>): string {
+  const header = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+  if (header) return header[1].trim();
+  if (!isPoetryDepSection(section) && !isPep621DepSection(section)) return section;
+  if (isPoetryDepSection(section)) {
+    const assign = /^\s*(\w[\w.-]*)\s*=\s*"([^"]*)"/.exec(line);
+    if (assign) {
+      const op = /^(===|==|>=|<=|~=|!=|>|<|\^|~)/.exec(assign[2]);
+      if (op?.[1] === "!=" || op?.[1] === "<" || op?.[1] === "<=") return section;
+      const ver = op ? assign[2].slice(op[1].length) : assign[2];
+      putPypiVersion(out, assign[1], ver);
+      return section;
+    }
+  }
+  const req = /^\s*"?(\w[\w.-]*)(?:\[[^\]]+\])?\s*(===|==|>=|<=|~=|!=|>|<)\s*([^"<\s,]+)/.exec(line);
+  if (!req) return section;
+  if (req[2] === "!=" || req[2] === "<" || req[2] === "<=") return section;
+  putPypiVersion(out, req[1], req[3]);
+  return section;
 }
 
 function collectRequirementsDeps(content: string, out: Map<string, string>): void {

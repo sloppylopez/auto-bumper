@@ -3,7 +3,7 @@
  * Auto-Bumper — Polyglot offline vulnerability scanner.
  *
  * Usage:
- *   scan [path] [--format markdown|json] [--ecosystem npm|crates.io|pypi|maven] [--offline]
+ *   scan [path] [--format markdown|json] [--ecosystem npm|crates.io|pypi|maven] [--exclude=name] [--offline]
  *   bun cli/scan.ts [path] [options]   (local dev)
  *
  * Exit codes: 0 clean, 1 vulns found, 2 error / nothing scannable
@@ -25,14 +25,16 @@ const hasJsonFlag = args.includes("--json");
 const ecosystemFlag = args.find(a => a.startsWith("--ecosystem"));
 const ecosystemFilter = ecosystemFlag ? ecosystemFlag.split("=")[1]?.toLowerCase() : null;
 const offlineFlag = args.includes("--offline");
+const excludePackages = args.filter(a => a.startsWith("--exclude=")).map(a => a.split("=")[1]!).filter(Boolean);
 
 if (hasJsonFlag) console.error("Warning: --json flag deprecated, use --format json");
 
 try {
-  const { packages, findings, warnings } = await runAutoBumperScan(resolvedTarget, {
+  const { packages, findings, warnings, incomplete } = await runAutoBumperScan(resolvedTarget, {
     ecosystemFilter,
     ora: defaultSpinnerFactory,
     offline: offlineFlag,
+    excludePackages,
   });
 
   for (const w of warnings) console.log(w);
@@ -55,7 +57,12 @@ try {
     console.log(reportMarkdown(findings));
   }
 
-  process.exit(findings.length > 0 ? 1 : 0);
+  if (incomplete) {
+    console.error("Scan incomplete: dependency tree or advisory data was not fully loaded. Not reporting a clean result.");
+  }
+  if (findings.length > 0) process.exit(1);
+  if (incomplete) process.exit(2);
+  process.exit(0);
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`Scan failed: ${msg}`);

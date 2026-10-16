@@ -15,7 +15,7 @@
 | Feature | Detail |
 |---------|--------|
 | **What it does** | Finds vulnerable dependencies → proposes minimal version bumps → edits your manifest files |
-| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; a small set of vendor GHSA repo advisories comes from the GitHub API; locally-vendored advisory files in `<packageRoot>/local-advisories/` cover disclosures OSV has not ingested yet |
+| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; a small set of vendor GHSA repo advisories comes from the GitHub API (cached, and read again with `--offline`); locally-vendored advisory files in the package `local-advisories/` and in `<project>/local-advisories/` cover disclosures OSV has not ingested yet |
 | **Where data lives** | `.auto-bumper/db/osv/` in your current working directory — never leaves your machine |
 | **Network needed?** | Only to refresh the OSV advisory database. Each online run sends a lightweight HEAD probe (~ms, no project data) per ecosystem and re-downloads only when the remote dump changed; otherwise the local cache is used (7-day TTL fallback if the probe fails). All matching runs against the local DB — your package list is never sent anywhere. Pass `--offline` to skip even that |
 | **LLM involved?** | No. Fixed versions come directly from OSV advisory metadata |
@@ -240,13 +240,14 @@ scan [path] [options]
 | `--ecosystem=<name>` | *(all)* | Filter: `npm`, `crates.io`, `pypi`, `maven`, `gradle` (Gradle = deps from `build.gradle` via `gradlew`) |
 
 **Gradle scan scope:** `runtimeClasspath` + `testRuntimeClasspath` via `gradlew dependencies` (285 pkgs typical Spring app). Not scanned: Gradle plugin classpath, custom configs (e.g. `jaxb` in applied scripts), `annotationProcessor` deps. `scan` and `fix` use the same two configurations.
+| `--exclude=<name>` | *(none)* | Package coordinate to drop from findings (repeatable). Same flag as `fix` |
 | `--offline` | false | No network access at all; use cached advisory DB only |
 | `--json` | — | Deprecated alias for `--format=json` (prints a warning) |
 
 **Exit codes:**
 - `0` — Clean (no vulnerabilities found)
 - `1` — Vulnerabilities detected
-- `2` — Error (invalid path, network failure, or no supported lockfile found)
+- `2` — Error (invalid path, network failure, no supported lockfile, offline with no advisory cache, or an incomplete Java tree / missing GHSA cache that would otherwise look clean)
 
 **Example outputs:**
 
@@ -407,7 +408,7 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
 |--------|---------|
 | **scan** | `runAutoBumperScan()` — full scan pipeline (advisory loading, matching, reporting) |
 | **ghsa** | `loadRepoAdvisories()`, `getWatchedRepos()` — vendor-published repo advisories (netty, jackson) from the GitHub API; watchlist in `<cacheRoot>/ghsa-repos.json` |
-| **local-advisories** | `loadLocalAdvisories()`, `getLocalAdvisoriesDir()` — locally-vendored OSV-format advisory files in `<packageRoot>/local-advisories/*.json`; always loaded, no network involved |
+| **local-advisories** | `loadLocalAdvisories()`, `loadLocalAdvisoriesForTarget()`, `getLocalAdvisoriesDir()` — OSV-format JSON in the package `local-advisories/` plus `<target>/local-advisories/`; always loaded, no network involved |
 | **fixer** | `buildFixPlan(findings[])` → `{ fixable[], unfixable[], renames[] }` |
 | **matcher** | `matchVulnerabilities(packages[], advisories[])` → `Finding[]` |
 | **reporter** | `reportMarkdown()`, `reportJson()`, `reportSummary()` |
@@ -433,10 +434,10 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
 - **Location:** Always under current working directory
 - **Format:** Gzip-compressed JSON arrays of OSV advisory entries
 - **Freshness:** every online run HEAD-probes each remote dump by ETag — if the remote object changed since the cache was written, it is re-downloaded immediately; otherwise the local cache is used. If the probe fails (no network), the 7-day TTL applies (configurable via `CACHE_TTL_MS` constant)
-- **GitHub repo advisories:** vendor-published advisories missing from the OSV bulk DB (e.g. netty, FasterXML jackson) are fetched from the GitHub API for a small watched-repo list and cached as `repo-advisories.json.gz`. Override the watchlist with `<cacheRoot>/ghsa-repos.json` (JSON array of `"owner/repo"`)
+- **GitHub repo advisories:** vendor-published advisories missing from the OSV bulk DB (e.g. netty, FasterXML jackson) are fetched from the GitHub API for a small watched-repo list and cached as `repo-advisories.json.gz`. A failed fetch keeps the last cache. Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the unauthenticated rate limit. `--offline` reads that cache and does not call GitHub. Override the watchlist with `<cacheRoot>/ghsa-repos.json` (JSON array of `"owner/repo"`)
 - **Fallback strategy:** Stale cache > no cache. If download fails, uses whatever is cached
 - **Disk usage:** ~8MB total across all four ecosystems
-- **Local vendored advisories:** disclosures not yet in the OSV bulk dump can be added as OSV-format JSON files under `<packageRoot>/local-advisories/` (see `Maven.json`, currently the 8 BouncyCastle 1.86 CVEs). Loaded on every scan, works offline, never fetched
+- **Local vendored advisories:** disclosures not yet in the OSV bulk dump can be added as OSV-format JSON files under `<packageRoot>/local-advisories/` (shipped with this package) and under `<project>/local-advisories/` (the repo you scan). A project file with the same advisory id replaces the packaged copy. Loaded on every scan, works offline, never fetched
 
 ---
 
@@ -449,7 +450,7 @@ flowchart LR
     A["scan / fix --offline"] --> B["Parse lockfiles (local)"]
     B --> C{"Cache in<br/>.auto-bumper/db/osv/ ?"}
     C -- "yes — TTL ignored" --> D["Load local *.json.gz only"]
-    C -- "no" --> E["One download attempt →<br/>fails → exit 2"]
+    C -- "no" --> E["No download → exit 2<br/>run update-db first"]
     D --> F["Match packages vs. local advisories"]
     F --> G["Report / fix plan<br/>(0 outbound requests)"]
 ```
@@ -458,10 +459,10 @@ What each data source does offline:
 
 | Data source | Online behavior | `--offline` behavior |
 |-------------|-----------------|----------------------|
-| Per-ecosystem OSV dumps (GCS) | Fresh cache used; stale/missing → download | Cache used **regardless of TTL**; if no cache file exists at all, one download is attempted and the scan exits `2` when it fails |
+| Per-ecosystem OSV dumps (GCS) | Fresh cache used; stale/missing → download | Cache used **regardless of TTL**. No cache file → exit `2` (no download). Run `update-db` online first |
 | Orphan-CVE bridge (Maven) | Same as above | Local cache or empty — never fetched |
-| GHSA vendor repo advisories (netty/jackson) | Fetched + cached | **Skipped entirely** — even a fresh local `repo-advisories.json.gz` is not read, so those vendor GHSAs are not matched offline |
-| Local vendored advisories (`local-advisories/*.json`) | Loaded from disk on every scan | **Always loaded** — pure local files, no fetch involved |
+| GHSA vendor repo advisories (netty/jackson) | Fetched + cached. On fetch failure the last cache is used. `GITHUB_TOKEN` or `GH_TOKEN` is sent when set. Fetch failure with no cache is an incomplete scan (exit 2, not clean) | Cache is read. A missing cache is a warning, not a download |
+| Local vendored advisories (`local-advisories/*.json`) | Loaded from the package and from `<project>/local-advisories/` | **Always loaded** — pure local files, no fetch involved |
 
 Practical notes:
 

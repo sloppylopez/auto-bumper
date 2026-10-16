@@ -174,4 +174,49 @@ describe("scan cache auto-refresh", () => {
     expect(result.findings).toHaveLength(1);
     expect(result.findings[0].id).toBe("GHSA-fresh-hit");
   });
+
+  it("refuses an offline scan when the OSV cache is missing", async () => {
+    const proj = writeProj("4.2.17.Final");
+    for (const ext of [".json.gz", ".json"]) {
+      fs.rmSync(path.join(dbDir(), `Maven${ext}`), { force: true });
+    }
+    dumpMock.mockClear();
+    await expect(scanWithoutMvn(proj, { quiet: true, offline: true })).rejects.toThrow(/No cached Maven/);
+    expect(dumpMock).not.toHaveBeenCalled();
+  });
+
+  it("matches cached repo advisories while offline", async () => {
+    const proj = writeProj("4.2.17.Final");
+    writeGz("Maven", [], 60_000);
+    writeGz("repo-advisories", [advisory("GHSA-repo-offline", "io.netty:netty-codec-http3")], 60_000);
+    dumpMock.mockClear();
+    const result = await scanWithoutMvn(proj, { quiet: true, offline: true });
+    expect(dumpMock).not.toHaveBeenCalled();
+    expect(result.findings.map(f => f.id)).toContain("GHSA-repo-offline");
+  });
+
+  it("drops excluded packages before reporting", async () => {
+    const proj = writeProj("4.2.17.Final");
+    writeGz("Maven", [advisory("GHSA-excluded", "io.netty:netty-codec-http3")], 60_000);
+    const savedPath = process.env.PATH;
+    process.env.PATH = NO_MVN_PATH;
+    try {
+      const result = await runAutoBumperScan(proj, {
+        quiet: true,
+        offline: true,
+        excludePackages: ["io.netty:netty-codec-http3"],
+      });
+      expect(result.findings).toHaveLength(0);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
+  it("does not call a pom scan clean when mvn is unavailable", async () => {
+    const proj = writeProj("4.2.17.Final");
+    writeGz("Maven", [], 60_000);
+    const result = await scanWithoutMvn(proj, { quiet: true, offline: true });
+    expect(result.incomplete).toBe(true);
+    expect(result.warnings.some(w => w.includes("Incomplete dependency tree"))).toBe(true);
+  });
 });

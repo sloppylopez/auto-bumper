@@ -191,6 +191,48 @@ describe("loadRepoAdvisories", () => {
     const recs = await loadRepoAdvisories({ forceRefresh: true });
     expect(recs.map(r => r.id)).toEqual(["GHSA-q9pg-8h3j-8hvm", "GHSA-page2-aaaa-bbbb"]);
   });
+
+  it("reads the cache offline and does not call GitHub", async () => {
+    fetchMock.mockClear();
+    const recs = await loadRepoAdvisories({ offline: true });
+    expect(recs[0]?.id).toBe("GHSA-q9pg-8h3j-8hvm");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends GITHUB_TOKEN when set", async () => {
+    process.env.GITHUB_TOKEN = "test-token";
+    let auth: string | null = null;
+    fetchMock.mockImplementation(async (_url: string | URL, init?: RequestInit) => {
+      auth = new Headers(init?.headers).get("authorization");
+      return new Response(JSON.stringify([nettyAdvisory]), { status: 200 });
+    });
+    try {
+      await loadRepoAdvisories({ forceRefresh: true });
+    } finally {
+      delete process.env.GITHUB_TOKEN;
+    }
+    expect(auth).toBe("Bearer test-token");
+  });
+
+  it("uses a stale cache when GitHub fetch fails", async () => {
+    const gz = path.join(dbDir, "repo-advisories.json.gz");
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(gz, old, old);
+    fetchMock.mockImplementation(async () => {
+      throw new Error("rate limited");
+    });
+    const warnings: string[] = [];
+    const recs = await loadRepoAdvisories({ onWarning: (msg) => warnings.push(msg) });
+    expect(recs[0]?.id).toBe("GHSA-q9pg-8h3j-8hvm");
+    expect(warnings[0]).toContain("using cached copy");
+  });
+
+  it("throws when fetch fails and no cache exists", async () => {
+    fs.rmSync(path.join(dbDir, "repo-advisories.json.gz"), { force: true });
+    fs.rmSync(path.join(dbDir, "repo-advisories.json"), { force: true });
+    fetchMock.mockImplementation(async () => new Response("no", { status: 403 }));
+    await expect(loadRepoAdvisories({ forceRefresh: true })).rejects.toThrow(/no cache exists/);
+  });
 });
 
 describe("OSV bulk + repo advisories dedup", () => {
