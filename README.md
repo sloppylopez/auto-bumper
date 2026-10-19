@@ -15,7 +15,7 @@
 | Feature | Detail |
 |---------|--------|
 | **What it does** | Finds vulnerable dependencies → proposes minimal version bumps → edits your manifest files |
-| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; a small set of vendor GHSA repo advisories comes from the GitHub API (cached, and read again with `--offline`); locally-vendored advisory files in the package `local-advisories/` and in `<project>/local-advisories/` cover disclosures OSV has not ingested yet |
+| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; reviewed Maven advisories come from the GitHub global advisory list (cached, refreshed by `updated` time, and read again with `--offline`); locally-vendored advisory files in the package `local-advisories/` and in `<project>/local-advisories/` cover disclosures OSV and GitHub have not ingested yet. Set `AUTO_BUMPER_SUPPLEMENTAL=off` (or `0`/`false`, case-insensitive) to disable both supplemental sources and run strictly on the dump + local advisories |
 | **Where data lives** | `.auto-bumper/db/osv/` in your current working directory — never leaves your machine |
 | **Network needed?** | Only to refresh the OSV advisory database. Each online run sends a lightweight HEAD probe (~ms, no project data) per ecosystem and re-downloads only when the remote dump changed; otherwise the local cache is used (7-day TTL fallback if the probe fails). All matching runs against the local DB — your package list is never sent anywhere. Pass `--offline` to skip even that |
 | **LLM involved?** | No. Fixed versions come directly from OSV advisory metadata |
@@ -80,6 +80,7 @@
 │        ▼                                                            │
 │  Gates: major (--allow-major) | rename (--allow-renames)            │
 │      unfixable --> --apply-excludes (Maven/Gradle)                  │
+│      no OSV forward fix --> --allow-downgrades (Maven, Gradle)      │
 │  --apply: re-scan until clean or stalled (default cap 10)           │
 │    dry-run shows plan; TTY prompts; CI skips risky                  │
 │        │                                                            │
@@ -172,7 +173,7 @@ bun run security:fix -- . --dry-run
 
 `fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain; add `--strict` to exit 1.
 
-**Unfixable packages** (no fixed version in OSV) are reported, never bumped. Add `--apply-excludes` (Maven/Gradle only) to have the tool exclude them from the dependency graph instead — Gradle gets a managed `configurations.all { exclude … }` block; Maven attaches `<exclusion>` to the parent dependency. An exclusion counts only when every touched project actually wrote it: a Maven *direct* dependency cannot be excluded and is reported with manual-removal advice instead of a false success.
+**Unfixable packages** (no fixed version in OSV) are reported, never bumped — except by downgrade. When every finding for a package carries an introduced bound and a published release sits strictly below it, `fix` names that newest sub-introduced release as the candidate: without `--allow-downgrades` (Maven/Gradle) it stays in the Unfixable section as a proposal; with the flag the downgrade is applied (marked ↓), each touched project is compile-checked (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`), and any bump that breaks the build is rolled back automatically. Add `--apply-excludes` (Maven/Gradle only) to have the tool exclude them from the dependency graph instead — Gradle gets a managed `configurations.all { exclude … }` block; Maven attaches `<exclusion>` to the parent dependency. An exclusion counts only when every touched project actually wrote it: a Maven *direct* dependency cannot be excluded and is reported with manual-removal advice instead of a false success. Excluding a coordinate that other resolved packages still depend on would remove classes from **every** configuration and break class loading, so the tool refuses such exclusions by default (no prompt, no approval — even under `--apply-excludes`) and reports a health warning naming the dependents; pass `--force-exclude=group:artifact` (repeatable) to accept that risk explicitly.
 
 **npm / Rust:** re-scans overlay direct deps from `package.json` / `Cargo.toml` onto the lockfile tree so bump loops progress without `npm install`. Transitive-only fixes still need a lock refresh after.
 
@@ -312,6 +313,7 @@ fix [path] [options]
 | `--apply` | false | Write changes, then re-scan until clean or stalled (`--max-iterations`, default 10) |
 | `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back. Requires network (not with `--offline`) |
 | `--allow-major` | false | Skip interactive prompts for major bumps |
+| `--allow-downgrades` | false | Maven/Gradle only — apply downgrades for vulnerabilities with no OSV fixed version: the newest published release strictly below the advisory's introduced bound (project repos, then Maven Central). Without the flag the target is only proposed in Unfixable. Each downgrade is compile-checked (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`) and rolled back automatically if the build fails. Requires network (not with `--offline`) |
 | `--allow-renames` | false | Skip prompts for Maven coordinate renames (group:artifact migrations from OSV / known group moves) |
 | `--allow-source-migrations` | false | Apply known source rewrites for applied rename clusters (Java, JS/TS, Python, Rust) |
 | `--ecosystem=<name>` | *(all)* | Limit to one ecosystem |
@@ -319,6 +321,7 @@ fix [path] [options]
 | `--strict` | false | Exit `1` when vulnerabilities remain after the run |
 | `--exclude=group:pkg` | *(none)* | Packages to skip (repeatable) |
 | `--apply-excludes` | false | Maven/Gradle only — exclude unfixable packages (no fixed version) from the dependency graph: Gradle gets a managed `configurations.all { exclude … }` block, Maven attaches `<exclusion>` to the parent dependency. Recorded only when every touched project wrote it; a Maven direct dependency cannot be excluded and is reported instead |
+| `--force-exclude=group:artifact` | *(none)* | Maven/Gradle only — allow excluding an unfixable package that other resolved packages depend on (repeatable). Without it, such exclusions are refused with a health warning naming the dependents, because removing the coordinate from all configurations breaks class loading |
 | `--offline` | false | No network access during re-scans |
 | `--format=markdown\|json` | `markdown` | Output format |
 
@@ -347,6 +350,8 @@ update-db [--ecosystem=<name>]
 2. For each missing/expired cache: downloads the per-ecosystem OSV dump from the public GCS bucket (osv.dev data)
 3. Stores as gzip-compressed JSON (~few MB per ecosystem)
 4. Falls back to cached data if download fails (never breaks your workflow)
+
+**Cache location:** all caches (OSV dumps, the GitHub advisory mirror, and its sync cursor) live in `<target project>/.auto-bumper/` — the CLI changes into the target directory first, so each project keeps its own copy. Override with `AUTO_BUMPER_CACHE_DIR=<dir>`. A GitHub mirror interrupted mid-download is kept as a partial cache and completed on the next run.
 
 ---
 
@@ -407,7 +412,7 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
 | Module | Exports |
 |--------|---------|
 | **scan** | `runAutoBumperScan()` — full scan pipeline (advisory loading, matching, reporting) |
-| **ghsa** | `loadRepoAdvisories()`, `getWatchedRepos()` — vendor-published repo advisories (netty, jackson) from the GitHub API; watchlist in `<cacheRoot>/ghsa-repos.json` |
+| **ghsa** | `loadRepoAdvisories()` — reviewed Maven advisories from `GET /advisories?ecosystem=maven`. The first pull caches the list; later pulls send only `updated>=` the last sync. The query never includes your package names |
 | **local-advisories** | `loadLocalAdvisories()`, `loadLocalAdvisoriesForTarget()`, `getLocalAdvisoriesDir()` — OSV-format JSON in the package `local-advisories/` plus `<target>/local-advisories/`; always loaded, no network involved |
 | **fixer** | `buildFixPlan(findings[])` → `{ fixable[], unfixable[], renames[] }` |
 | **matcher** | `matchVulnerabilities(packages[], advisories[])` → `Finding[]` |
@@ -428,13 +433,14 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
         ├── PyPI.json.gz         ← ~1MB compressed
         ├── Maven.json.gz        ← ~3MB compressed
         ├── Maven-orphan.json.gz ← package-less OSV CVEs bridged onto Maven coordinates
-        └── repo-advisories.json.gz ← vendor-published GHSA advisories (GitHub API)
+        ├── repo-advisories.json.gz ← reviewed GitHub Maven advisories
+        └── repo-advisories.since  ← UTC cursor for the next `updated>=` pull
 ```
 
 - **Location:** Always under current working directory
 - **Format:** Gzip-compressed JSON arrays of OSV advisory entries
 - **Freshness:** every online run HEAD-probes each remote dump by ETag — if the remote object changed since the cache was written, it is re-downloaded immediately; otherwise the local cache is used. If the probe fails (no network), the 7-day TTL applies (configurable via `CACHE_TTL_MS` constant)
-- **GitHub repo advisories:** vendor-published advisories missing from the OSV bulk DB (e.g. netty, FasterXML jackson) are fetched from the GitHub API for a small watched-repo list and cached as `repo-advisories.json.gz`. A failed fetch keeps the last cache. Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the unauthenticated rate limit. `--offline` reads that cache and does not call GitHub. Override the watchlist with `<cacheRoot>/ghsa-repos.json` (JSON array of `"owner/repo"`)
+- **GitHub Maven advisories:** reviewed advisories from the GitHub global advisory API (`ecosystem=maven`), cached as `repo-advisories.json.gz`. The first online refresh downloads the list. Later refreshes send `updated>=` the timestamp in `repo-advisories.since`, plus a withdrawn pass so revoked ids drop out of the cache. The request does not include project package names. A failed fetch keeps the last cache and does not move the cursor. Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the unauthenticated rate limit (the first full pull is many pages). `--offline` reads that cache and does not call GitHub
 - **Fallback strategy:** Stale cache > no cache. If download fails, uses whatever is cached
 - **Disk usage:** ~8MB total across all four ecosystems
 - **Local vendored advisories:** disclosures not yet in the OSV bulk dump can be added as OSV-format JSON files under `<packageRoot>/local-advisories/` (shipped with this package) and under `<project>/local-advisories/` (the repo you scan). A project file with the same advisory id replaces the packaged copy. Loaded on every scan, works offline, never fetched
@@ -461,7 +467,7 @@ What each data source does offline:
 |-------------|-----------------|----------------------|
 | Per-ecosystem OSV dumps (GCS) | Fresh cache used; stale/missing → download | Cache used **regardless of TTL**. No cache file → exit `2` (no download). Run `update-db` online first |
 | Orphan-CVE bridge (Maven) | Same as above | Local cache or empty — never fetched |
-| GHSA vendor repo advisories (netty/jackson) | Fetched + cached. On fetch failure the last cache is used. `GITHUB_TOKEN` or `GH_TOKEN` is sent when set. Fetch failure with no cache is an incomplete scan (exit 2, not clean) | Cache is read. A missing cache is a warning, not a download |
+| GitHub reviewed Maven advisories | Full list on first pull, then `updated>=` cursor. On fetch failure the last cache is used and the cursor stays put. `GITHUB_TOKEN` or `GH_TOKEN` is sent when set. Fetch failure with no cache is an incomplete scan (exit 2, not clean) | Cache is read. A missing cache is a warning, not a download |
 | Local vendored advisories (`local-advisories/*.json`) | Loaded from the package and from `<project>/local-advisories/` | **Always loaded** — pure local files, no fetch involved |
 
 Practical notes:

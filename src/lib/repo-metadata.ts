@@ -62,6 +62,17 @@ export function pickNextVersion(versions: string[], minVersion: string): string 
   return above[0]!;
 }
 
+/** Newest non-SNAPSHOT, non-prerelease version strictly below `boundary`, or null. Pure — unit-testable. */
+export function pickPreviousVersion(versions: string[], boundary: string): string | null {
+  const below = versions.filter(v => !isPreReleaseOrSnapshot(v) && compareMavenVersion(v, boundary) < 0);
+  if (below.length === 0) return null;
+  let best = below[0];
+  for (const v of below.slice(1)) {
+    if (compareMavenVersion(v, best) > 0) best = v;
+  }
+  return best;
+}
+
 /** Version entries of a Maven maven-metadata.xml, in document order. */
 export function extractMetadataVersions(body: string): string[] {
   const versions = [...body.matchAll(/<version>([^<]+)<\/version>/g)].map(m => m[1].trim());
@@ -238,6 +249,34 @@ export async function findLatestAvailableVersion(
     return { version: latestReleaseVersion(versions, currentVersion), metadataFound: true };
   }
   return { version: null, metadataFound: false };
+}
+
+/**
+ * Newest non-prerelease release of `packageName` strictly below `boundary`, read from the
+ * repository's maven-metadata.xml (the project's declared repositories first, then Maven
+ * Central). Null when nothing below the boundary exists or no metadata was reachable.
+ * Best-effort.
+ */
+export async function findPreviousAvailableVersion(
+  manifestPath: string,
+  kind: "gradle" | "maven",
+  packageName: string,
+  boundary: string,
+): Promise<string | null> {
+  const [group, artifact] = packageName.split(":");
+  if (!group || !artifact) return null;
+
+  let bases = extractRepoUrls(manifestPath, kind);
+  if (!bases.some(b => stripTrailingSlashes(b) === MAVEN_CENTRAL)) bases.push(MAVEN_CENTRAL);
+  const groupPath = group.replaceAll(".", "/");
+  for (const base of bases) {
+    const xml = await fetchText(`${stripTrailingSlashes(base)}/${groupPath}/${artifact}/maven-metadata.xml`);
+    if (!xml) continue;
+    const versions = extractMetadataVersions(xml);
+    if (versions.length === 0) continue;
+    return pickPreviousVersion(versions, boundary);
+  }
+  return null;
 }
 
 /**

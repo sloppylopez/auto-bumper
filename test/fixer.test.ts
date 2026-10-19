@@ -1,5 +1,5 @@
 import type { Finding } from "../src/lib/types.ts";
-import { buildFixPlan, withNextFixVersion } from "../src/lib/fixer.ts";
+import { buildFixPlan, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 
 const makeFinding = (overrides: Partial<Finding>): Finding => ({
   id: "GHSA-test",
@@ -172,5 +172,75 @@ describe("withNextFixVersion", () => {
   it("stays unfixable when nothing newer is published", () => {
     expect(withNextFixVersion(candidate, null)).toBeNull();
     expect(withNextFixVersion(candidate, "1.9")).toBeNull();
+  });
+});
+
+describe("withDowngradeVersion", () => {
+  const candidate = {
+    packageName: "org.glassfish.jaxb:jaxb-core",
+    installedVersion: "4.0.5",
+    targetVersion: null,
+    isMajor: false,
+    findingIds: ["GHSA-JAXB"],
+    severity: "HIGH" as const,
+    ecosystem: "maven",
+    introduced: "3.0.3",
+  };
+
+  it("uses a release strictly below the introduced bound and flags it as a downgrade", () => {
+    const promoted = withDowngradeVersion(candidate, "3.0.2");
+    expect(promoted?.targetVersion).toBe("3.0.2");
+    expect(promoted?.isDowngrade).toBe(true);
+  });
+
+  it("never targets the introduced bound itself (still vulnerable)", () => {
+    expect(withDowngradeVersion(candidate, "3.0.3")).toBeNull();
+  });
+
+  it("refuses a release at or above the installed version", () => {
+    expect(withDowngradeVersion(candidate, "4.0.5")).toBeNull();
+    expect(withDowngradeVersion(candidate, "4.1.0")).toBeNull();
+  });
+
+  it("returns null without an introduced bound or with no previous release", () => {
+    expect(withDowngradeVersion({ ...candidate, introduced: undefined }, "3.0.2")).toBeNull();
+    expect(withDowngradeVersion(candidate, null)).toBeNull();
+  });
+
+  it("marks isMajor when the downgrade crosses a major boundary", () => {
+    const promoted = withDowngradeVersion(candidate, "2.3.9");
+    expect(promoted?.isMajor).toBe(true);
+  });
+
+  it("ignores candidates that already have a forward fix", () => {
+    expect(withDowngradeVersion({ ...candidate, targetVersion: "4.0.6" }, "3.0.2")).toBeNull();
+  });
+});
+
+describe("buildFixPlan introduced propagation", () => {
+  const mavenFinding = (id: string, introduced?: string): Finding => makeFinding({
+    id,
+    ecosystem: "maven",
+    packageName: "org.example:lib",
+    installedVersion: "4.0.5",
+    fixedVersions: [],
+    vulnerableRange: ">=3.0.3",
+    introduced,
+  });
+
+  it("takes the minimum introduced across findings of one package", () => {
+    const plan = buildFixPlan([mavenFinding("GHSA-1", "3.0.3"), mavenFinding("GHSA-2", "3.1.0")]);
+    expect(plan.unfixable.length).toBe(1);
+    expect(plan.unfixable[0].introduced).toBe("3.0.3");
+  });
+
+  it("leaves introduced undefined when any finding lacks the bound", () => {
+    const plan = buildFixPlan([mavenFinding("GHSA-1", "3.0.3"), mavenFinding("GHSA-2")]);
+    expect(plan.unfixable.length).toBe(1);
+    expect(plan.unfixable[0].introduced).toBeUndefined();
+  });
+
+  it("returns an empty downgrades list", () => {
+    expect(buildFixPlan([]).downgrades).toEqual([]);
   });
 });

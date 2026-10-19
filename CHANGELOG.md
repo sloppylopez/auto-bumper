@@ -2,6 +2,26 @@
 
 All notable changes to `@elephantseed/auto-bumper`.
 
+## [Unreleased]
+
+### Added
+- `AUTO_BUMPER_SUPPLEMENTAL` environment variable: setting it to `off`, `0`, or `false` (case-insensitive) disables both supplemental advisory sources — GitHub's reviewed Maven advisory list and the orphan-CVE bridge — so scans run strictly on the OSV bulk dump plus locally-vendored advisories. Unset or any other value keeps current behavior
+- `fix --force-exclude=group:artifact` (Maven/Gradle, repeatable): explicitly approve excluding an unfixable coordinate that other resolved packages still depend on — see the refusal behavior under Fixed
+- Vendored two SNYK-only Maven advisories absent from the OSV bulk dump: CVE-2026-93879 / SNYK-JAVA-ORGHIBERNATEVALIDATOR-20877468 (`org.hibernate.validator:hibernate-validator`, fixed 9.2.0.Beta1) and SNYK-JAVA-JAKARTAVALIDATION-20936881 (`jakarta.validation:jakarta.validation-api` 2.0.1–< 4.0.0-M1, fixed 4.0.0-M1)
+- `fix --allow-downgrades` (Maven/Gradle): for vulnerabilities with no fixed version in OSV, the tool now computes the newest published release strictly below the advisory's introduced bound and proposes a downgrade out of the affected window. Without the flag the proposal is shown in the Unfixable section only; with it, the downgrade is applied (marked ↓ in the plan), each touched project is compile-checked afterwards (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`), and a failed build rolls back that project's downgrade bumps one by one — original versions kept, reported as remaining issues. Requires an introduced bound on every finding for the package; skipped when `--offline`
+
+### Changed
+- Reviewed Maven advisories now come from GitHub's global advisory list (`GET /advisories?ecosystem=maven`) instead of a five-repo watchlist. The first pull caches the set; later pulls ask only for rows updated since `repo-advisories.since`. The request does not include the project's package names. A failed fetch keeps the previous cache and does not move the cursor. The now-dead `getWatchedRepos` / `DEFAULT_WATCHED_REPOS` exports are removed
+- Maven/Gradle dependency tree parsing now retains parent edges (`PackageRef.requiredBy`: the coordinates that require each package on the resolved classpath), so `fix` can tell whether an unfixable coordinate is still needed by something else before excluding it
+- `fix --apply`'s `Applied:` lines report the version actually written to the manifest: when a pin is aligned to a higher declared version elsewhere in the project, that aligned version is reported instead of the requested target
+
+### Fixed
+- Windows Gradle invocation: `windowsBatchArgs` always quoted the executable, but cmd.exe cannot resolve a bare `.bat`/`.cmd` name through PATH when it is quoted, so wrapper invocations failed; the executable is now quoted only when its path contains whitespace
+- GitHub Maven advisory fetch: a stale or invalid `GITHUB_TOKEN` / `GH_TOKEN` produced a 401 that aborted supplemental loading; since the endpoint is public, the request now retries once anonymously before failing — and once the token is rejected, every later request in the same run (including pagination) also goes anonymous
+- `fix` no longer excludes unfixable coordinates that other resolved packages depend on from all configurations — such a global exclusion removed classes the classpath still loads and broke class loading. The exclude gate now refuses these by default (no prompt, no approval, even under `--apply-excludes`) and reports a health warning naming the dependents; `--force-exclude=group:artifact` overrides per coordinate
+- GitHub Maven advisory sync: a bootstrap interrupted mid-pagination (e.g. a rate limit or network failure on page 2) now keeps the pages already fetched as a partial cache and returns them with a warning instead of discarding everything. A cache without its sync cursor counts as incomplete and is re-synced even inside the TTL window, so the next run completes it
+- GitHub Maven advisory fetch: an anonymous 403 carrying rate-limit headers now reports `rate limit exceeded (resets <UTC time>)` with advice to set `GITHUB_TOKEN`, instead of a generic HTTP 403 message — and when a configured token was rejected first, the error says so (refresh the token) rather than suggesting to set one
+
 ## [0.0.4] - 2026-10-15
 
 ### Added

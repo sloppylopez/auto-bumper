@@ -958,7 +958,10 @@ function findUp(dir: string, fileName: string): string | null {
  */
 export function windowsBatchArgs(executable: string, args: string[]): string[] {
   const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
-  const command = `"${[quote(executable), ...args.map(quote)].join(" ")}"`;
+  // cmd.exe cannot resolve a quoted bare .cmd/.bat name through PATH (it fails silently);
+  // only quote the executable when the path actually contains whitespace.
+  const exe = /\s/.test(executable) ? quote(executable) : executable;
+  const command = `"${[exe, ...args.map(quote)].join(" ")}"`;
   return ["/d", "/s", "/c", command];
 }
 
@@ -990,7 +993,7 @@ function spawnCaptured(
 }
 
 /** Find mvnw or system mvn. Wrapper search stops at the git root. */
-function detectMaven(dir: string): { executable: string; isWrapper: boolean } | null {
+export function detectMaven(dir: string): { executable: string; isWrapper: boolean } | null {
   const isWin = process.platform === "win32";
   const wrapperName = isWin ? "mvnw.cmd" : "mvnw";
   const wrapper = findUp(dir, wrapperName);
@@ -1190,30 +1193,44 @@ function matchesCoordShape(token: string): boolean {
 }
 
 /** Parse Maven dependency:tree output into PackageRef[]. */
-function parseMavenTree(output: string, filePath: string): ParseResult {
+export function parseMavenTree(output: string, filePath: string): ParseResult {
   const pkgs: PackageRef[] = [];
   const seen = new Set<string>();
+  // Monotonic stack of (prefix length, coordinate) — the top entry with a shorter prefix than the
+  // current line is its parent. Prefix length grows strictly with depth in dependency:tree output,
+  // so raw lengths compare correctly without assuming an exact cell width.
+  const parentStack: Array<{ prefixLen: number; name: string }> = [];
 
   for (const rawLine of output.split("\n")) {
     const line = rawLine.replace(/^\[INFO\]\s*/, "").trim();
     if (!line || /omitted for duplicate|omitted for conflict/i.test(line)) continue;
 
-    const trimmed = line.replace(/^[|\s+\\-]+/, "");
+    const prefixMatch = /^[|\s+\\-]+/.exec(line);
+    const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
+    const trimmed = line.slice(prefixLen);
     const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
     if (!match) continue;
 
     const [, group, artifact, version] = match;
     if (!version || version.startsWith("(")) continue;
 
+    while (parentStack.length > 0 && parentStack[parentStack.length - 1].prefixLen >= prefixLen) {
+      parentStack.pop();
+    }
+    const parentName = parentStack.length > 0 ? parentStack[parentStack.length - 1].name : null;
+
     const key = `${group.toLowerCase()}:${artifact.toLowerCase()}@${version}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    pkgs.push({
+    const pkg: PackageRef = {
       ecosystem: "maven",
       name: `${group}:${artifact}`,
       version,
       manifestPath: filePath,
-    });
+    };
+    if (parentName) pkg.requiredBy = [parentName];
+    pkgs.push(pkg);
+    parentStack.push({ prefixLen, name: `${group}:${artifact}` });
   }
 
   return pkgs.length > 0 ? { packages: pkgs, warnings: [] } : { packages: [], warnings: [] };
@@ -1260,7 +1277,7 @@ export function parseBuildGradle(filePath: string): ParseResult {
 }
 
 /** Find gradlew. Search stops at the git root so a parent outside the repo is not executed. */
-function detectGradlew(dir: string): string | null {
+export function detectGradlew(dir: string): string | null {
   const name = process.platform === "win32" ? "gradlew.bat" : "gradlew";
   return findUp(dir, name);
 }
@@ -1576,6 +1593,11 @@ interface GradleTreeState {
   unresolved: string[];
   seen: Set<string>;
   failedSeen: Set<string>;
+  // Monotonic stack of (prefix length, coordinate): the top entry with a shorter prefix than the
+  // current line is its parent. Prefix length grows strictly with depth in `gradlew dependencies`
+  // output, so raw lengths compare correctly without assuming an exact cell width.
+  parentStack: Array<{ prefixLen: number; name: string }>;
+  byKey: Map<string, PackageRef>;
 }
 
 /** Strip Gradle decoration from a tree-line version: "->" resolution, "{strictly x}" braces, "(...)" notes. */
@@ -1595,9 +1617,10 @@ function normalizeGradleTreeVersion(rawVersion: string): string {
 }
 
 function parseGradleTreeLine(line: string, filePath: string, state: GradleTreeState): void {
-  const match = /^[|\s]*[+\\-]---\s+([\w.@-]+):([\w.@-]+):(.*)$/.exec(line);
+  const match = /^([|\s]*)([+\\-])---\s+([\w.@-]+):([\w.@-]+):(.*)$/.exec(line);
   if (!match) return;
-  const [, group, name, rawVersionPart] = match;
+  const prefixLen = match[1].length;
+  const [, , , group, name, rawVersionPart] = match;
   const rawVersion = rawVersionPart.trimStart();
   // Gradle marks unresolvable deps with a trailing "FAILED" (e.g. "10.1.58 FAILED" or "1.2 -> 3.4 FAILED")
   if (/\sFAILED$/.test(rawVersion)) {
@@ -1614,14 +1637,32 @@ function parseGradleTreeLine(line: string, filePath: string, state: GradleTreeSt
   const version = normalizeGradleTreeVersion(rawVersion);
   if (!version || version.startsWith('(')) return;
   const key = `${group}:${name}`.toLowerCase();
-  if (state.seen.has(key)) return;
-  state.seen.add(key);
-  state.pkgs.push({ ecosystem: 'maven', name: `${group}:${name}`, version, manifestPath: filePath });
+
+  while (state.parentStack.length > 0 && state.parentStack[state.parentStack.length - 1].prefixLen >= prefixLen) {
+    state.parentStack.pop();
+  }
+  const parentName = state.parentStack.length > 0 ? state.parentStack[state.parentStack.length - 1].name : null;
+
+  if (state.seen.has(key)) {
+    // Diamond: the first occurrence must not hide later parents — append this one.
+    const existing = state.byKey.get(key);
+    if (existing && parentName) {
+      const requiredBy = existing.requiredBy ?? (existing.requiredBy = []);
+      if (!requiredBy.includes(parentName)) requiredBy.push(parentName);
+    }
+  } else {
+    state.seen.add(key);
+    const pkg: PackageRef = { ecosystem: 'maven', name: `${group}:${name}`, version, manifestPath: filePath };
+    if (parentName) pkg.requiredBy = [parentName];
+    state.pkgs.push(pkg);
+    state.byKey.set(key, pkg);
+  }
+  state.parentStack.push({ prefixLen, name: `${group}:${name}` });
 }
 
 /** Parse Gradle dependency tree output into PackageRef[] */
 export function parseGradleTree(output: string, filePath: string): ParseResult {
-  const state: GradleTreeState = { pkgs: [], unresolved: [], seen: new Set(), failedSeen: new Set() };
+  const state: GradleTreeState = { pkgs: [], unresolved: [], seen: new Set(), failedSeen: new Set(), parentStack: [], byKey: new Map() };
   for (const line of output.split(/\r?\n/)) {
     parseGradleTreeLine(line, filePath, state);
   }

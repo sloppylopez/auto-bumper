@@ -33,6 +33,8 @@ export interface BumpRequest {
   because: string[];
   /** Ecosystem of the bump ("maven" for Maven coordinates); present on --latest bumps that carry no advisory finding. */
   ecosystem?: string;
+  /** True when the target is strictly below the installed version (user-approved downgrade). */
+  isDowngrade?: boolean;
 }
 
 export interface RenameRequest {
@@ -64,6 +66,8 @@ export interface ApplyResult {
   /** Packages forced via resolutionStrategy (beats enforcedPlatform). */
   forced: string[];
   warnings: string[];
+  /** Version actually written per package (managed pins may be raised to the declared version). */
+  appliedTargets?: Record<string, string>;
 }
 
 function escapeRegex(s: string): string {
@@ -495,7 +499,7 @@ function upsertManagedBlock(
   }
   for (const force of forces) {
     const prev = forceMap.get(force.packageName);
-    if (!prev || compareMavenVersion(force.targetVersion, prev) > 0) {
+    if (force.isDowngrade || !prev || compareMavenVersion(force.targetVersion, prev) > 0) {
       forceMap.set(force.packageName, force.targetVersion);
     }
   }
@@ -626,6 +630,7 @@ export function collectForcePins(content: string, bumps: BumpRequest[]): BumpReq
     forces.set(bump.packageName, bump);
     const [group, artifact] = bump.packageName.split(":");
     if (!group || !artifact) continue;
+    if (bump.isDowngrade) continue; // never drag shared-variable siblings down with a downgrade
 
     const varRefRe = new RegExp(
       String.raw`["']${escapeRegex(group)}:${escapeRegex(artifact)}:\$\{(\w+)\}["']`,
@@ -684,8 +689,9 @@ export function readDeclaredVersion(content: string, packageName: string): strin
   return null;
 }
 
-/** Raise bump target to max(OSV target, version already in the manifest). */
+/** Raise bump target to max(OSV target, version already in the manifest). Downgrades keep their target. */
 export function withEffectiveVersion(content: string, bump: BumpRequest): BumpRequest {
+  if (bump.isDowngrade) return bump;
   const declared = readDeclaredVersion(content, bump.packageName);
   if (declared && compareMavenVersion(declared, bump.targetVersion) > 0) {
     return { ...bump, targetVersion: declared };
@@ -713,7 +719,7 @@ function mergePinsToEffective(
     const prevPin = pins.get(bump.packageName);
     const prevConstraint = existing.get(bump.packageName);
     const prevVer = prevPin?.targetVersion ?? prevConstraint?.version;
-    if (!prevVer || compareMavenVersion(bump.targetVersion, prevVer) > 0) {
+    if (bump.isDowngrade || !prevVer || compareMavenVersion(bump.targetVersion, prevVer) > 0) {
       pins.set(bump.packageName, bump);
     }
   }
@@ -821,6 +827,11 @@ export function applyBumps(
   content = upsertManagedBlock(content, pins, excludes, forces, kotlin);
   result.direct.push(...catalogDirect, ...classified.direct);
   result.constrained.push(...pins.map(p => p.packageName));
+  if (pins.length > 0) {
+    const appliedTargets: Record<string, string> = {};
+    for (const p of pins) appliedTargets[p.packageName] = p.targetVersion;
+    result.appliedTargets = appliedTargets;
+  }
   result.warnings.push(...classified.warnings);
   emitSpringBootWarnings(result, pins);
   result.excluded = excludes.map(e => e.packageName);

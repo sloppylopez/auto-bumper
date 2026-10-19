@@ -49,4 +49,24 @@ describe("parseGradleTree", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("retains parent edges including diamond re-occurrences", () => {
+    const tree = [
+      "runtimeClasspath",
+      "+--- org.a:a:1.0.0",
+      "|    +--- org.b:b:2.0.0",
+      "|    |    \\--- org.d:d:1.0.0",
+      "|    \\--- org.e:e:1.0.0",
+      "\\--- org.c:c:3.0.0",
+      "     \\--- org.b:b:2.0.0 (*)",
+    ].join("\n");
+    const result = parseGradleTree(tree, "build.gradle");
+    // Top-level deps have no parent in the printed output.
+    expect(result.packages.find((p) => p.name === "org.a:a")?.requiredBy).toBeUndefined();
+    expect(result.packages.find((p) => p.name === "org.c:c")?.requiredBy).toBeUndefined();
+    // Diamond: b appears under a and c — both parents retained despite dedup.
+    expect(result.packages.find((p) => p.name === "org.b:b")?.requiredBy).toEqual(["org.a:a", "org.c:c"]);
+    expect(result.packages.find((p) => p.name === "org.d:d")?.requiredBy).toEqual(["org.b:b"]);
+    expect(result.packages.find((p) => p.name === "org.e:e")?.requiredBy).toEqual(["org.a:a"]);
+  });
 });

@@ -33,6 +33,12 @@ export interface FixCandidate {
   latest?: boolean;
   /** Inclusive last-affected version when OSV has no fixed version. */
   lastAffected?: string;
+  /** True when this fix moves to an OLDER release (downgrade out of the affected window). */
+  isDowngrade?: boolean;
+  /** Exclusive lower bound of the vulnerable window across all findings for this package (minimum introduced); undefined when safety cannot be proven. */
+  introduced?: string;
+  /** Computed downgrade target while the candidate is still unfixable (proposal only, not applied). */
+  downgradeTarget?: string;
 }
 
 export interface FixPlan {
@@ -42,6 +48,8 @@ export interface FixPlan {
   unfixable: FixCandidate[];
   /** Package coordinate renames (Maven group:artifact or npm/pypi/crate name moves). */
   renames: FixCandidate[];
+  /** Downgrade-only fixes (no forward fix exists); applied only with --allow-downgrades. */
+  downgrades: FixCandidate[];
 }
 
 const SEVERITY_RANK: Record<string, number> = {
@@ -156,7 +164,7 @@ export function buildFixPlan(findings: Finding[], advisories: AdvisoryEntry[] = 
   const remainingFixable = fixable.filter(f => !renameFrom.has(candidateKey(f)));
   const remainingUnfixable = unfixable.filter(u => !renameFrom.has(candidateKey(u)));
 
-  return { fixable: remainingFixable, unfixable: remainingUnfixable, renames };
+  return { fixable: remainingFixable, unfixable: remainingUnfixable, renames, downgrades: [] };
 }
 
 /** Build a single FixCandidate from grouped findings for one ecosystem+package */
@@ -177,6 +185,7 @@ function buildCandidate(pkgFindings: Finding[]): FixCandidate {
     severity,
     ecosystem,
     lastAffected: highestLastAffected(pkgFindings),
+    introduced: lowestIntroduced(pkgFindings),
   };
 }
 
@@ -187,6 +196,21 @@ function highestLastAffected(findings: Finding[]): string | undefined {
   for (const finding of findings) {
     if (!finding.lastAffected) continue;
     if (!best || cmp(finding.lastAffected, best, eco) > 0) best = finding.lastAffected;
+  }
+  return best;
+}
+
+/**
+ * Strictly-lower safe boundary for downgrades: the minimum `introduced` across all findings
+ * for the package. Undefined when any finding lacks an introduced bound — a release below
+ * that finding's window cannot be proven safe, so no downgrade may be proposed.
+ */
+function lowestIntroduced(findings: Finding[]): string | undefined {
+  let best: string | undefined;
+  const eco = findings[0].ecosystem;
+  for (const finding of findings) {
+    if (!finding.introduced) return undefined;
+    if (best === undefined || cmp(finding.introduced, best, eco) < 0) best = finding.introduced;
   }
   return best;
 }
@@ -203,6 +227,24 @@ export function withNextFixVersion(candidate: FixCandidate, nextVersion: string 
     ...candidate,
     targetVersion: nextVersion,
     isMajor: majorOf(nextVersion) !== majorOf(candidate.installedVersion),
+  };
+}
+
+/**
+ * A published release strictly below the advisory's introduced bound fixes the finding by
+ * moving out of the affected window. The boundary itself stays vulnerable and is never the
+ * target, and the release must also be strictly older than what is installed.
+ */
+export function withDowngradeVersion(candidate: FixCandidate, previousVersion: string | null): FixCandidate | null {
+  if (candidate.targetVersion || !candidate.introduced || !previousVersion) return null;
+  const eco = candidate.ecosystem || "maven";
+  if (cmp(previousVersion, candidate.introduced, eco) >= 0) return null;
+  if (cmp(previousVersion, candidate.installedVersion, eco) >= 0) return null;
+  return {
+    ...candidate,
+    targetVersion: previousVersion,
+    isMajor: majorOf(previousVersion) !== majorOf(candidate.installedVersion),
+    isDowngrade: true,
   };
 }
 

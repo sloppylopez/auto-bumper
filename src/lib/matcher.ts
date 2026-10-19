@@ -93,6 +93,7 @@ export function matchVulnerabilities(packages: PackageRef[], osvData: any[]): Fi
         vulnerableRange: result.range || `=${pkg.version}`,
         fixedVersions,
         lastAffected: result.lastAffected,
+        introduced: result.introduced,
         severity,
         summary: entry.summary || `${pkg.name}@${pkg.version} has a known vulnerability`,
         references: extractReferences(entry),
@@ -121,6 +122,8 @@ interface AffectedResult {
   range?: string;
   /** Inclusive end of the matching window. Not a fixed version. */
   lastAffected?: string;
+  /** Exclusive lower bound of the matching window (event-based ranges only). */
+  introduced?: string;
 }
 
 /** Check if a specific version falls within the affected range of an OSV entry */
@@ -538,6 +541,8 @@ interface AffectedEventResult {
   isAffected: boolean;
   range?: string;
   lastAffected?: string;
+  /** Exclusive lower bound of the matching segment. */
+  introduced?: string;
 }
 
 /** Compare versions for ECOSYSTEM event ranges (and fix planning). */
@@ -614,7 +619,7 @@ function matchesEcosystemEvents(
     if (!versionInEventSegment(version, segment, ecosystem)) continue;
     const range = buildSegmentRange(segment);
     const lastAffected = segment.last_affected ?? undefined;
-    return { isAffected: true, range, lastAffected };
+    return { isAffected: true, range, lastAffected, introduced: segment.introduced };
   }
   return { isAffected: false };
 }

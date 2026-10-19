@@ -121,4 +121,28 @@ describe("vendored OSV-orphan Maven advisories (data contract)", () => {
     const clean = matchVulnerabilities([pkg("org.glassfish.jaxb:jaxb-core", "3.0.2")], advisories);
     expect(clean).toHaveLength(0);
   });
+
+  it("flags hibernate-validator below 9.2.0.Beta1 with the fix and leaves 9.2.0.Beta1 clean", () => {
+    const advisories = loadLocalAdvisories(getLocalAdvisoriesDir());
+
+    const vulnerable = matchVulnerabilities([pkg("org.hibernate.validator:hibernate-validator", "9.1.5.Final")], advisories);
+    expect(vulnerable).toHaveLength(1);
+    expect(vulnerable[0].id).toBe("CVE-2026-93879");
+    expect(vulnerable[0].fixedVersions[0]).toBe("9.2.0.Beta1");
+
+    const clean = matchVulnerabilities([pkg("org.hibernate.validator:hibernate-validator", "9.2.0.Beta1")], advisories);
+    expect(clean).toHaveLength(0);
+  });
+
+  it("flags jakarta.validation-api in [2.0.1,4.0.0-M1) with the fix and leaves 4.0.0-M1 clean", () => {
+    const advisories = loadLocalAdvisories(getLocalAdvisoriesDir());
+
+    const vulnerable = matchVulnerabilities([pkg("jakarta.validation:jakarta.validation-api", "3.0.2")], advisories);
+    expect(vulnerable).toHaveLength(1);
+    expect(vulnerable[0].id).toBe("SNYK-JAVA-JAKARTAVALIDATION-20936881");
+    expect(vulnerable[0].fixedVersions[0]).toBe("4.0.0-M1");
+
+    const clean = matchVulnerabilities([pkg("jakarta.validation:jakarta.validation-api", "4.0.0-M1")], advisories);
+    expect(clean).toHaveLength(0);
+  });
 });

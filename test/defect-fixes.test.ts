@@ -417,6 +417,12 @@ describe("security guards", () => {
     expect(line[3]).toBe(String.raw`""C:\ok & calc\gradlew.bat" "dependencies" "--quiet""`);
   });
 
+  it("leaves a bare batch name unquoted so cmd resolves it through PATH", () => {
+    const line = windowsBatchArgs("mvn.cmd", ["--version"]);
+    expect(line.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+    expect(line[3]).toBe('"mvn.cmd "--version""');
+  });
+
   it("rejects a zip entry that climbs out of the extract dir", () => {
     expect(() => assertNoZipSlip(["ok.json", "../evil.json"])).toThrow(/escapes/);
   });

@@ -422,6 +422,38 @@ describe("matchVulnerabilities", () => {
   });
 });
 
+describe("finding introduced bound", () => {
+  it("carries the introduced event of an ECOSYSTEM range without a fix", () => {
+    const packages = [{ ecosystem: "maven", name: "org.glassfish.jaxb:jaxb-core", version: "4.0.5", manifestPath: "pom.xml" }];
+    const osvData = [{
+      id: "GHSA-jaxb-test",
+      aliases: ["CVE-2023-21980"],
+      ecosystems: ["Maven"],
+      affected: [{
+        package: { name: "org.glassfish.jaxb:jaxb-core", ecosystem: "Maven" },
+        ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "3.0.3" }] }],
+      }],
+    }];
+    const results = matchVulnerabilities(packages, osvData);
+    expect(results.length).toBe(1);
+    expect(results[0].introduced).toBe("3.0.3");
+    expect(results[0].fixedVersions).toEqual([]);
+  });
+
+  it("leaves introduced undefined for exact-version (rep) advisories", () => {
+    const packages = [{ ecosystem: "maven", name: "org.example:lib", version: "1.2.3", manifestPath: "pom.xml" }];
+    const osvData = [{
+      id: "GHSA-rep-test",
+      aliases: [],
+      ecosystems: ["Maven"],
+      affected: [{ package: { name: "org.example:lib", ecosystem: "Maven" }, versions: ["1.2.3"], ranges: [] }],
+    }];
+    const results = matchVulnerabilities(packages, osvData);
+    expect(results.length).toBe(1);
+    expect(results[0].introduced).toBeUndefined();
+  });
+});
+
 // ─── Parallel Release Lines (Maven backports) ──────────────
 
 describe("parallel release lines", () => {

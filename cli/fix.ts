@@ -3,20 +3,21 @@
  * Auto-Bumper Fix — Polyglot auto-remediation for Java, npm, Rust, Python.
  *
  * Usage:
- *   fix [path] [--dry-run] [--apply] [--allow-major] [--allow-renames] [--allow-source-migrations] [--apply-excludes] [--latest] [--offline] [options]
+ *   fix [path] [--dry-run] [--apply] [--allow-major] [--allow-renames] [--allow-downgrades] [--allow-source-migrations] [--apply-excludes] [--force-exclude=group:artifact] [--latest] [--offline] [options]
  *   bun cli/fix.ts [path] [options]   (local dev)
  */
 import fs from "node:fs";
+import childProcess from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
-import { GRADLE_ALL_CONFIGURATIONS, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect } from "../src/lib/parse-lockfile.ts";
-import { buildFixPlan, majorOf, withNextFixVersion } from "../src/lib/fixer.ts";
+import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { buildFixPlan, majorOf, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
-import { findLatestAvailableVersion, findNextAvailableVersion, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
+import { findLatestAvailableVersion, findNextAvailableVersion, findPreviousAvailableVersion, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
 import { compareMavenVersion, matchVulnerabilities } from "../src/lib/matcher.ts";
 import {
   applyBumps as applyGradleBumps,
@@ -107,6 +108,7 @@ if (args.includes("--yolo")) {
 const dryRun = args.includes("--dry-run");
 const applyFlag = args.includes("--apply");
 const allowMajor = args.includes("--allow-major");
+const allowDowngrades = args.includes("--allow-downgrades");
 const allowRenames = args.includes("--allow-renames");
 const applyExcludes = args.includes("--apply-excludes");
 const deprecatedJavaImports = args.includes("--allow-java-imports");
@@ -129,6 +131,8 @@ const maxIterations = maxIterFlag
   ? Number.parseInt(maxIterFlag.split("=")[1]!, 10)
   : 10;
 const excludeArgs = args.filter(a => a.startsWith("--exclude=")).map(a => a.split("=")[1]!);
+const forceExcludeArgs = args.filter(a => a.startsWith("--force-exclude=")).map(a => a.split("=")[1]!);
+const forceExcludeCoords = new Set(forceExcludeArgs.map(s => s.toLowerCase()));
 const ecosystemFlag = args.find(a => a.startsWith("--ecosystem="));
 const ecosystemFilter = ecosystemFlag ? ecosystemFlag.split("=")[1]?.toLowerCase() : null;
 
@@ -152,6 +156,8 @@ interface AppliedBump {
   manifestPath?: string;
   /** True for preemptive --latest bumps (no advisory finding). */
   latest?: boolean;
+  /** True when this bump moved the project to an OLDER release (downgrade-only fix). */
+  isDowngrade?: boolean;
 }
 
 /** Detect ALL fixable projects in directory */
@@ -273,8 +279,9 @@ function pushPlannedBumps(lines: string[], fixable: FixCandidate[]): void {
   if (fixable.length === 0) return;
   lines.push(`## Planned bumps (${fixable.length})`, "", "| Package | Current | Target | Major | Advisories |", "|---------|---------|--------|-------|------------|");
   for (const c of fixable) {
-    lines.push(`| ${c.packageName} | ${c.installedVersion} | ${c.targetVersion} | ${c.isMajor ? "yes" : "no"} | ${c.findingIds.length > 0 ? c.findingIds.slice(0, 2).join(", ") : "—"} |`);
+    lines.push(`| ${c.packageName} | ${c.installedVersion} | ${c.targetVersion}${c.isDowngrade ? " ↓" : ""} | ${c.isMajor ? "yes" : "no"} | ${c.findingIds.length > 0 ? c.findingIds.slice(0, 2).join(", ") : "—"} |`);
   }
+  if (fixable.some(c => c.isDowngrade)) lines.push("- Downgrades (↓) move to an OLDER release — applied only with --allow-downgrades; each is compile-checked and rolled back automatically if the build fails.");
   lines.push("");
 }
 
@@ -341,6 +348,8 @@ function pushUnfixable(lines: string[], unfixable: FixCandidate[], unfixableRema
   for (const u of all) {
     if (excludeFailed?.has(u.packageName)) {
       lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV, and it cannot be excluded (likely a direct dependency) — remove it from the manifest manually, or use --exclude=${u.packageName}`);
+    } else if (u.downgradeTarget) {
+      lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV; safe downgrade target ${u.downgradeTarget} available (below introduced ${u.introduced ?? "?"}) — pass --allow-downgrades to apply it`);
     } else {
       lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV (consider --exclude=${u.packageName}, or re-run with --apply-excludes)`);
     }
@@ -433,9 +442,20 @@ async function filterByRenameGate(candidates: FixCandidate[]) {
 }
 
 /** Gate for unfixable packages: exclude them from the dependency graph when approved. Exclusions are only expressible in Maven/Gradle manifests. */
-async function filterByExcludeGate(unfixable: FixCandidate[], projects: ProjectInfo[], preApproved: Set<string>, failed: Set<string>) {
+export async function filterByExcludeGate(
+  unfixable: FixCandidate[],
+  projects: ProjectInfo[],
+  preApproved: Set<string>,
+  failed: Set<string>,
+  packages: PackageRef[],
+  forceExclude: Set<string>,
+): Promise<{ approved: FixCandidate[]; warnings: string[] }> {
   const approved: FixCandidate[] = [];
-  if (!projects.some(isMavenLike)) return { approved };
+  const warnings: string[] = [];
+  if (!projects.some(isMavenLike)) return { approved, warnings };
+  // coordinate (lowercase) -> PackageRef, so each candidate's own dependents can be read from its requiredBy edge list.
+  const byCoord = new Map<string, PackageRef>();
+  for (const p of packages) byCoord.set(p.name.toLowerCase(), p);
   const seen = new Set<string>();
   for (const c of unfixable) {
     if (c.ecosystem && c.ecosystem !== "maven") continue;
@@ -443,6 +463,13 @@ async function filterByExcludeGate(unfixable: FixCandidate[], projects: ProjectI
     if (seen.has(c.packageName)) continue;
     seen.add(c.packageName);
     if (failed.has(c.packageName)) continue;
+    // requiredBy lists the coordinates that require this one on the resolved classpath. Excluding it from all
+    // configurations would remove classes those dependents still load. Refuse unless explicitly forced.
+    const dependents = [...(byCoord.get(c.packageName.toLowerCase())?.requiredBy ?? [])];
+    if (dependents.length > 0 && !forceExclude.has(c.packageName.toLowerCase())) {
+      warnings.push(`Refused to exclude ${c.packageName} (no fix version): required by ${dependents.join(", ")} on the resolved classpath — removing it from all configurations breaks class loading. Exclude it manually in the manifest if you accept the risk, or pass --force-exclude=${c.packageName}.`);
+      continue;
+    }
     if (dryRun) continue;
     if (applyExcludes || preApproved.has(c.packageName)) {
       approved.push(c);
@@ -456,7 +483,7 @@ async function filterByExcludeGate(unfixable: FixCandidate[], projects: ProjectI
     }
   }
 
-  return { approved };
+  return { approved, warnings };
 }
 
 async function filterBySourceGate(
@@ -726,6 +753,7 @@ function mapBumps(approved: FixCandidate[]): BumpRequest[] {
     targetVersion: c.targetVersion!,
     because: c.findingIds,
     ecosystem: c.ecosystem,
+    isDowngrade: c.isDowngrade === true,
   }));
 }
 
@@ -914,6 +942,7 @@ interface FixLoopContext {
   allSkippedMajors: FixCandidate[];
   allSkippedRenames: FixCandidate[];
   allSkippedUnresolvable: AppliedBump[];
+  allRolledBackDowngrades: AppliedBump[];
   sessionUnresolvable: Set<string>;
   approvedExcludeCoords: Set<string>;
   excludeFailedCoords: Set<string>;
@@ -1033,19 +1062,20 @@ function reportCleanExit(ctx: FixLoopContext): never {
   // Successfully excluded packages are reported in the Applied section — do not re-list them as unfixable.
   const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   if (outputFormat === "json") {
-    console.log(JSON.stringify({ status: "clean", applied: ctx.allApplied, skippedMajors: ctx.allSkippedMajors, skippedUnresolvable: ctx.allSkippedUnresolvable }, null, 2));
-  } else if (ctx.allSkippedUnresolvable.length > 0) {
-    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
-    console.log(`Remaining issues: ${ctx.allSkippedUnresolvable.length} fix(es) rolled back — target version not resolvable from project repositories.`);
+    console.log(JSON.stringify({ status: "clean", applied: ctx.allApplied, skippedMajors: ctx.allSkippedMajors, skippedUnresolvable: ctx.allSkippedUnresolvable, rolledBackDowngrades: ctx.allRolledBackDowngrades }, null, 2));
+  } else if (ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) {
+    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
+    if (ctx.allSkippedUnresolvable.length > 0) console.log(`Remaining issues: ${ctx.allSkippedUnresolvable.length} fix(es) rolled back — target version not resolvable from project repositories.`);
+    if (ctx.allRolledBackDowngrades.length > 0) console.log(`Remaining issues: ${ctx.allRolledBackDowngrades.length} downgrade(s) rolled back — build failed after downgrade; original versions kept.`);
   } else if (ctx.allApplied.length > 0) {
-    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings }));
+    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false }));
     console.log("All vulnerabilities fixed.");
   } else {
     console.log("No vulnerabilities found.");
   }
   for (const p of ctx.projects) discardManifestBackup(p);
   discardSourceMigrationBackups(ctx.allSourceChanged);
-  process.exit(ctx.allSkippedUnresolvable.length > 0 && strictExit ? 1 : 0);
+  process.exit((ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) && strictExit ? 1 : 0);
 }
 
 /** Plan + gate decisions for one pass. */
@@ -1089,9 +1119,43 @@ async function promoteLastAffectedFixes(plan: FixPlan, projects: ProjectInfo[]):
   plan.unfixable = still;
 }
 
+/** When OSV has no forward fix, a release strictly below the advisory's introduced bound fixes the finding by leaving the affected window. */
+async function promoteDowngradeFixes(plan: FixPlan, projects: ProjectInfo[]): Promise<void> {
+  const project = projects.find(isMavenLike);
+  if (!project || offlineFlag) return;
+  const still: FixCandidate[] = [];
+  for (const candidate of plan.unfixable) {
+    if ((candidate.ecosystem || "maven") !== "maven" || !candidate.introduced) {
+      still.push(candidate);
+      continue;
+    }
+    const prev = await findPreviousAvailableVersion(
+      project.manifestPath,
+      project.kind,
+      candidate.packageName,
+      candidate.introduced,
+    );
+    const promoted = withDowngradeVersion(candidate, prev);
+    if (!promoted) {
+      console.log(`  ~ ${candidate.packageName}: no published release below introduced ${candidate.introduced}`);
+      still.push(candidate);
+      continue;
+    }
+    if (allowDowngrades) {
+      console.log(`  ~ ${candidate.packageName}: no forward fix; downgrading to ${promoted.targetVersion} (below introduced ${candidate.introduced})`);
+      plan.downgrades.push(promoted);
+    } else {
+      console.log(`  ~ ${candidate.packageName}: no forward fix; safe downgrade target ${promoted.targetVersion} available (below introduced ${candidate.introduced}) — pass --allow-downgrades to apply it`);
+      still.push({ ...candidate, downgradeTarget: promoted.targetVersion! });
+    }
+  }
+  plan.unfixable = still;
+}
+
 async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCandidates: FixCandidate[]): Promise<PassPlan> {
   const plan = buildFixPlan(scan.findings, dedupeAdvisories(scan.advisories));
   await promoteLastAffectedFixes(plan, ctx.projects);
+  await promoteDowngradeFixes(plan, ctx.projects);
   plan.renames = expandRenameBundle(plan.renames, scan.packages);
   if (latestFlag && latestCandidates.length > 0) mergeLatestCandidates(plan.fixable, latestCandidates);
 
@@ -1106,7 +1170,9 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
   ctx.lastHealthWarnings = healthWarnings;
   ctx.lastUnfixable = plan.unfixable;
   // Approved here; promoted to approvedExcludeCoords only after runApplyPass verifies every touched project wrote the exclusion.
-  const { approved: effectiveExcludes } = await filterByExcludeGate(plan.unfixable, ctx.projects, ctx.approvedExcludeCoords, ctx.excludeFailedCoords);
+  const { approved: effectiveExcludes, warnings: excludeGateWarnings } = await filterByExcludeGate(plan.unfixable, ctx.projects, ctx.approvedExcludeCoords, ctx.excludeFailedCoords, scan.packages, forceExcludeCoords);
+  for (const w of excludeGateWarnings) console.log(`  ! ${w}`);
+  if (excludeGateWarnings.length > 0) ctx.lastHealthWarnings.push(...excludeGateWarnings);
 
   const { approved, skipped } = await filterByMajorGate(plan.fixable);
   ctx.allSkippedMajors.push(...skipped);
@@ -1122,6 +1188,8 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
     effectiveRenames = dropUnresolvable(renamesForMixedClasspathCompletion(approvedRenames, scan.packages), ctx.sessionUnresolvable);
   }
   effectiveApproved = await dropUnpublishedTargets(effectiveApproved, ctx.projects, scan.findings);
+  const downgradeApproved = dropUnresolvable(plan.downgrades, ctx.sessionUnresolvable);
+  if (downgradeApproved.length > 0) effectiveApproved = [...effectiveApproved, ...downgradeApproved];
   const policy = applyPolicyForRenames(effectiveRenames.map(r => ({ fromPackage: r.packageName, toPackage: r.renameTo ?? "" })));
   return { plan, approved, skippedMajors: skipped, approvedRenames, skippedRenames, effectiveApproved, effectiveRenames, effectiveExcludes, policy };
 }
@@ -1291,16 +1359,17 @@ function bumpsForProject(project: ProjectInfo, batch: ApplyBatch): BumpRequest[]
 interface ProjectApplyOutcome { direct: number; constrained: number; fileChanges: number; renamed: boolean; excludedWritten: string[] }
 
 /** Record one applied bump by method classification and update the outcome counters. */
-function recordBumpOutcome(outcome: ProjectApplyOutcome, method: "direct" | "constrained", c: FixCandidate, ctx: FixLoopContext, project: ProjectInfo): void {
+function recordBumpOutcome(outcome: ProjectApplyOutcome, method: "direct" | "constrained", c: FixCandidate, ctx: FixLoopContext, project: ProjectInfo, appliedTarget?: string): void {
   outcome.fileChanges++;
   if (method === "direct") outcome.direct++; else outcome.constrained++;
   recordApplied(ctx.allApplied, ctx.appliedKeys, {
     packageName: c.packageName,
     from: c.installedVersion,
-    to: c.targetVersion!,
+    to: appliedTarget ?? c.targetVersion!,
     method,
     findingIds: c.findingIds,
     latest: c.latest,
+    isDowngrade: c.isDowngrade,
     manifestPath: project.manifestPath,
   });
 }
@@ -1331,7 +1400,7 @@ function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoop
   // Record applied bumps by method classification (direct + constrained are both written to disk)
   for (const c of batch.effectiveApproved) {
     const method = bumpApplyMethod(applyResult, c.packageName);
-    if (method === "direct" || method === "constrained") recordBumpOutcome(outcome, method, c, ctx, project);
+    if (method === "direct" || method === "constrained") recordBumpOutcome(outcome, method, c, ctx, project, applyResult.appliedTargets?.[c.packageName]);
   }
   // Exclusions: report which were actually written to this manifest; runApplyPass aggregates across projects before recording.
   for (const c of batch.effectiveExcludes) {
@@ -1443,17 +1512,19 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
 async function reportOrConfirmApply(ctx: FixLoopContext, pass: PassPlan, plannedSourceMigrations: SourceMigrationConfig | null, applySource: boolean): Promise<void> {
   if (dryRun || (!applyFlag && !isTTY)) {
     console.log(planMarkdown(
-      { ...pass.plan, fixable: dryRun ? pass.plan.fixable : pass.approved, renames: dryRun ? pass.plan.renames : pass.approvedRenames },
+      // Show what apply will actually execute (after unresolvable/unpublished drops), not the raw plan —
+      // a raw candidate whose target is unpublished would otherwise appear as a phantom planned bump.
+      { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames },
       { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: dryRun ? [] : ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource && !allowSourceMigrations, excludeFailed: ctx.excludeFailedCoords },
     ));
     process.exit(0);
   }
   if (!applyFlag && isTTY && ctx.iteration === 1) {
     console.log(planMarkdown(
-      { ...pass.plan, fixable: pass.approved, renames: pass.approvedRenames },
+      { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames },
       { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource, excludeFailed: ctx.excludeFailedCoords },
     ));
-    const total = pass.approved.length + pass.approvedRenames.length + pass.effectiveExcludes.length;
+    const total = pass.effectiveApproved.length + pass.effectiveRenames.length + pass.effectiveExcludes.length;
     const proceed = await ask(`Apply ${total} change(s)? [y/N] `);
     if (!proceed) process.exit(1);
   }
@@ -1534,20 +1605,85 @@ function refreshLocksAfterApply(ctx: FixLoopContext, dirs: string[]): void {
   }
 }
 
+/** Compile-check command for a Java project; null when no build tool is available. */
+function javaCompileCommand(project: ProjectInfo): { bin: string; args: string[]; label: string } | null {
+  const dir = path.dirname(project.manifestPath);
+  if (project.kind === "gradle") {
+    const gradlew = detectGradlew(dir);
+    return gradlew ? { bin: gradlew, args: ["compileJava", "compileTestJava", "--console=plain", "-q"], label: "gradlew compileJava compileTestJava" } : null;
+  }
+  const mvn = detectMaven(dir);
+  return mvn ? { bin: mvn.executable, args: ["-q", "-DskipTests", "test-compile"], label: "mvn -q -DskipTests test-compile" } : null;
+}
+
+/** Run a compile check synchronously; returns the tail of the output on failure. */
+function runCompileCheck(command: { bin: string; args: string[] }, cwd: string): { ok: boolean; detail: string } {
+  const base = { encoding: "utf-8" as const, timeout: 900_000, cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, shell: false as const };
+  let result;
+  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(command.bin)) {
+    const comspec = process.env.ComSpec || "cmd.exe";
+    result = childProcess.spawnSync(comspec, windowsBatchArgs(command.bin, command.args), { ...base, windowsVerbatimArguments: true });
+  } else {
+    result = childProcess.spawnSync(command.bin, command.args, base);
+  }
+  if (result.status === 0 && !result.error) return { ok: true, detail: "" };
+  const text = `${result.stderr || ""}\n${result.stdout || ""}`.trim();
+  const tail = text.split(/\r?\n/).filter(Boolean).slice(-3).join(" ");
+  return { ok: false, detail: (tail || result.error?.message || `exit ${result.status}`).slice(0, 400) };
+}
+
+/**
+ * Compile-check projects whose applied batch contains downgrades. A downgrade moves to an older
+ * release whose API may not satisfy the project's code; when the build fails, that project's
+ * downgrade bumps are rolled back one by one (original versions kept) and the target is marked
+ * unresolvable for the rest of the session so the loop does not retry it.
+ */
+function verifyDowngradeBuilds(ctx: FixLoopContext, projectsToTouch: ProjectInfo[]): void {
+  for (const project of projectsToTouch) {
+    if (!isMavenLike(project)) continue;
+    const downgrades = ctx.allApplied.filter(r => r.manifestPath === project.manifestPath && r.isDowngrade);
+    if (downgrades.length === 0) continue;
+    if (offlineFlag) {
+      console.log(`  ! ${project.label}: skipping compile check for ${downgrades.length} downgrade(s) — --offline`);
+      continue;
+    }
+    const command = javaCompileCommand(project);
+    if (!command) {
+      console.log(`  ! ${project.label}: no build tool found — skipping compile check for ${downgrades.length} downgrade(s)`);
+      continue;
+    }
+    console.log(`  Compiling ${project.label} after downgrade (${command.label})...`);
+    const result = runCompileCheck(command, path.dirname(project.manifestPath));
+    if (result.ok) continue;
+    console.log(`  ! ${project.label}: build failed after downgrade: ${result.detail}`);
+    for (const r of downgrades) {
+      const removePin = project.kind === "gradle" ? removeGradleManagedPin : removeMavenManagedPin;
+      removePin(project.manifestPath, r.packageName);
+      if (r.method === "direct") restoreDirectBump(project, r);
+      const idx = ctx.allApplied.indexOf(r);
+      if (idx !== -1) ctx.allApplied.splice(idx, 1);
+      ctx.appliedKeys.delete(`${r.packageName}|${r.from}|${r.to}`);
+      ctx.sessionUnresolvable.add(`${r.packageName.toLowerCase()}@${r.to.toLowerCase()}`);
+      ctx.allRolledBackDowngrades.push(r);
+      console.log(`  ~ rolled back ${r.packageName}: build failed after downgrade to ${r.to} (kept ${r.from})`);
+    }
+  }
+}
+
 /** Final report after the fix loop; always exits. */
 function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   const reportApplied = dedupeApplied(ctx.allApplied);
   // Successfully excluded packages are reported in the Applied section — do not re-list them as unfixable.
   const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   console.log(planMarkdown(
-    { fixable: [], unfixable: unfixableShown, renames: [] },
+    { fixable: [], unfixable: unfixableShown, renames: [], downgrades: [] },
     { applied: reportApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: finalFindings.map(f => ({ packageName: f.packageName, installedVersion: f.installedVersion, id: f.id, aliases: f.aliases })), skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords },
   ));
   if (ctx.lockUnsynced && reportApplied.length > 0) {
     console.error("Lockfile was not updated after apply. The lock may still pin the vulnerable version.");
     process.exit(1);
   }
-  if (finalFindings.length === 0 && ctx.allSkippedUnresolvable.length === 0) {
+  if (finalFindings.length === 0 && ctx.allSkippedUnresolvable.length === 0 && ctx.allRolledBackDowngrades.length === 0) {
     if (ctx.incompleteScan) {
       console.error("Scan incomplete: dependency tree or advisory data was not fully loaded. Not reporting a clean result.");
       process.exit(2);
@@ -1559,8 +1695,9 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   }
   if (finalFindings.length > 0) console.log(`Remaining vulnerabilities: ${finalFindings.length}`);
   if (ctx.allSkippedUnresolvable.length > 0) console.log(`Rolled back fixes: ${ctx.allSkippedUnresolvable.length} — target version not resolvable from project repositories.`);
+  if (ctx.allRolledBackDowngrades.length > 0) console.log(`Rolled back downgrades: ${ctx.allRolledBackDowngrades.length} — build failed after downgrade; original versions kept.`);
   if (reportApplied.length > 0) console.log("Bumps were applied. Re-run scan to verify, or use --exclude=group:artifact for unfixable OSV noise.");
-  process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0) && strictExit ? 1 : 0);
+  process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) && strictExit ? 1 : 0);
 }
 
 async function main() {
@@ -1590,6 +1727,7 @@ async function main() {
     approvedExcludeCoords: new Set<string>(),
     excludeFailedCoords: new Set<string>(),
     lastUnfixable: [],
+    allRolledBackDowngrades: [],
     lastHealthWarnings: [],
     iteration: 0,
     prevFindingSig: null,
@@ -1629,6 +1767,7 @@ async function main() {
     if (applied.passFileChanges > 0) {
       refreshLocksAfterApply(ctx, projectsToTouch.map(p => path.dirname(p.manifestPath)));
     }
+    verifyDowngradeBuilds(ctx, projectsToTouch);
     ctx.prevPlanSig = currentPlanSig;
     ctx.prevFindingSig = currentSig;
   }

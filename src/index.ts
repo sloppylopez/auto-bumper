@@ -12,7 +12,7 @@ export type { ParseResult } from "./lib/parse-lockfile.ts";
 
 export { matchVulnerabilities, compareMavenVersion } from "./lib/matcher.ts";
 
-export { loadRepoAdvisories, getWatchedRepos, DEFAULT_WATCHED_REPOS } from "./lib/github-repo-advisories.ts";
+export { loadRepoAdvisories } from "./lib/github-repo-advisories.ts";
 
 export { buildFixPlan } from "./lib/fixer.ts";
 export type { FixPlan, FixCandidate } from "./lib/fixer.ts";

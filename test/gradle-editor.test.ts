@@ -90,6 +90,46 @@ dependencies {
       expect(afterSecond).toContain("com.example:transitive-lib:2.0.0");
     });
   });
+
+  it("applies an approved downgrade below the declared version and overrides stale higher pins", () => {
+    withTempGradle(
+      `def jaxb_version = "4.0.9"
+
+dependencies {
+    implementation platform("org.springframework.boot:spring-boot-dependencies:3.5.0")
+}
+
+configurations.all {
+    resolutionStrategy {
+        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"
+        force "org.glassfish.jaxb:jaxb-runtime:\${jaxb_version}"
+    }
+}`,
+      filePath => {
+        // A previous run pinned a higher release in the managed block.
+        applyBumps(filePath, [{
+          packageName: "org.glassfish.jaxb:jaxb-core",
+          targetVersion: "4.1.0",
+          because: ["CVE-OLD"],
+        }]);
+        expect(readGradle(filePath)).toContain("org.glassfish.jaxb:jaxb-core:4.1.0");
+
+        const result = applyBumps(filePath, [{
+          packageName: "org.glassfish.jaxb:jaxb-core",
+          targetVersion: "3.0.2",
+          because: ["CVE-2026-92877"],
+          isDowngrade: true,
+        }]);
+        expect(result.constrained).toContain("org.glassfish.jaxb:jaxb-core");
+        const content = readGradle(filePath);
+        // The downgrade must not be raised back to the declared 4.0.9 nor masked by the stale pin.
+        expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+        expect(content).not.toContain("org.glassfish.jaxb:jaxb-core:4.1.0");
+        // Shared-variable siblings are not dragged down with the downgrade.
+        expect(content).not.toContain("org.glassfish.jaxb:jaxb-runtime:3.0.2");
+      },
+    );
+  });
 });
 
 describe("applyRenames", () => {

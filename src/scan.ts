@@ -22,6 +22,17 @@ export { CACHE_TTL_MS } from "./lib/osv-db.ts";
 export { readCacheFile, writeCacheFile } from "./lib/osv-cache.ts";
 
 export const DB_DIR = getOsvDbDir();
+/**
+ * True when AUTO_BUMPER_SUPPLEMENTAL is set to `off`, `0`, or `false` (case-insensitive).
+ * Disables both supplemental advisory sources (GitHub repo advisories + orphan-CVE bridge),
+ * leaving runs strictly on the OSV bulk dump plus locally-vendored advisories. Unset/other → current behavior.
+ */
+export function supplementalDisabled(): boolean {
+  const v = process.env.AUTO_BUMPER_SUPPLEMENTAL;
+  if (v === undefined) return false;
+  const normalized = v.toLowerCase();
+  return normalized === "off" || normalized === "0" || normalized === "false";
+}
 export const ECOSYSTEM_MAP = ECOSYSTEM_OSV_NAME;
 
 export interface ScanResult {
@@ -270,24 +281,26 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   );
 
   // Bridge package-less OSV records (e.g. log4j CVEs) onto Maven coordinates.
-  if (packagesNeedOrphanBridge(packages)) {
+  if (!supplementalDisabled() && packagesNeedOrphanBridge(packages)) {
     allAdvData = mergeAdvisories(allAdvData, await loadOrphanBridgedAdvisories(packages, { offline: opts.offline }));
   }
 
-  // Phase 3: Load repo-published advisories (vendor GHSAs missing from bulk OSV dumps)
+  // Phase 3: Reviewed GitHub Maven advisories (global list, incremental after the first pull)
   let repoAdvisories: AdvisoryEntry[] = [];
   let advisoryIncomplete = false;
-  try {
-    setText(opts.offline ? "Loading cached repo advisories..." : "Loading repo-published advisories...");
-    repoAdvisories = await loadRepoAdvisories({
-      setText,
-      offline: opts.offline,
-      onWarning: (msg) => warnings.push(msg),
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`GitHub repo advisories unavailable: ${msg}`);
-    advisoryIncomplete = true;
+  if (!supplementalDisabled()) {
+    try {
+      setText(opts.offline ? "Loading cached GitHub Maven advisories..." : "Loading GitHub Maven advisories...");
+      repoAdvisories = await loadRepoAdvisories({
+        setText,
+        offline: opts.offline,
+        onWarning: (msg) => warnings.push(msg),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(msg);
+      advisoryIncomplete = true;
+    }
   }
   // Phase 3b: Merge locally-vendored advisories (package dir + <target>/local-advisories)
   const localAdvisories = loadLocalAdvisoriesForTarget(resolvedTarget);
