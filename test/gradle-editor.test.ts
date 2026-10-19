@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps, applyRenames, hasEnforcedPlatform, readDeclaredVersion } from "../src/lib/gradle-editor.ts";
+import { applyBumps, applyRenames, detectGradlePlatform, hasEnforcedPlatform, readDeclaredVersion } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
@@ -127,6 +127,187 @@ configurations.all {
         expect(content).not.toContain("org.glassfish.jaxb:jaxb-core:4.1.0");
         // Shared-variable siblings are not dragged down with the downgrade.
         expect(content).not.toContain("org.glassfish.jaxb:jaxb-runtime:3.0.2");
+      },
+    );
+  });
+});
+
+const QUARKUS_BUILD = [
+  "plugins { id 'io.quarkus' }",
+  "",
+  "dependencies {",
+  '    enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")',
+  "}",
+].join("\n");
+
+const QUARKUS_PROPS = [
+  "quarkusPluginId=io.quarkus",
+  "quarkusPluginVersion=3.28.5",
+  "quarkusPlatformGroupId=io.quarkus.platform",
+  "quarkusPlatformArtifactId=quarkus-bom",
+  "quarkusPlatformVersion=3.28.5",
+].join("\n");
+
+function withTempGradleAndProperties(build: string, props: string | null, run: (filePath: string, propsPath: string) => void): void {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
+  const filePath = path.join(dir, "build.gradle");
+  const propsPath = path.join(dir, "gradle.properties");
+  fs.writeFileSync(filePath, build, "utf-8");
+  if (props !== null) fs.writeFileSync(propsPath, props, "utf-8");
+  try {
+    run(filePath, propsPath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("platform policy", () => {
+  it("detects a property-based Quarkus platform coordinate", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      expect(detectGradlePlatform(filePath)).toEqual({
+        group: "io.quarkus.platform",
+        artifact: "quarkus-bom",
+        version: "3.28.5",
+        property: "quarkusPlatformVersion",
+      });
+      expect(fs.existsSync(propsPath)).toBe(true);
+    });
+  });
+
+  it("detects an inline literal platform coordinate and returns null when unresolvable", () => {
+    withTempGradle(
+      'dependencies {\n    implementation platform("org.springframework.boot:spring-boot-dependencies:3.2.5")\n}',
+      filePath => {
+        expect(detectGradlePlatform(filePath)).toEqual({
+          group: "org.springframework.boot",
+          artifact: "spring-boot-dependencies",
+          version: "3.2.5",
+        });
+      },
+    );
+    withTempGradle('dependencies {\n    implementation platform("com.example:bom:${unknownVar}")\n}', filePath => {
+      expect(detectGradlePlatform(filePath)).toBeNull();
+    });
+    withTempGradle("plugins { id 'java' }\n", filePath => {
+      expect(detectGradlePlatform(filePath)).toBeNull();
+    });
+  });
+
+  it("bumps the whole Quarkus platform when a BOM-managed fix crosses the minor line", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [{
+        packageName: "io.quarkus:quarkus-vertx-http",
+        targetVersion: "3.33.2.1",
+        because: ["GHSA-qcxp-gm7m-4j5v"],
+        installedVersion: "3.28.5",
+      }]);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.33.2.1");
+      // Quarkus plugin stays in sync with the platform.
+      expect(props).toContain("quarkusPluginVersion=3.33.2.1");
+      expect(result.direct.some(e => e.startsWith("io.quarkus:quarkus-vertx-http:"))).toBe(true);
+      expect(result.appliedTargets?.["io.quarkus:quarkus-vertx-http"]).toBe("3.33.2.1");
+      // No single-artifact constraint or force pin for the BOM-managed artifact.
+      const content = readGradle(filePath);
+      expect(content).not.toContain("io.quarkus:quarkus-vertx-http");
+      expect(result.warnings.some(w => w.includes("Bumped io.quarkus.platform:quarkus-bom 3.28.5 → 3.33.2.1"))).toBe(true);
+    });
+  });
+
+  it("keeps same-minor family fixes on the pin path and leaves the platform untouched", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [{
+        packageName: "io.quarkus:quarkus-rest",
+        targetVersion: "3.28.9",
+        because: ["GHSA-test"],
+        installedVersion: "3.28.5",
+      }]);
+      expect(result.constrained).toContain("io.quarkus:quarkus-rest");
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.28.5");
+    });
+  });
+
+  it("skips non-family cross-minor fixes under an identified platform instead of desynchronizing siblings", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [{
+        packageName: "io.netty:netty-codec-http",
+        targetVersion: "4.2.0.Final",
+        because: ["GHSA-test"],
+        installedVersion: "4.1.115.Final",
+      }]);
+      expect(result.constrained).not.toContain("io.netty:netty-codec-http");
+      expect(result.forced).not.toContain("io.netty:netty-codec-http");
+      const content = readGradle(filePath);
+      expect(content).not.toContain("io.netty:netty-codec-http");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.28.5");
+    });
+  });
+
+  it("converges multiple family fixes on the highest platform version", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [
+        { packageName: "io.quarkus:quarkus-vertx-http", targetVersion: "3.33.2.1", because: ["GHSA-a"] },
+        { packageName: "io.quarkus:quarkus-hibernate-orm", targetVersion: "3.34.0", because: ["GHSA-b"] },
+      ]);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.34.0");
+      expect(result.direct.filter(e => e.includes("via io.quarkus.platform:quarkus-bom")).length).toBe(2);
+    });
+  });
+
+  it("skips cross-minor fixes when artifact versions do not map to platform releases", () => {
+    withTempGradle(
+      'dependencies {\n    implementation platform("org.springframework.boot:spring-boot-dependencies:3.2.5")\n}',
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.springframework:spring-web",
+          targetVersion: "6.2.0",
+          because: ["GHSA-test"],
+          installedVersion: "6.1.5",
+        }]);
+        expect(result.direct).not.toContain("org.springframework:spring-web");
+        expect(result.constrained).not.toContain("org.springframework:spring-web");
+        expect(result.forced).not.toContain("org.springframework:spring-web");
+        const content = readGradle(filePath);
+        expect(content).not.toContain("org.springframework:spring-web");
+        expect(result.warnings.some(w => w.includes("bump the platform/BOM manually"))).toBe(true);
+      },
+    );
+  });
+
+  it("skips cross-minor BOM-managed fixes when the platform version cannot be identified", () => {
+    withTempGradle(
+      "plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}\n",
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.apache.tomcat.embed:tomcat-embed-core",
+          targetVersion: "10.2.0",
+          because: ["GHSA-test"],
+          installedVersion: "10.1.20",
+        }]);
+        expect(result.constrained).not.toContain("org.apache.tomcat.embed:tomcat-embed-core");
+        expect(result.forced).not.toContain("org.apache.tomcat.embed:tomcat-embed-core");
+        const content = readGradle(filePath);
+        expect(content).not.toContain("tomcat-embed-core");
+        expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+      },
+    );
+  });
+
+  it("still force-pins same-minor BOM-managed fixes when the platform version cannot be identified", () => {
+    withTempGradle(
+      "plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}\n",
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.apache.tomcat.embed:tomcat-embed-core",
+          targetVersion: "10.1.42",
+          because: ["GHSA-test"],
+          installedVersion: "10.1.20",
+        }]);
+        expect(result.forced).toContain("org.apache.tomcat.embed:tomcat-embed-core");
       },
     );
   });
@@ -334,6 +515,116 @@ dependencies {
 
     it("returns false when no BOM present", () => {
       expect(hasEnforcedPlatform('dependencies {\n    implementation "commons-io:commons-io:2.19.0"\n}')).toBe(false);
+    });
+  });
+});
+
+describe("applyBumps BOM-aware cleanup", () => {
+  const bomMap = new Map<string, string>([
+    ["io.netty:netty-codec-http2", "4.1.139"],
+    ["io.netty:netty-handler", "4.1.139"],
+    ["io.netty:netty-resolver-dns", "4.1.139"],
+    ["com.example:fresh-lib", "2.0.0"],
+  ]);
+
+  const ENFORCED_FILE = `dependencies {
+    implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.33.4.1"))
+    implementation "org.slf4j:slf4j-api:2.0.16"
+}
+`;
+
+  function seed(filePath: string, bumps: Array<{ pkg: string; version: string }>): void {
+    applyBumps(filePath, bumps.map(b => ({ packageName: b.pkg, targetVersion: b.version, because: ["GHSA-test"] })));
+  }
+
+  it("drops stale constraint and force pins, keeps fresh ones", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+        { pkg: "io.netty:netty-handler", version: "4.1.137" },
+        { pkg: "com.example:fresh-lib", version: "3.0.0" },
+      ]);
+      expect(readGradle(filePath)).toContain(GRADLE_MARKER_BEGIN);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toEqual([
+        "io.netty:netty-codec-http2@4.1.136",
+        "io.netty:netty-handler@4.1.137",
+      ]);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("4.1.136");
+      expect(content).not.toContain("4.1.137");
+      expect(content).toContain("com.example:fresh-lib:3.0.0");
+      expect(result.warnings.some(w => w.includes("dropped stale pin io.netty:netty-codec-http2@4.1.136"))).toBe(true);
+    });
+  });
+
+  it("is a byte-identical no-op when no pin is stale", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "com.example:fresh-lib", version: "3.0.0" }]);
+      const before = readGradle(filePath);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toBeUndefined();
+      expect(readGradle(filePath)).toBe(before);
+    });
+  });
+
+  it("removes the managed block entirely when every pin is stale", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+        { pkg: "io.netty:netty-resolver-dns", version: "4.1.135" },
+      ]);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toHaveLength(2);
+      const content = readGradle(filePath);
+      expect(content).not.toContain(GRADLE_MARKER_BEGIN);
+      expect(content).not.toContain(GRADLE_MARKER_END);
+    });
+  });
+
+  it("skips new pins at or below the BOM-managed version", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const before = readGradle(filePath);
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.138", because: ["GHSA-x"] },
+      ], [], bomMap);
+      expect(result.warnings.some(w => w.includes("pin would force a downgrade"))).toBe(true);
+      expect(readGradle(filePath)).toBe(before);
+    });
+  });
+
+  it("keeps new pins above the BOM-managed version", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.140", because: ["GHSA-y"] },
+      ], [], bomMap);
+      expect(result.warnings.some(w => w.includes("skipped"))).toBe(false);
+      expect(readGradle(filePath)).toContain("io.netty:netty-handler:4.1.140");
+    });
+  });
+
+  it("keeps explicit downgrades below the BOM-managed version", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.130", because: ["GHSA-z"], isDowngrade: true },
+      ], [], bomMap);
+      expect(result.warnings.some(w => w.includes("skipped"))).toBe(false);
+      expect(readGradle(filePath)).toContain("io.netty:netty-handler:4.1.130");
+    });
+  });
+
+  it("is idempotent across repeated cleanup runs", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "io.netty:netty-codec-http2", version: "4.1.136" }]);
+      applyBumps(filePath, [], [], bomMap);
+      const afterFirst = readGradle(filePath);
+
+      const second = applyBumps(filePath, [], [], bomMap);
+      expect(second.droppedStale).toBeUndefined();
+      expect(readGradle(filePath)).toBe(afterFirst);
     });
   });
 });

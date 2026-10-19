@@ -1,0 +1,137 @@
+/**
+ * BOM managed-version lookup for Gradle platform detection.
+ *
+ * Fetches the platform BOM's POM (e.g. io.quarkus.platform:quarkus-bom:3.33.4.1) from the
+ * project's repositories (Maven Central as fallback), extracts its dependencyManagement
+ * versions, and caches them per BOM version — a published BOM is immutable, so a cache
+ * hit needs no TTL. All network access is best-effort: any failure yields null and the
+ * caller keeps best-effort behavior (no pin cleanup, no pin filtering).
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { extractRepoUrls, fetchText, MAVEN_CENTRAL, stripTrailingSlashes } from "./repo-metadata.ts";
+import { getCacheRoot } from "../path.ts";
+
+/**
+ * Managed versions declared by a BOM POM's <dependencyManagement> sections.
+ * Key: "groupId:artifactId", value: version with ${property} references resolved.
+ * Import-scoped (nested BOM) entries and unresolvable versions are skipped. Pure — unit-testable.
+ */
+export function parseBomManagedVersions(pomXml: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const props = parsePomProperties(pomXml);
+
+  /** Resolve ${property} references (up to 3 nested levels). Null when unresolvable. */
+  const resolveRef = (value: string): string | null => {
+    let v = value.trim();
+    for (let i = 0; i < 3; i++) {
+      const m = /^\$\{([^}]+)\}$/.exec(v);
+      if (!m) return v;
+      const next = props.get(m[1]!);
+      if (next === undefined) return null;
+      v = next.trim();
+    }
+    return v;
+  };
+
+  for (const dm of pomXml.matchAll(/<dependencyManagement>[\s\S]*?<\/dependencyManagement>/g)) {
+    const section = dm[0]!;
+    for (const dep of section.matchAll(/<dependency>([\s\S]*?)<\/dependency>/g)) {
+      const body = dep[1]!;
+      const scope = tagValue(body, "scope");
+      const type = tagValue(body, "type");
+      if (scope === "import" || type === "pom") continue; // nested BOM — not a managed version
+      const g = tagValue(body, "groupId");
+      const a = tagValue(body, "artifactId");
+      const v = tagValue(body, "version");
+      if (!g || !a || !v) continue;
+      const group = resolveRef(g);
+      const artifact = resolveRef(a);
+      const version = resolveRef(v);
+      if (!group || !artifact || !version) continue; // unresolvable property — best-effort skip
+      const key = `${group}:${artifact}`;
+      if (!out.has(key)) out.set(key, version); // first declaration wins (Maven semantics)
+    }
+  }
+  return out;
+}
+
+/** <properties> entries of a POM (name → literal value). */
+function parsePomProperties(pomXml: string): Map<string, string> {
+  const props = new Map<string, string>();
+  const m = /<properties>([\s\S]*?)<\/properties>/.exec(pomXml);
+  if (!m) return props;
+  for (const p of m[1]!.matchAll(/<([A-Za-z][\w.-]*)>([^<]*)</g)) {
+    props.set(p[1]!, p[2]!.trim());
+  }
+  return props;
+}
+
+/** Value of one <tag>...</tag> inside a dependency entry, trimmed. Null when absent. */
+function tagValue(depBody: string, tag: string): string | null {
+  const m = new RegExp(`<${tag}>([^<]+)</${tag}>`).exec(depBody);
+  return m ? m[1]!.trim() : null;
+}
+
+/** Cache directory for parsed BOM maps (under the project's .auto-bumper root). */
+function bomCacheDir(): string {
+  return path.join(getCacheRoot(), "db", "bom");
+}
+
+function bomCachePath(group: string, artifact: string, version: string): string {
+  const safe = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_");
+  return path.join(bomCacheDir(), `${safe(group)}__${safe(artifact)}__${safe(version)}.json`);
+}
+
+function readCachedBomMap(cachePath: string): Map<string, string> | null {
+  try {
+    const raw = fs.readFileSync(cachePath, "utf-8");
+    const entries = JSON.parse(raw) as Array<[string, string]>;
+    if (!Array.isArray(entries)) return null;
+    return new Map(entries);
+  } catch {
+    return null; // missing or corrupt cache — treat as miss
+  }
+}
+
+/** Atomic replace (Windows-safe). Cache write failure is not fatal. */
+function writeCachedBomMap(cachePath: string, map: Map<string, string>): void {
+  try {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    const tmp = `${cachePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...map.entries()]));
+    fs.renameSync(tmp, cachePath);
+  } catch {
+    // The parsed map is still returned to the caller.
+  }
+}
+
+/**
+ * Managed versions of a platform BOM as published in its POM. Cached per BOM version under
+ * .auto-bumper/db/bom (BOMs are immutable once published). Null when no repository served a
+ * parseable BOM POM (offline, auth failure, unknown layout) — callers keep best-effort behavior.
+ */
+export async function fetchBomManagedVersions(
+  manifestPath: string,
+  group: string,
+  artifact: string,
+  version: string,
+): Promise<Map<string, string> | null> {
+  const cachePath = bomCachePath(group, artifact, version);
+  const cached = readCachedBomMap(cachePath);
+  if (cached) return cached;
+
+  let bases = extractRepoUrls(manifestPath, "gradle");
+  if (!bases.some(b => stripTrailingSlashes(b) === MAVEN_CENTRAL)) bases.push(MAVEN_CENTRAL);
+  const groupPath = group.replaceAll(".", "/");
+  for (const base of bases) {
+    const url = `${stripTrailingSlashes(base)}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
+    const pom = await fetchText(url);
+    if (!pom) continue;
+    const map = parseBomManagedVersions(pom);
+    if (map.size === 0) continue; // not a BOM, or no resolvable versions — try the next repository
+    writeCachedBomMap(cachePath, map);
+    return map;
+  }
+  return null;
+}

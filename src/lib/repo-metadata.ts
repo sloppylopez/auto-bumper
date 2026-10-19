@@ -8,7 +8,7 @@ import { compareMavenVersion } from "./matcher.ts";
  * back to a safe rollback.
  */
 
-const MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2";
+export const MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2";
 
 /** Extract repository base URLs declared in a Gradle or Maven manifest. */
 export function extractRepoUrls(manifestPath: string, kind: "gradle" | "maven"): string[] {
@@ -159,7 +159,7 @@ export function repoRequestInit(url: string, creds?: { user?: string; pass?: str
 }
 
 /** Fetch a document with a short timeout and optional env-based Basic auth. Null on any failure. */
-async function fetchText(url: string): Promise<string | null> {
+export async function fetchText(url: string): Promise<string | null> {
   const init = repoRequestInit(url, {
     user: process.env.JFROG_USER || process.env.MAVEN_USERNAME,
     pass: process.env.JFROG_TOKEN || process.env.MAVEN_PASSWORD,
@@ -185,7 +185,7 @@ async function fetchText(url: string): Promise<string | null> {
 }
 
 /** Remove trailing slashes (linear scan, no regex). */
-function stripTrailingSlashes(s: string): string {
+export function stripTrailingSlashes(s: string): string {
   let end = s.length;
   while (end > 0 && s[end - 1] === "/") end--;
   return s.slice(0, end);

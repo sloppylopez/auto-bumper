@@ -35,6 +35,8 @@ export interface BumpRequest {
   ecosystem?: string;
   /** True when the target is strictly below the installed version (user-approved downgrade). */
   isDowngrade?: boolean;
+  /** Installed version reported by the scan, when known; used for minor-line policy decisions. */
+  installedVersion?: string;
 }
 
 export interface RenameRequest {
@@ -68,6 +70,15 @@ export interface ApplyResult {
   warnings: string[];
   /** Version actually written per package (managed pins may be raised to the declared version). */
   appliedTargets?: Record<string, string>;
+  /** Managed pins dropped as stale against the platform BOM ("pkg@oldVersion"). */
+  droppedStale?: string[];
+}
+
+/** A managed pin whose version is at or below what the platform BOM now manages. */
+export interface StaleManagedPin {
+  packageName: string;
+  version: string;
+  bomVersion: string;
 }
 
 function escapeRegex(s: string): string {
@@ -360,6 +371,34 @@ function parseExistingForces(block: string): Map<string, string> {
   return forces;
 }
 
+/**
+ * Managed pins (constraints and forces) whose version is at or below what the given BOM
+ * manages — they would only force an older version than the current platform provides.
+ * Pure — unit-testable.
+ */
+export function findStaleManagedPins(content: string, bomManaged: ReadonlyMap<string, string>): StaleManagedPin[] {
+  const found = findManagedBlock(content);
+  if (!found) return [];
+  const block = content.slice(found.begin, found.end + found.endLen);
+  const stale: StaleManagedPin[] = [];
+  const reported = new Set<string>();
+  for (const [pkg, e] of parseExistingConstraints(block)) {
+    const bv = bomManaged.get(pkg);
+    if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
+      stale.push({ packageName: pkg, version: e.version, bomVersion: bv });
+      reported.add(pkg);
+    }
+  }
+  for (const [pkg, v] of parseExistingForces(block)) {
+    if (reported.has(pkg)) continue; // same pin reported once when it is both a constraint and a force
+    const bv = bomManaged.get(pkg);
+    if (bv !== undefined && compareMavenVersion(bv, v) >= 0) {
+      stale.push({ packageName: pkg, version: v, bomVersion: bv });
+    }
+  }
+  return stale;
+}
+
 /** Render the managed block (constraints + forces + excludes). */
 function renderManagedBlock(
   entries: Map<string, { version: string; because: string }>,
@@ -458,7 +497,9 @@ function findManagedBlock(content: string): { begin: number; end: number; endLen
 
 /**
  * Replace (or append) the auto-bumper managed block, merging new pins/excludes
- * with any existing ones. New pins win on version conflicts.
+ * with any existing ones. New pins win on version conflicts. When a BOM managed-version
+ * map is given, existing pins at or below the BOM-managed version are dropped first —
+ * they would only force an older version than the current platform provides.
  */
 function upsertManagedBlock(
   content: string,
@@ -466,6 +507,8 @@ function upsertManagedBlock(
   excludes: ExcludeRequest[],
   forces: BumpRequest[] = [],
   kotlin = false,
+  bomManaged: ReadonlyMap<string, string> | null = null,
+  droppedOut?: StaleManagedPin[],
 ): string {
   const found = findManagedBlock(content);
 
@@ -482,6 +525,30 @@ function upsertManagedBlock(
     entries = parseExistingConstraints(block);
     excludeSet = parseExistingExcludes(block);
     forceMap = parseExistingForces(block);
+
+    // Drop pins the platform BOM now manages at or above — they only force an older version.
+    if (bomManaged) {
+      const droppedPkgs = new Set<string>();
+      for (const [pkg, e] of [...entries]) {
+        const bv = bomManaged.get(pkg);
+        if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
+          entries.delete(pkg);
+          droppedOut?.push({ packageName: pkg, version: e.version, bomVersion: bv });
+          droppedPkgs.add(pkg);
+        }
+      }
+      for (const [pkg, v] of [...forceMap]) {
+        if (droppedPkgs.has(pkg)) {
+          forceMap.delete(pkg); // already reported via the constraint entry — still drop the matching force
+          continue;
+        }
+        const bv = bomManaged.get(pkg);
+        if (bv !== undefined && compareMavenVersion(bv, v) >= 0) {
+          forceMap.delete(pkg);
+          droppedOut?.push({ packageName: pkg, version: v, bomVersion: bv });
+        }
+      }
+    }
     before = collapseTrailingNewlines(content.slice(0, beginIdx));
     after = content.slice(endIdx + endLen).replace(/^\n+/, "\n");
   }
@@ -504,7 +571,12 @@ function upsertManagedBlock(
     }
   }
 
-  if (entries.size === 0 && excludeSet.size === 0 && forceMap.size === 0) return content;
+  if (entries.size === 0 && excludeSet.size === 0 && forceMap.size === 0) {
+    // Fully cleaned block: remove it so re-runs stay idempotent.
+    if (!found) return content;
+    const afterClean = content.slice(found.end + found.endLen).replace(/^\n+/, "");
+    return `${collapseTrailingNewlines(content.slice(0, found.begin))}${afterClean}`;
+  }
 
   const block = renderManagedBlock(entries, excludeSet, forceMap, kotlin);
   if (hasBlock) {
@@ -617,6 +689,105 @@ export function hasEnforcedPlatform(content: string): boolean {
     || /mavenBom/.test(content)
     || /io\.spring\.dependency-management/.test(content)
     || /org\.springframework\.boot/.test(content);
+}
+
+/** A BOM/platform whose coordinate and version could be resolved from the build file. */
+export interface GradlePlatform {
+  group: string;
+  artifact: string;
+  version: string;
+  /** Name of the gradle.properties property holding the version, when property-based. */
+  property?: string;
+}
+
+/** Map of gradle.properties entries plus inline `def`/typed assignments in the build file. */
+function readVersionProperties(buildFile: string): Map<string, string> {
+  const props = new Map<string, string>();
+  const content = fs.readFileSync(buildFile, "utf-8");
+  for (const line of content.split(/\r?\n/)) {
+    const m = /^\s*(?:(?:def|final)\s+)?(?:(?:String|int|Integer)\s+)?([A-Za-z_]\w*)\s*=\s*["']([^"']+)["']/.exec(line);
+    if (m) props.set(m[1]!, m[2]!);
+  }
+  const propsPath = path.join(path.dirname(buildFile), "gradle.properties");
+  if (fs.existsSync(propsPath)) {
+    for (const line of fs.readFileSync(propsPath, "utf-8").split(/\r?\n/)) {
+      if (line.trim().startsWith("#")) continue;
+      const m = /^\s*([A-Za-z_][\w.-]*)\s*[=:]\s*(.+?)\s*$/.exec(line);
+      if (m) props.set(m[1]!, m[2]!);
+    }
+  }
+  return props;
+}
+
+/** Resolve a literal or `${var}` coordinate part against properties/inline defs. */
+function resolveCoordPart(part: string, props: Map<string, string>): string | null {
+  const vm = /^\$\{(\w+)\}$/.exec(part);
+  if (vm) return props.get(vm[1]!) ?? null;
+  return part.length > 0 ? part : null;
+}
+
+/** Detect the enforcedPlatform/platform BOM coordinate and resolve its group, artifact, and version. */
+export function detectGradlePlatform(buildFile: string): GradlePlatform | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(buildFile, "utf-8");
+  } catch {
+    return null;
+  }
+  const m = /(?:enforcedPlatform|platform)\s*\(\s*["']([^"':]+):([^"':]+):([^"':]+)["']/.exec(content);
+  if (!m) return null;
+  const props = readVersionProperties(buildFile);
+  const group = resolveCoordPart(m[1]!, props);
+  const artifact = resolveCoordPart(m[2]!, props);
+  const version = resolveCoordPart(m[3]!, props);
+  if (!group || !artifact || !version) return null;
+  const vm = /^\$\{(\w+)\}$/.exec(m[3]!);
+  return { group, artifact, version, property: vm?.[1] };
+}
+
+/** True when major or minor differs between two versions (qualifiers ignored). */
+export function crossesMinorBoundary(from: string, to: string): boolean {
+  const parts = (v: string): [string, string] => {
+    const m = /^(\d+)(?:\.(\d+))?/.exec(v);
+    return [m?.[1] ?? "0", m?.[2] ?? "0"];
+  };
+  const [fMaj, fMin] = parts(from);
+  const [tMaj, tMin] = parts(to);
+  return tMaj !== fMaj || tMin !== fMin;
+}
+
+/** True when two Maven groups are identical or one is a dotted prefix of the other. */
+export function sameGroupFamily(a: string, b: string): boolean {
+  if (a === b) return true;
+  return a.startsWith(`${b}.`) || b.startsWith(`${a}.`);
+}
+
+
+/**
+ * Rewrite the platform version (gradle.properties property or inline coordinate).
+ * Quarkus: also syncs quarkusPluginVersion when it still equals the old platform version.
+ */
+export function bumpGradlePlatform(platform: GradlePlatform, buildFile: string, newVersion: string): boolean {
+  const dir = path.dirname(buildFile);
+  if (platform.property) {
+    const propsPath = path.join(dir, "gradle.properties");
+    if (!fs.existsSync(propsPath)) return false;
+    let text = fs.readFileSync(propsPath, "utf-8");
+    const lineRe = new RegExp(`^([ \\t]*${escapeRegex(platform.property)}[ \\t]*=[ \\t]*)${escapeRegex(platform.version)}\\s*$`, "m");
+    if (!lineRe.test(text)) return false;
+    text = text.replace(lineRe, `$1${newVersion}`);
+    const pluginRe = /^([ \t]*quarkusPluginVersion[ \t]*=[ \t]*)(\S+)\s*$/m;
+    const pm = pluginRe.exec(text);
+    if (pm && pm[2] === platform.version) text = text.replace(pluginRe, `$1${newVersion}`);
+    fs.writeFileSync(propsPath, text, "utf-8");
+    return true;
+  }
+  let content = fs.readFileSync(buildFile, "utf-8");
+  const coordRe = new RegExp(`(["'])${escapeRegex(platform.group)}:${escapeRegex(platform.artifact)}:${escapeRegex(platform.version)}\\1`);
+  if (!coordRe.test(content)) return false;
+  content = content.replace(coordRe, `$1${platform.group}:${platform.artifact}:${newVersion}$1`);
+  fs.writeFileSync(buildFile, content, "utf-8");
+  return true;
 }
 
 /**
@@ -796,26 +967,50 @@ function applyCatalogBumps(buildFile: string, bumps: BumpRequest[]): string[] {
  * are rewritten in place; everything else is pinned through the managed
  * constraints block. When the file uses enforcedPlatform or mavenBom, also emit
  * resolutionStrategy.force so BOM cannot downgrade the fix. Caller is responsible
- * for backing up the file first.
+ * for backing up the file first. With a BOM managed-version map, existing pins at or below
+ * the BOM-managed version are dropped (the BOM already covers them), and new pins that would
+ * force a downgrade against the BOM are skipped.
  */
 export function applyBumps(
   filePath: string,
   bumps: BumpRequest[],
   excludes: ExcludeRequest[] = [],
+  bomManaged: ReadonlyMap<string, string> | null = null,
 ): ApplyResult {
   const result: ApplyResult = { direct: [], constrained: [], excluded: [], forced: [], warnings: [] };
-  if (bumps.length === 0 && excludes.length === 0) return result;
 
   const kotlin = filePath.endsWith(".kts");
   let content = fs.readFileSync(filePath, "utf-8");
+  // Cleanup-only runs (no bumps/excludes) proceed when the BOM map marks existing pins stale.
+  if (bumps.length === 0 && excludes.length === 0) {
+    const stale = bomManaged ? findStaleManagedPins(content, bomManaged) : [];
+    if (stale.length === 0) return result;
+  }
   const catalogDirect = applyCatalogBumps(filePath, bumps);
-  const remainingBumps = bumps.filter(b => !catalogDirect.includes(b.packageName));
+  let remainingBumps = bumps.filter(b => !catalogDirect.includes(b.packageName));
+
+  // BOM policy: a fix crossing the minor/major line of a BOM-managed artifact family must never be
+  // force-pinned on a single artifact — it desynchronizes its siblings (e.g. netty-codec-http 4.2.x
+  // inside a 4.1.x stack breaks the HTTP pipeline). If the artifact belongs to the detected
+  // platform's family, bump the whole platform; otherwise skip and warn.
+  const enforced = hasEnforcedPlatform(content);
+  const platform = detectGradlePlatform(filePath);
+  const appliedTargets: Record<string, string> = {};
+  if (platform) {
+    remainingBumps = routePlatformBumps(platform, filePath, content, remainingBumps, result, appliedTargets);
+  }
+  if (enforced) {
+    remainingBumps = skipCrossMinorBomBumps(content, remainingBumps, result, platform);
+  }
+  if (bomManaged) {
+    remainingBumps = filterBomCoveredBumps(remainingBumps, bomManaged, platform, result);
+  }
+
   const classified = classifyBumps(remainingBumps, content);
   content = classified.content;
 
   const effectiveBumps = remainingBumps.map(b => withEffectiveVersion(content, b));
   const pins = mergePinsToEffective(content, classified.pinned, effectiveBumps);
-  const enforced = hasEnforcedPlatform(content);
   const forces = enforced ? collectForcePins(content, effectiveBumps) : [];
   if (forces.length > 0) {
     result.forced.push(...forces.map(f => f.packageName));
@@ -824,19 +1019,139 @@ export function applyBumps(
     );
   }
 
-  content = upsertManagedBlock(content, pins, excludes, forces, kotlin);
+  const dropped: StaleManagedPin[] = [];
+  content = upsertManagedBlock(content, pins, excludes, forces, kotlin, bomManaged, dropped);
+  if (dropped.length > 0) {
+    result.droppedStale = dropped.map(d => `${d.packageName}@${d.version}`);
+    for (const d of dropped) {
+      result.warnings.push(`dropped stale pin ${d.packageName}@${d.version} — BOM now manages ${d.bomVersion}`);
+    }
+  }
   result.direct.push(...catalogDirect, ...classified.direct);
   result.constrained.push(...pins.map(p => p.packageName));
-  if (pins.length > 0) {
-    const appliedTargets: Record<string, string> = {};
-    for (const p of pins) appliedTargets[p.packageName] = p.targetVersion;
-    result.appliedTargets = appliedTargets;
-  }
+  for (const p of pins) appliedTargets[p.packageName] = p.targetVersion;
+  if (Object.keys(appliedTargets).length > 0) result.appliedTargets = appliedTargets;
   result.warnings.push(...classified.warnings);
   emitSpringBootWarnings(result, pins);
   result.excluded = excludes.map(e => e.packageName);
   fs.writeFileSync(filePath, content, "utf-8");
   return result;
+}
+
+/**
+ * Route BOM-managed family candidates that cross the platform's minor line to a whole-platform bump.
+ * Returns the bumps left for the normal pin/force path; records applied/skipped entries on result.
+ */
+function routePlatformBumps(
+  platform: GradlePlatform,
+  buildFile: string,
+  content: string,
+  bumps: BumpRequest[],
+  result: ApplyResult,
+  appliedTargets: Record<string, string>,
+): BumpRequest[] {
+  const routed: BumpRequest[] = [];
+  const rest: BumpRequest[] = [];
+  for (const b of bumps) {
+    const group = b.packageName.split(":")[0] || "";
+    const crosses = !b.isDowngrade
+      && group !== ""
+      && sameGroupFamily(group, platform.group)
+      && readDeclaredVersion(content, b.packageName) === null
+      && compareMavenVersion(b.targetVersion, platform.version) > 0
+      && crossesMinorBoundary(platform.version, b.targetVersion);
+    if (crosses) routed.push(b); else rest.push(b);
+  }
+  if (routed.length === 0) return bumps;
+
+  // Unified-version platforms (e.g. Quarkus): the fix target IS a platform version. Other BOMs
+  // (e.g. Spring Boot, where artifact versions differ from BOM versions) cannot be mapped — skip.
+  const platformMajor = /^(\d+)/.exec(platform.version)?.[1] ?? "";
+  const mappable = routed.filter(b => (/^(\d+)/.exec(b.targetVersion)?.[1] ?? "") === platformMajor);
+  if (mappable.length === 0) {
+    for (const b of routed) result.warnings.push(
+      `${b.packageName}: fix ${b.targetVersion} crosses the minor line managed by ${platform.group}:${platform.artifact} ${platform.version}, but artifact versions do not map to platform releases — skipped; bump the platform/BOM manually`,
+    );
+    return rest;
+  }
+
+  const target = mappable.reduce(
+    (max, b) => compareMavenVersion(b.targetVersion, max) > 0 ? b.targetVersion : max,
+    platform.version,
+  );
+  if (!bumpGradlePlatform(platform, buildFile, target)) {
+    for (const b of routed) result.warnings.push(
+      `${b.packageName}: could not rewrite ${platform.group}:${platform.artifact} version — skipped instead of force-pinning across the minor line`,
+    );
+    return rest;
+  }
+
+  for (const b of mappable) {
+    result.direct.push(`${b.packageName}: via ${platform.group}:${platform.artifact} ${platform.version} → ${target}`);
+    appliedTargets[b.packageName] = target;
+  }
+  for (const b of routed) {
+    if (!mappable.includes(b)) result.warnings.push(
+      `${b.packageName}: fix ${b.targetVersion} does not map to a ${platform.group}:${platform.artifact} release — skipped; bump the platform/BOM manually`,
+    );
+  }
+  result.warnings.push(
+    `Bumped ${platform.group}:${platform.artifact} ${platform.version} → ${target} — ${mappable.length} fix(es) cross the platform's minor line. Expect API changes; run a full build and tests.`,
+  );
+
+  // Family candidates now covered by the new platform version need no pin of their own.
+  return rest.filter(b => {
+    const group = b.packageName.split(":")[0] || "";
+    return !(group !== "" && sameGroupFamily(group, platform.group) && compareMavenVersion(b.targetVersion, target) <= 0);
+  });
+}
+
+/**
+ * Force-pinning a BOM-managed artifact across a minor line would desynchronize it from its siblings.
+ * Skip such candidates (downgrades keep their compile-gated path) and warn to align the family or
+ * bump via the BOM/platform. Runs on all enforced-BOM projects, after platform routing.
+ */
+function skipCrossMinorBomBumps(content: string, bumps: BumpRequest[], result: ApplyResult, platform: GradlePlatform | null): BumpRequest[] {
+  const kept: BumpRequest[] = [];
+  for (const b of bumps) {
+    if (!b.isDowngrade && readDeclaredVersion(content, b.packageName) === null
+      && b.installedVersion !== undefined && crossesMinorBoundary(b.installedVersion, b.targetVersion)) {
+      const via = platform ? ` managed by ${platform.group}:${platform.artifact} ${platform.version}` : "";
+      result.warnings.push(
+        `${b.packageName}: BOM${via}-managed and ${b.installedVersion} → ${b.targetVersion} crosses a minor line — force-pinning would desynchronize its siblings; skipped. Align the whole family or bump via the BOM/platform`,
+      );
+      continue;
+    }
+    kept.push(b);
+  }
+  return kept;
+}
+
+/**
+ * A non-downgrade pin whose target is at or below the version the platform BOM already manages
+ * would force a downgrade of that artifact against the BOM — skip it; the BOM covers the fix.
+ * Downgrades are user-approved and keep their path.
+ */
+function filterBomCoveredBumps(
+  bumps: BumpRequest[],
+  bomManaged: ReadonlyMap<string, string>,
+  platform: GradlePlatform | null,
+  result: ApplyResult,
+): BumpRequest[] {
+  const kept: BumpRequest[] = [];
+  for (const b of bumps) {
+    if (!b.isDowngrade) {
+      const bv = bomManaged.get(b.packageName);
+      if (bv !== undefined && compareMavenVersion(bv, b.targetVersion) >= 0) {
+        result.warnings.push(
+          `${b.packageName}: target ${b.targetVersion} is at or below ${platform ? `${platform.group}:${platform.artifact} ${platform.version}` : "BOM"}-managed ${bv} — pin would force a downgrade; skipped`,
+        );
+        continue;
+      }
+    }
+    kept.push(b);
+  }
+  return kept;
 }
 
 /** Try each bump against the file; classify as direct or constrained */

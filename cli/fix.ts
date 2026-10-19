@@ -18,17 +18,20 @@ import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
 import { findLatestAvailableVersion, findNextAvailableVersion, findPreviousAvailableVersion, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
+import { fetchBomManagedVersions } from "../src/lib/bom-managed.ts";
 import { compareMavenVersion, matchVulnerabilities } from "../src/lib/matcher.ts";
 import {
   applyBumps as applyGradleBumps,
   applyRenames as applyGradleRenames,
   backupBuildGradle,
+  detectGradlePlatform,
   discardBackup as discardGradleBackup,
+  findStaleManagedPins,
   removeManagedPin as removeGradleManagedPin,
   restoreBuildGradle,
   restoreDeclaredVersion as restoreGradleDeclaredVersion,
 } from "../src/lib/gradle-editor.ts";
-import type { RenameRequest } from "../src/lib/gradle-editor.ts";
+import type { GradlePlatform, RenameRequest, StaleManagedPin } from "../src/lib/gradle-editor.ts";
 import {
   applyBumps as applyMavenBumps,
   applyRenames as applyMavenRenames,
@@ -671,9 +674,9 @@ function discardManifestBackup(project: ProjectInfo): void {
   }
 }
 
-function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string }[]): BumpApplyResult {
+function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string }[], bomManaged: ReadonlyMap<string, string> | null = null): BumpApplyResult {
   if (project.kind === "maven") return normalizeBumpApplyResult(applyMavenBumps(project.manifestPath, bumps, excludes));
-  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes));
+  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged));
   if (project.kind === "npm") return normalizeBumpApplyResult(applyNpmBumps(project.manifestPath, bumps, excludes));
   if (project.kind === "crates.io") return normalizeBumpApplyResult(applyCargoBumps(project.manifestPath, bumps, excludes));
   if (project.manifestPath.endsWith("pyproject.toml")) return normalizeBumpApplyResult(applyToPyprojectToml(project.manifestPath, bumps, excludes));
@@ -712,6 +715,77 @@ function applyManifestRenames(project: ProjectInfo, renames: RenameRequest[]) {
   return { direct: [] as string[], constrained: [] as string[], warnings: [] as string[] };
 }
 
+/**
+ * Load platform BOM managed-version maps for Gradle projects (best-effort, cached per BOM version).
+ * Skipped in offline mode; failures leave the project without a map (no cleanup, no pin filtering).
+ */
+async function loadBomManagedMaps(projects: ProjectInfo[]): Promise<Map<string, Map<string, string>>> {
+  const maps = new Map<string, Map<string, string>>();
+  if (offlineFlag) return maps;
+  for (const project of projects) {
+    if (project.kind !== "gradle") continue;
+    let platform: GradlePlatform | null = null;
+    try {
+      platform = detectGradlePlatform(project.manifestPath);
+    } catch {
+      // Unreadable build file — no BOM map.
+    }
+    if (!platform) continue;
+    const bomMap = await fetchBomManagedVersions(project.manifestPath, platform.group, platform.artifact, platform.version);
+    if (bomMap) maps.set(project.manifestPath, bomMap);
+  }
+  return maps;
+}
+
+/** True when the project's managed block has pins that the BOM now manages at or above. */
+function bomPinCleanupNeeded(project: ProjectInfo, bomMaps: Map<string, Map<string, string>>): boolean {
+  if (project.kind !== "gradle") return false;
+  const map = bomMaps.get(project.manifestPath);
+  if (!map) return false;
+  try {
+    return findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Drop managed pins that the platform BOM now manages at or above (they only force older versions).
+ * Runs on clean exits and nothing-approved breaks too, so a stale block gets cleaned up eventually.
+ */
+async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>): Promise<void> {
+  if (outputFormat === "json") return; // machine output stays pure
+  const details: Array<{ project: ProjectInfo; stale: StaleManagedPin[] }> = [];
+  for (const project of projects) {
+    if (project.kind !== "gradle") continue;
+    const map = bomMaps.get(project.manifestPath);
+    if (!map) continue;
+    try {
+      const stale = findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map);
+      if (stale.length > 0) details.push({ project, stale });
+    } catch {
+      // Unreadable build file — skip.
+    }
+  }
+  if (details.length === 0) return;
+  const list = details.flatMap(d => d.stale.map(s => `${s.packageName}@${s.version}`)).join(", ");
+  if (dryRun || (!applyFlag && !isTTY)) {
+    console.log(`  ~ stale pin(s): ${list} — run with --apply to drop`);
+    return;
+  }
+  const proceed = applyFlag || await ask(`Drop ${details.reduce((n, d) => n + d.stale.length, 0)} stale managed pin(s)? [y/N] `);
+  if (!proceed) return;
+  for (const { project } of details) {
+    try {
+      backupBuildGradle(project.manifestPath);
+      const result = applyGradleBumps(project.manifestPath, [], [], bomMaps.get(project.manifestPath)!);
+      for (const w of result.warnings) console.log(`  [${project.label}] ${w}`);
+      discardGradleBackup(project.manifestPath);
+    } catch {
+      restoreBuildGradle(project.manifestPath);
+    }
+  }
+}
 function renamesForSourceMigrations(renames: FixCandidate[]): Array<{
   packageName: string;
   renameTo?: string;
@@ -754,6 +828,7 @@ function mapBumps(approved: FixCandidate[]): BumpRequest[] {
     because: c.findingIds,
     ecosystem: c.ecosystem,
     isDowngrade: c.isDowngrade === true,
+    installedVersion: c.installedVersion,
   }));
 }
 
@@ -1391,11 +1466,11 @@ function recordRenameOutcome(outcome: ProjectApplyOutcome, method: "direct" | "c
 }
 
 /** Apply this project's share of approved bumps and record outcomes by method. */
-function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome): void {
+function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome, bomMap: ReadonlyMap<string, string> | null = null): void {
   const projectBumps = bumpsForProject(project, batch);
   const hasExcludes = isMavenLike(project) && batch.excludes.length > 0;
-  if (projectBumps.length === 0 && !hasExcludes) return;
-  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes);
+  if (projectBumps.length === 0 && !hasExcludes && bomMap === null) return;
+  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap);
   for (const w of applyResult.warnings) console.log(`  [${project.label}] ${w}`);
   // Record applied bumps by method classification (direct + constrained are both written to disk)
   for (const c of batch.effectiveApproved) {
@@ -1407,6 +1482,7 @@ function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoop
     if (applyResult.missed.includes(c.packageName)) outcome.excludedWritten.push(c.packageName);
   }
   if (projectBumps.length === 0 && outcome.excludedWritten.length > 0) outcome.fileChanges++;
+  if (applyResult.droppedStale?.length) outcome.fileChanges++;
 }
 
 /** Apply this project's share of approved renames and record outcomes by method. */
@@ -1423,9 +1499,9 @@ function applyProjectRenames(project: ProjectInfo, batch: ApplyBatch, ctx: FixLo
 }
 
 /** Apply this project's share of the batch and record applied entries. */
-function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext): ProjectApplyOutcome {
+function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, bomMap: ReadonlyMap<string, string> | null = null): ProjectApplyOutcome {
   const outcome: ProjectApplyOutcome = { direct: 0, constrained: 0, fileChanges: 0, renamed: false, excludedWritten: [] };
-  applyProjectBumps(project, batch, ctx, outcome);
+  applyProjectBumps(project, batch, ctx, outcome, bomMap);
   applyProjectRenames(project, batch, ctx, outcome);
   return outcome;
 }
@@ -1453,7 +1529,7 @@ function applySourceMigrationPass(ctx: FixLoopContext, effectiveRenames: FixCand
 interface ApplyPassOutcome { passFileChanges: number; totalDirect: number; totalConstrained: number }
 
 /** Transactional apply for one pass: backup touched manifests, apply per project (+ source migrations), restore on failure. */
-function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean): ApplyPassOutcome {
+function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean, bomMaps: Map<string, Map<string, string>>): ApplyPassOutcome {
   const outcome: ApplyPassOutcome = { passFileChanges: 0, totalDirect: 0, totalConstrained: 0 };
   const perOutcomes: ProjectApplyOutcome[] = [];
   let renamesAppliedThisPass = false;
@@ -1468,7 +1544,7 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
       restore: () => restoreSession(ctx.projects, ctx.allSourceChanged),
       apply: () => {
         for (const project of projectsToTouch) {
-          const per = applyProjectFixes(project, batch, ctx);
+          const per = applyProjectFixes(project, batch, ctx, bomMaps.get(project.manifestPath) ?? null);
           perOutcomes.push(per);
           outcome.passFileChanges += per.fileChanges;
           outcome.totalDirect += per.direct;
@@ -1743,6 +1819,8 @@ async function main() {
     const scan = await runScanPass(ctx);
     await rollBackUnresolvable(selectUnresolvableRollbacks(ctx.allApplied, scan.unresolved, scan.packages), projects, ctx.allApplied, ctx.appliedKeys, ctx.allSkippedUnresolvable, ctx.sessionUnresolvable);
     const latestCandidates = await buildLatestForProjects(ctx, scan.packages);
+    const bomMaps = await loadBomManagedMaps(projects);
+    await cleanupStaleBomPins(projects, bomMaps);
 
     if (scan.findings.length === 0 && (!latestFlag || latestCandidates.length === 0)) reportCleanExit(ctx);
 
@@ -1761,8 +1839,8 @@ async function main() {
     const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0);
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
-    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)));
-    const applied = runApplyPass(ctx, projectsToTouch, batch, applySource);
+    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps));
+    const applied = runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps);
     ctx.lastAppliedCount = applied.passFileChanges;
     if (applied.passFileChanges > 0) {
       refreshLocksAfterApply(ctx, projectsToTouch.map(p => path.dirname(p.manifestPath)));
