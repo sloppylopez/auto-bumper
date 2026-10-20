@@ -3,7 +3,7 @@
  * Supports semver (npm, crates.io), PEP 440 (PyPI), and Maven versioning (Java).
  * Handles range matching, deduplication, severity extraction.
  */
-import type { PackageRef, Finding } from "./types.ts";
+import type { PackageRef, Finding, AdvisoryEntry } from "./types.ts";
 import { SeverityOrder, sortBySeverity } from "./types.ts";
 
 /** Summary prefix GitHub attaches to advisories marked as duplicates of another advisory. */
@@ -139,7 +139,16 @@ function checkAffected(packageName: string, version: string, ecosystem: string, 
 
     // Try exact version list — an explicit vendor statement, never excluded
     const exactResult = tryExactVersion(cleanVersion, affected);
-    if (exactResult.isAffected) return exactResult;
+    if (exactResult.isAffected) {
+      // The flat list decides matching; the same block's ranges still carry the window
+      // bounds the downgrade planner needs. Dropping them loses the introduced bound and
+      // no safe downgrade can ever be proposed for this finding.
+      const rangeResult = tryRanges(cleanVersion, affected, eco);
+      if (rangeResult.isAffected && (rangeResult.introduced || rangeResult.lastAffected)) {
+        return { ...exactResult, introduced: rangeResult.introduced, lastAffected: rangeResult.lastAffected };
+      }
+      return exactResult;
+    }
 
     // GHSA-curated advisories state affected versions explicitly; their auto-derived
     // ECOSYSTEM ranges are coarse bounds that over-cover backported lines (e.g. fixed
@@ -159,6 +168,24 @@ function checkAffected(packageName: string, version: string, ecosystem: string, 
   if (isPatchedByParallelLineFix(cleanVersion, entry, packageName, eco)) return { isAffected: false };
 
   return rangeMatch;
+}
+
+/**
+ * True when `version` falls inside any affected block of `entry` for `packageName` —
+ * exact version lists, event windows and representation ranges, with the same
+ * curated-list and parallel-line rules the scan uses. Fix planning reuses this so a
+ * proposed target is only accepted when the next scan would not flag it again.
+ */
+export function isVersionAffected(packageName: string, version: string, ecosystem: string, entry: AdvisoryEntry): boolean {
+  return checkAffected(packageName, version, ecosystem, entry).isAffected;
+}
+
+/** True when the entry carries at least one affected block for `packageName` in this ecosystem (any window or version list). */
+export function entryAffectsPackage(entry: AdvisoryEntry, packageName: string, ecosystem: string): boolean {
+  const eco = ecosystem.toLowerCase();
+  if (!entry.ecosystems.some(e => e.toLowerCase() === eco)) return false;
+  const pkgNameNorm = eco === "pypi" ? normalizePyPIName(packageName) : packageName.toLowerCase();
+  return entry.affected.some(a => isSamePackage(pkgNameNorm, a, eco));
 }
 
 /** Check if an affected block refers to the same package */

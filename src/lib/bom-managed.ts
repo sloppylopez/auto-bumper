@@ -11,6 +11,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { extractRepoUrls, fetchText, MAVEN_CENTRAL, stripTrailingSlashes } from "./repo-metadata.ts";
 import { getCacheRoot } from "../path.ts";
+import { findStaleManagedPins } from "./gradle-editor.ts";
+import type { StaleManagedPin } from "./gradle-editor.ts";
+import { matchVulnerabilities } from "./matcher.ts";
+import type { AdvisoryEntry } from "./types.ts";
 
 /**
  * Managed versions declared by a BOM POM's <dependencyManagement> sections.
@@ -134,4 +138,25 @@ export async function fetchBomManagedVersions(
     return map;
   }
   return null;
+}
+
+/**
+ * Stale managed pins whose removal would reintroduce a known vulnerability: the BOM-managed
+ * version is affected while the pinned version is not (e.g. a downgrade escape below
+ * `introduced` when no forward fix exists). These must survive BOM pin cleanup. Pure — unit-testable.
+ */
+export function computeProtectedPins(
+  content: string,
+  bomManaged: ReadonlyMap<string, string>,
+  advisories: readonly AdvisoryEntry[],
+): Map<string, StaleManagedPin> {
+  const protectedPins = new Map<string, StaleManagedPin>();
+  for (const stale of findStaleManagedPins(content, bomManaged)) {
+    // Probe each version in its own matcher call: matchVulnerabilities dedupes findings
+    // per (advisory, package), so a single two-version probe would collapse to one finding.
+    const affectedAt = (version: string): boolean =>
+      matchVulnerabilities([{ ecosystem: "maven", name: stale.packageName, version, manifestPath: "" }], [...advisories]).length > 0;
+    if (affectedAt(stale.bomVersion) && !affectedAt(stale.version)) protectedPins.set(stale.packageName, stale);
+  }
+  return protectedPins;
 }

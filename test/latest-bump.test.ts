@@ -80,6 +80,11 @@ describe("latestReleaseVersion", () => {
     expect(latestReleaseVersion(["1.0.0", "1.2.0"], "1.2.0")).toBeNull();
     expect(latestReleaseVersion([], "1.0.0")).toBeNull();
   });
+
+  it("excludes Java build qualifiers (-bNN)", () => {
+    expect(latestReleaseVersion(["1.0.0", "1.1.0-b02"], "1.0.0")).toBeNull();
+    expect(latestReleaseVersion(["1.0.0", "1.1.0-b02", "1.2.0"], "1.0.0")).toBe("1.2.0");
+  });
 });
 
 describe("parsePomXmlDirect", () => {

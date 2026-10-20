@@ -377,6 +377,15 @@ describe("pickPreviousVersion", () => {
     expect(pickPreviousVersion(["3.0.3", "4.0.5"], "3.0.3")).toBeNull();
     expect(pickPreviousVersion([], "1.0.0")).toBeNull();
   });
+
+  it("excludes Java build qualifiers (-bNN) from candidates", () => {
+    expect(pickPreviousVersion(["2.2.10-b140310.1920"], "3.0.0")).toBeNull();
+    expect(pickPreviousVersion(["3.0.1", "3.0.2-b01", "4.0.0-M4"], "4.0.0-M4")).toBe("3.0.1");
+  });
+
+  it("accepts GA versions carrying a final/release word", () => {
+    expect(pickPreviousVersion(["1.0.0.Final", "2.0.0-RELEASE", "3.0.0"], "3.0.0")).toBe("2.0.0-RELEASE");
+  });
 });
 
 describe("hostAcceptsEnvCredentials", () => {

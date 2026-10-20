@@ -374,15 +374,22 @@ function parseExistingForces(block: string): Map<string, string> {
 /**
  * Managed pins (constraints and forces) whose version is at or below what the given BOM
  * manages — they would only force an older version than the current platform provides.
- * Pure — unit-testable.
+ * Pins named in `protectedPins` are never reported stale: dropping them would reintroduce
+ * a vulnerability the BOM-managed version still carries (e.g. a downgrade escape when no
+ * forward fix exists). Pure — unit-testable.
  */
-export function findStaleManagedPins(content: string, bomManaged: ReadonlyMap<string, string>): StaleManagedPin[] {
+export function findStaleManagedPins(
+  content: string,
+  bomManaged: ReadonlyMap<string, string>,
+  protectedPins?: ReadonlySet<string>,
+): StaleManagedPin[] {
   const found = findManagedBlock(content);
   if (!found) return [];
   const block = content.slice(found.begin, found.end + found.endLen);
   const stale: StaleManagedPin[] = [];
   const reported = new Set<string>();
   for (const [pkg, e] of parseExistingConstraints(block)) {
+    if (protectedPins?.has(pkg)) continue;
     const bv = bomManaged.get(pkg);
     if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
       stale.push({ packageName: pkg, version: e.version, bomVersion: bv });
@@ -391,6 +398,7 @@ export function findStaleManagedPins(content: string, bomManaged: ReadonlyMap<st
   }
   for (const [pkg, v] of parseExistingForces(block)) {
     if (reported.has(pkg)) continue; // same pin reported once when it is both a constraint and a force
+    if (protectedPins?.has(pkg)) continue;
     const bv = bomManaged.get(pkg);
     if (bv !== undefined && compareMavenVersion(bv, v) >= 0) {
       stale.push({ packageName: pkg, version: v, bomVersion: bv });
@@ -509,6 +517,7 @@ function upsertManagedBlock(
   kotlin = false,
   bomManaged: ReadonlyMap<string, string> | null = null,
   droppedOut?: StaleManagedPin[],
+  protectedPins?: ReadonlySet<string>,
 ): string {
   const found = findManagedBlock(content);
 
@@ -527,9 +536,11 @@ function upsertManagedBlock(
     forceMap = parseExistingForces(block);
 
     // Drop pins the platform BOM now manages at or above — they only force an older version.
+    // Protected pins (vulnerability escapes) survive: the BOM-managed version is itself affected.
     if (bomManaged) {
       const droppedPkgs = new Set<string>();
       for (const [pkg, e] of [...entries]) {
+        if (protectedPins?.has(pkg)) continue;
         const bv = bomManaged.get(pkg);
         if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
           entries.delete(pkg);
@@ -542,6 +553,7 @@ function upsertManagedBlock(
           forceMap.delete(pkg); // already reported via the constraint entry — still drop the matching force
           continue;
         }
+        if (protectedPins?.has(pkg)) continue;
         const bv = bomManaged.get(pkg);
         if (bv !== undefined && compareMavenVersion(bv, v) >= 0) {
           forceMap.delete(pkg);
@@ -969,13 +981,15 @@ function applyCatalogBumps(buildFile: string, bumps: BumpRequest[]): string[] {
  * resolutionStrategy.force so BOM cannot downgrade the fix. Caller is responsible
  * for backing up the file first. With a BOM managed-version map, existing pins at or below
  * the BOM-managed version are dropped (the BOM already covers them), and new pins that would
- * force a downgrade against the BOM are skipped.
+ * force a downgrade against the BOM are skipped — except pins in `protectedPins`, whose
+ * removal would reintroduce a vulnerability the BOM-managed version still carries.
  */
 export function applyBumps(
   filePath: string,
   bumps: BumpRequest[],
   excludes: ExcludeRequest[] = [],
   bomManaged: ReadonlyMap<string, string> | null = null,
+  protectedPins?: ReadonlySet<string>,
 ): ApplyResult {
   const result: ApplyResult = { direct: [], constrained: [], excluded: [], forced: [], warnings: [] };
 
@@ -983,7 +997,7 @@ export function applyBumps(
   let content = fs.readFileSync(filePath, "utf-8");
   // Cleanup-only runs (no bumps/excludes) proceed when the BOM map marks existing pins stale.
   if (bumps.length === 0 && excludes.length === 0) {
-    const stale = bomManaged ? findStaleManagedPins(content, bomManaged) : [];
+    const stale = bomManaged ? findStaleManagedPins(content, bomManaged, protectedPins) : [];
     if (stale.length === 0) return result;
   }
   const catalogDirect = applyCatalogBumps(filePath, bumps);
@@ -1020,7 +1034,7 @@ export function applyBumps(
   }
 
   const dropped: StaleManagedPin[] = [];
-  content = upsertManagedBlock(content, pins, excludes, forces, kotlin, bomManaged, dropped);
+  content = upsertManagedBlock(content, pins, excludes, forces, kotlin, bomManaged, dropped, protectedPins);
   if (dropped.length > 0) {
     result.droppedStale = dropped.map(d => `${d.packageName}@${d.version}`);
     for (const d of dropped) {

@@ -12,9 +12,21 @@ import {
 } from "./osv-package-bridge.ts";
 import { mapOsvVulnToAdvisory } from "./osv-export.ts";
 import { CACHE_TTL_MS } from "./osv-db.ts";
-import { readCacheFile, writeCacheFile, getCacheAgeMs } from "./osv-cache.ts";
+import { readCacheFile, writeCacheFile, getCacheAgeMs, deleteCacheFile } from "./osv-cache.ts";
+import crypto from "node:crypto";
 
-const ORPHAN_CACHE_NAME = "Maven-orphan";
+const LEGACY_ORPHAN_CACHE_NAME = "Maven-orphan";
+
+/** Content-keyed cache name: changes when bridged products or their CVE lists change. */
+export function orphanCacheName(products: BridgeProduct[]): string {
+  const fingerprint = products
+    .map(p => `${p.id}|${(p.knownCveIds ?? []).join(",")}|${p.advisoryIdSources.join(",")}`)
+    .sort()
+    .join("\u00a7");
+  return `Maven-orphan-${crypto.createHash("sha256").update(fingerprint).digest("hex").slice(0, 12)}`;
+}
+
+const ORPHAN_CACHE_NAME = orphanCacheName(BRIDGE_PRODUCTS);
 const CVE_ID_RE = /CVE-\d{4}-\d+/gi;
 
 export function extractCveIdsFromHtml(html: string): string[] {
@@ -82,12 +94,15 @@ export interface OrphanLoadOptions {
 
 /**
  * Load bridged orphan Maven advisories for packages in the scan set.
- * Uses a local cache (Maven-orphan) with the same TTL as ecosystem dumps.
+ * Uses a content-keyed local cache (Maven-orphan-<hash>) with the same TTL as
+ * ecosystem dumps; the key changes when BRIDGE_PRODUCTS changes so a stale
+ * product set is never served from an old cache file.
  */
 export async function loadOrphanBridgedAdvisories(
   packages: PackageRef[],
   opts: OrphanLoadOptions = {},
 ): Promise<AdvisoryEntry[]> {
+  deleteCacheFile(LEGACY_ORPHAN_CACHE_NAME); // one-time cutover from the unkeyed name
   const products = bridgeProductsForPackages(packages);
   if (products.length === 0 && !opts.forceRefresh) return [];
   if (!opts.forceRefresh && !packagesNeedOrphanBridge(packages)) return [];
@@ -100,9 +115,9 @@ export async function loadOrphanBridgedAdvisories(
   if (fresh && !opts.forceRefresh) return cached!;
 
   try {
-    const fetched = await fetchOrphanBridgedAdvisories(
-      opts.forceRefresh ? BRIDGE_PRODUCTS : products,
-    );
+    // Always fetch the full product set so cache contents match the content key,
+    // regardless of which bridged packages this particular scan contains.
+    const fetched = await fetchOrphanBridgedAdvisories(BRIDGE_PRODUCTS);
     if (fetched.length > 0) {
       writeCacheFile(ORPHAN_CACHE_NAME, fetched);
       return fetched;
@@ -115,6 +130,7 @@ export async function loadOrphanBridgedAdvisories(
 
 /** Refresh orphan bridge cache (used by update-db for Maven). */
 export async function refreshOrphanBridgedAdvisories(): Promise<AdvisoryEntry[]> {
+  deleteCacheFile(LEGACY_ORPHAN_CACHE_NAME); // one-time cutover from the unkeyed name
   const fetched = await fetchOrphanBridgedAdvisories(BRIDGE_PRODUCTS);
   if (fetched.length > 0) writeCacheFile(ORPHAN_CACHE_NAME, fetched);
   return fetched;

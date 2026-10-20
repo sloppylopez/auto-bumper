@@ -7,7 +7,8 @@
  * leave at least one CVE open).
  */
 import type { Finding, AdvisoryEntry } from "./types.ts";
-import { comparePackageVersion } from "./matcher.ts";
+import { comparePackageVersion, entryAffectsPackage } from "./matcher.ts";
+import { isPreReleaseOrSnapshot } from "./repo-metadata.ts";
 import { detectMavenRenames } from "./maven-renames.ts";
 import { detectAllPackageRenames } from "./package-renames.ts";
 
@@ -39,6 +40,8 @@ export interface FixCandidate {
   introduced?: string;
   /** Computed downgrade target while the candidate is still unfixable (proposal only, not applied). */
   downgradeTarget?: string;
+  /** Set when no GA release fixes the findings but pre-releases do — names that pre-release fix. */
+  preReleaseOnlyFix?: string;
 }
 
 export interface FixPlan {
@@ -80,17 +83,19 @@ function cmp(a: string, b: string, ecosystem: string): number {
 }
 
 /**
- * Minimal fixed version for a single finding that is strictly greater
- * than the installed version. Prefers same-major; cross-major targets are
- * returned too — the CLI major gate (--allow-major / prompt) enforces consent.
+ * Minimal GA fixed version for a single finding that is strictly greater than the
+ * installed version. Pre-release fixes (SNAPSHOT, milestone, RC, alpha/beta, Java
+ * build) are never targets — a package whose only fix is pre-release goes to the
+ * unfixable path with its pre-release fix named. Prefers same-major; cross-major
+ * targets are returned too — the CLI major gate (--allow-major / prompt) enforces consent.
  */
 function minimalFixForFinding(finding: Finding): string | null {
   const installed = finding.installedVersion;
   const eco = finding.ecosystem;
   const candidates = (finding.fixedVersions || [])
+    .filter(v => !isPreReleaseOrSnapshot(v))
     .filter(v => cmp(v, installed, eco) > 0)
     .sort((a, b) => cmp(a, b, eco));
-  if (candidates.length === 0) return null;
 
   const installedMajor = majorOf(installed);
   const sameMajor = candidates.filter(v => majorOf(v) === installedMajor);
@@ -186,6 +191,7 @@ function buildCandidate(pkgFindings: Finding[]): FixCandidate {
     ecosystem,
     lastAffected: highestLastAffected(pkgFindings),
     introduced: lowestIntroduced(pkgFindings),
+    preReleaseOnlyFix: target === null ? preReleaseOnlyFix(pkgFindings) : undefined,
   };
 }
 
@@ -211,6 +217,22 @@ function lowestIntroduced(findings: Finding[]): string | undefined {
   for (const finding of findings) {
     if (!finding.introduced) return undefined;
     if (best === undefined || cmp(finding.introduced, best, eco) < 0) best = finding.introduced;
+  }
+  return best;
+}
+
+/**
+ * When no GA release fixes a package's findings but pre-releases do, the smallest such
+ * pre-release fix — named in the report so the manual decision is informed.
+ */
+function preReleaseOnlyFix(findings: Finding[]): string | undefined {
+  let best: string | undefined;
+  const eco = findings[0].ecosystem;
+  for (const f of findings) {
+    for (const v of f.fixedVersions ?? []) {
+      if (!isPreReleaseOrSnapshot(v) || cmp(v, f.installedVersion, eco) <= 0) continue;
+      if (best === undefined || cmp(v, best, eco) < 0) best = v;
+    }
   }
   return best;
 }
@@ -246,6 +268,35 @@ export function withDowngradeVersion(candidate: FixCandidate, previousVersion: s
     isMajor: majorOf(previousVersion) !== majorOf(candidate.installedVersion),
     isDowngrade: true,
   };
+}
+
+/**
+ * First GA release walking outward from `installed` (ascending for "up", descending for
+ * "down") that `isUnsafe` does not flag. Pre-releases are never targets. Null when no
+ * published GA in that direction escapes every affected window — the package is
+ * unsatisfiable in that direction.
+ */
+export function pickSafeEscapeVersion(
+  versions: string[],
+  installed: string,
+  direction: "up" | "down",
+  ecosystem: string,
+  isUnsafe: (version: string) => boolean,
+): string | null {
+  const ga = versions.filter(v => !isPreReleaseOrSnapshot(v));
+  if (direction === "up") {
+    const above = ga.filter(v => cmp(v, installed, ecosystem) > 0).sort((a, b) => cmp(a, b, ecosystem));
+    for (const v of above) if (!isUnsafe(v)) return v;
+    return null;
+  }
+  const below = ga.filter(v => cmp(v, installed, ecosystem) < 0).sort((a, b) => cmp(b, a, ecosystem));
+  for (const v of below) if (!isUnsafe(v)) return v;
+  return null;
+}
+
+/** Advisory entries carrying an affected block for this package in this ecosystem — the full window set a proposed target must escape. */
+export function packageAdvisoryEntries(advisories: AdvisoryEntry[], packageName: string, ecosystem: string): AdvisoryEntry[] {
+  return advisories.filter(a => entryAffectsPackage(a, packageName, ecosystem));
 }
 
 /** Compute the highest severity across findings */

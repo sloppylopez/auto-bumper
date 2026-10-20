@@ -6,6 +6,8 @@ import {
   matchVulnerabilities,
   normalizePyPIName,
   dropShadowedDuplicates,
+  isVersionAffected,
+  entryAffectsPackage,
 } from "../src/lib/matcher.ts";
 import { buildFixPlan } from "../src/lib/fixer.ts";
 
@@ -161,6 +163,37 @@ describe("matchVulnerabilities", () => {
       expect(results[0].packageName).toBe("chalk");
       expect(results[0].installedVersion).toBe("4.0.0");
     }
+  });
+
+  it("keeps introduced bound from ranges when the exact version list also matches", () => {
+    const packages = [{
+      ecosystem: "maven",
+      name: "com.github.java-json-tools:jackson-coreutils",
+      version: "2.0",
+      manifestPath: "build.gradle",
+    }];
+    const osvData = [{
+      id: "CVE-TEST-coreutils",
+      aliases: [],
+      ecosystems: ["Maven"],
+      affected: [{
+        package: { name: "com.github.java-json-tools:jackson-coreutils", ecosystem: "Maven" },
+        versions: ["2.0", "v2.0"],
+        ranges: [{
+          type: "GIT",
+          repo: "https://github.com/java-json-tools/jackson-coreutils",
+          events: [{ introduced: "4575e2b026" }, { last_affected: "4575e2b026" }],
+          database_specific: {
+            extracted_events: [{ introduced: "2.0" }, { last_affected: "2.0" }],
+          },
+        }],
+      }],
+      summary: "Test vulnerability",
+    }];
+    const results = matchVulnerabilities(packages, osvData);
+    expect(results).toHaveLength(1);
+    expect(results[0].introduced).toBe("2.0");
+    expect(results[0].lastAffected).toBe("2.0");
   });
 
   it("does not flag version above fixed ECOSYSTEM range", () => {
@@ -706,5 +739,48 @@ describe("curated GHSA version lists override coarse ranges", () => {
   it("keeps range union behavior for non-curated (CVE-keyed) entries", () => {
     const cveEntry = { ...curatedEntry, id: "CVE-2024-6763", aliases: ["GHSA-qh8g-58pp-2wxh"] };
     expect(matchVulnerabilities(pkg("11.0.29"), [cveEntry])).toHaveLength(1);
+  });
+});
+
+describe("isVersionAffected", () => {
+  const pointEntry = {
+    id: "GHSA-point", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{ package: { name: "com.github.java-json-tools:json-patch" }, versions: ["1.13"] }], links: [],
+  };
+  const windowEntry = {
+    id: "GHSA-window", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{
+      package: { name: "com.github.java-json-tools:json-patch" },
+      ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "0" }, { last_affected: "1.12" }] }],
+    }], links: [],
+  };
+
+  it("flags exact listed versions and not the holes between them (json-patch point windows)", () => {
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.13", "maven", pointEntry)).toBe(true);
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.10", "maven", pointEntry)).toBe(false);
+  });
+
+  it("flags versions inside bounded event windows and not beyond the bound", () => {
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.5", "maven", windowEntry)).toBe(true);
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.13", "maven", windowEntry)).toBe(false);
+  });
+});
+
+describe("entryAffectsPackage", () => {
+  const mavenEntry = {
+    id: "GHSA-m", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{ package: { name: "org.example:lib" } }], links: [],
+  };
+  const pypiEntry = {
+    id: "GHSA-p", aliases: [], ecosystems: ["pypi"], summary: "", severity: [],
+    affected: [{ package: { name: "requests" } }], links: [],
+  };
+
+  it("is false when the entry's ecosystem does not match", () => {
+    expect(entryAffectsPackage(pypiEntry, "org.example:lib", "maven")).toBe(false);
+  });
+
+  it("matches maven package names case-insensitively", () => {
+    expect(entryAffectsPackage(mavenEntry, "ORG.EXAMPLE:LIB", "maven")).toBe(true);
   });
 });

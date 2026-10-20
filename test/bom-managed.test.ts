@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fetchBomManagedVersions, parseBomManagedVersions } from "../src/lib/bom-managed.ts";
+import { computeProtectedPins, fetchBomManagedVersions, parseBomManagedVersions } from "../src/lib/bom-managed.ts";
+import { applyBumps } from "../src/lib/gradle-editor.ts";
+import type { AdvisoryEntry } from "../src/lib/types.ts";
 
 function depEntry(group: string, artifact: string, version: string, extra = ""): string {
   return [
@@ -205,6 +207,69 @@ describe("fetchBomManagedVersions", () => {
       } finally {
         restore();
       }
+    });
+  });
+});
+
+function withTempGradle(content: string, run: (filePath: string) => void): void {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-bom-"));
+  const filePath = path.join(dir, "build.gradle");
+  fs.writeFileSync(filePath, content, "utf-8");
+  try {
+    run(filePath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const JAXB_CORE = "org.glassfish.jaxb:jaxb-core";
+
+function jaxbAdvisory(introduced: string): AdvisoryEntry {
+  return {
+    id: "CVE-2026-92877",
+    aliases: ["CVE-2026-92877"],
+    ecosystems: ["Maven"],
+    summary: "test vulnerability in jaxb-core",
+    severity: [],
+    affected: [{
+      package: { name: JAXB_CORE, ecosystem: "Maven" },
+      ranges: [{ type: "ECOSYSTEM", events: [{ introduced }] }],
+    }],
+    links: [],
+  };
+}
+
+describe("computeProtectedPins", () => {
+  const bomMap = new Map<string, string>([[JAXB_CORE, "4.0.8"]]);
+
+  function seedEscapePin(filePath: string): void {
+    applyBumps(filePath, [{ packageName: JAXB_CORE, targetVersion: "3.0.2", because: ["CVE-2026-92877"], isDowngrade: true }]);
+  }
+
+  it("protects a downgrade escape while the BOM-managed version is still affected", () => {
+    withTempGradle(`dependencies {\n    implementation "org.slf4j:slf4j-api:2.0.16"\n}\n`, filePath => {
+      seedEscapePin(filePath);
+
+      const protectedPins = computeProtectedPins(fs.readFileSync(filePath, "utf-8"), bomMap, [jaxbAdvisory("4.0.0-M4")]);
+      expect(protectedPins.get(JAXB_CORE)).toEqual({ packageName: JAXB_CORE, version: "3.0.2", bomVersion: "4.0.8" });
+    });
+  });
+
+  it("does not protect a pin when the BOM-managed version is clean", () => {
+    withTempGradle(`dependencies {\n    implementation "org.slf4j:slf4j-api:2.0.16"\n}\n`, filePath => {
+      seedEscapePin(filePath);
+
+      const protectedPins = computeProtectedPins(fs.readFileSync(filePath, "utf-8"), bomMap, [jaxbAdvisory("9.0.0")]);
+      expect(protectedPins.size).toBe(0);
+    });
+  });
+
+  it("does not protect a pin that is itself affected", () => {
+    withTempGradle(`dependencies {\n    implementation "org.slf4j:slf4j-api:2.0.16"\n}\n`, filePath => {
+      seedEscapePin(filePath);
+
+      const protectedPins = computeProtectedPins(fs.readFileSync(filePath, "utf-8"), bomMap, [jaxbAdvisory("1.0.0")]);
+      expect(protectedPins.size).toBe(0);
     });
   });
 });

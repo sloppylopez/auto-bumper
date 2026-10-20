@@ -1,5 +1,5 @@
-import type { Finding } from "../src/lib/types.ts";
-import { buildFixPlan, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
+import type { Finding, AdvisoryEntry } from "../src/lib/types.ts";
+import { buildFixPlan, packageAdvisoryEntries, pickSafeEscapeVersion, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 
 const makeFinding = (overrides: Partial<Finding>): Finding => ({
   id: "GHSA-test",
@@ -81,6 +81,33 @@ describe("buildFixPlan", () => {
     const plan = buildFixPlan(findings);
     expect(plan.fixable[0].targetVersion).toBe("2.21.5");
     expect(plan.fixable[0].isMajor).toBe(false);
+  });
+
+  it("never targets a pre-release fixed version — no GA fix means unfixable", () => {
+    const findings = [makeFinding({
+      ecosystem: "maven",
+      packageName: "org.hibernate.validator:hibernate-validator",
+      installedVersion: "9.1.5.Final",
+      fixedVersions: ["9.2.0.Beta1"],
+    })];
+    const plan = buildFixPlan(findings);
+    expect(plan.fixable).toEqual([]);
+    expect(plan.unfixable.length).toBe(1);
+    expect(plan.unfixable[0].targetVersion).toBeNull();
+    expect(plan.unfixable[0].preReleaseOnlyFix).toBe("9.2.0.Beta1");
+  });
+
+  it("prefers a GA fix when pre-release and GA fixed versions both exist", () => {
+    const findings = [makeFinding({
+      ecosystem: "maven",
+      packageName: "org.example:example-lib",
+      installedVersion: "8.0.0.Final",
+      fixedVersions: ["9.2.0.Beta1", "9.3.0.Final"],
+    })];
+    const plan = buildFixPlan(findings);
+    expect(plan.fixable.length).toBe(1);
+    expect(plan.fixable[0].targetVersion).toBe("9.3.0.Final");
+    expect(plan.fixable[0].preReleaseOnlyFix).toBeUndefined();
   });
 
   it("maven cross-major same-coords fix goes into fixable with isMajor for the major gate", () => {
@@ -242,5 +269,52 @@ describe("buildFixPlan introduced propagation", () => {
 
   it("returns an empty downgrades list", () => {
     expect(buildFixPlan([]).downgrades).toEqual([]);
+  });
+});
+
+describe("pickSafeEscapeVersion", () => {
+  const jsonPatchVersions = ["1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12", "1.13"];
+  const affectedPoints = new Set(["1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.11", "1.12", "1.13"]);
+
+  it("down-walk from an affected point lands on the safe hole below (json-patch 1.13 → 1.10)", () => {
+    expect(pickSafeEscapeVersion(jsonPatchVersions, "1.13", "down", "maven", v => affectedPoints.has(v))).toBe("1.10");
+  });
+
+  it("up-walk returns null when every release above is affected (json-patch 1.12 → no escape)", () => {
+    expect(pickSafeEscapeVersion(jsonPatchVersions, "1.12", "up", "maven", v => affectedPoints.has(v))).toBeNull();
+  });
+
+  it("returns null in both directions when windows cover the whole range", () => {
+    const versions = ["1.12", "1.13"];
+    expect(pickSafeEscapeVersion(versions, "1.12", "up", "maven", () => true)).toBeNull();
+    expect(pickSafeEscapeVersion(versions, "1.13", "down", "maven", () => true)).toBeNull();
+  });
+
+  it("skips pre-releases when walking up", () => {
+    const versions = ["1.2", "1.14-SNAPSHOT", "1.15"];
+    expect(pickSafeEscapeVersion(versions, "1.2", "up", "maven", v => v === "1.2")).toBe("1.15");
+  });
+
+  it("returns null when nothing is published in the direction", () => {
+    expect(pickSafeEscapeVersion(["2.0"], "1.5", "down", "maven", () => false)).toBeNull();
+  });
+});
+
+describe("packageAdvisoryEntries", () => {
+  const mavenEntry: AdvisoryEntry = {
+    id: "GHSA-1", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{ package: { name: "com.fasterxml.jackson.core:jackson-databind" } }], links: [],
+  };
+  const pypiEntry: AdvisoryEntry = {
+    id: "GHSA-2", aliases: [], ecosystems: ["pypi"], summary: "", severity: [],
+    affected: [{ package: { name: "requests" } }], links: [],
+  };
+
+  it("keeps only entries whose affected block names the package in that ecosystem", () => {
+    expect(packageAdvisoryEntries([mavenEntry, pypiEntry], "com.fasterxml.jackson.core:jackson-databind", "maven")).toEqual([mavenEntry]);
+  });
+
+  it("matches package names case-insensitively", () => {
+    expect(packageAdvisoryEntries([mavenEntry], "COM.FASTERXML.JACKSON.CORE:JACKSON-DATABIND", "maven")).toEqual([mavenEntry]);
   });
 });

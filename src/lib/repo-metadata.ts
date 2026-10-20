@@ -62,7 +62,7 @@ export function pickNextVersion(versions: string[], minVersion: string): string 
   return above[0]!;
 }
 
-/** Newest non-SNAPSHOT, non-prerelease version strictly below `boundary`, or null. Pure — unit-testable. */
+/** Newest GA release (no SNAPSHOT, milestone, RC, alpha/beta or Java build qualifier) strictly below `boundary`, or null. Pure — unit-testable. */
 export function pickPreviousVersion(versions: string[], boundary: string): string | null {
   const below = versions.filter(v => !isPreReleaseOrSnapshot(v) && compareMavenVersion(v, boundary) < 0);
   if (below.length === 0) return null;
@@ -84,10 +84,17 @@ export function extractMetadataVersions(body: string): string[] {
   return versions;
 }
 
-/** True for pre-release / snapshot version strings (Maven convention). */
-function isPreReleaseOrSnapshot(version: string): boolean {
+/**
+ * True for pre-release / snapshot version strings (Maven convention): SNAPSHOT, milestones
+ * (-M1 / .M1), alpha/beta (-Beta1 / .Beta1), release candidates (-RC1/-CR1/.RC1), early
+ * access/dev builds, and Java build qualifiers (-b02, -b140310.1920). Qualifiers may be
+ * dash- or dot-separated. GA releases carry no suffix or a final/release word (.FINAL,
+ * .RELEASE) and pass through.
+ */
+export function isPreReleaseOrSnapshot(version: string): boolean {
   return /SNAPSHOT$/i.test(version) ||
-    /-(alpha|beta|rc|cr|milestone|ea|dev)(\d*)$|-m\d+$/i.test(version);
+    /[.-](alpha|beta|rc|cr|milestone|ea|dev)(\d*)$|[.-]m\d+$/i.test(version) ||
+    /-b\d+(\.\d+)*$/i.test(version);
 }
 
 /** The qualifier after the last dash, e.g. "jre" in "33.6.0-jre". */
@@ -277,6 +284,32 @@ export async function findPreviousAvailableVersion(
     return pickPreviousVersion(versions, boundary);
   }
   return null;
+}
+
+/**
+ * Every version listed in the maven-metadata.xml of the project's declared repositories
+ * plus Maven Central (union; GA and pre-release alike, callers filter). Null when no
+ * metadata could be fetched at all (offline, auth failure) — callers keep best-effort
+ * behavior.
+ */
+export async function listAvailableVersions(
+  manifestPath: string,
+  kind: "gradle" | "maven",
+  packageName: string,
+): Promise<string[] | null> {
+  const [group, name] = packageName.split(":");
+  if (!group || !name) return null;
+
+  let bases = extractRepoUrls(manifestPath, kind);
+  if (!bases.some(b => stripTrailingSlashes(b) === MAVEN_CENTRAL)) bases.push(MAVEN_CENTRAL);
+  const groupPath = group.replaceAll(".", "/");
+  const seen = new Set<string>();
+  for (const base of bases) {
+    const xml = await fetchText(`${stripTrailingSlashes(base)}/${groupPath}/${name}/maven-metadata.xml`);
+    if (!xml) continue;
+    for (const v of extractMetadataVersions(xml)) seen.add(v);
+  }
+  return seen.size > 0 ? [...seen] : null;
 }
 
 /**

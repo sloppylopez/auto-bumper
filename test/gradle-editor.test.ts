@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps, applyRenames, detectGradlePlatform, hasEnforcedPlatform, readDeclaredVersion } from "../src/lib/gradle-editor.ts";
+import { applyBumps, applyRenames, detectGradlePlatform, findStaleManagedPins, hasEnforcedPlatform, readDeclaredVersion } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
@@ -525,6 +525,7 @@ describe("applyBumps BOM-aware cleanup", () => {
     ["io.netty:netty-handler", "4.1.139"],
     ["io.netty:netty-resolver-dns", "4.1.139"],
     ["com.example:fresh-lib", "2.0.0"],
+    ["org.glassfish.jaxb:jaxb-core", "4.0.8"],
   ]);
 
   const ENFORCED_FILE = `dependencies {
@@ -625,6 +626,56 @@ describe("applyBumps BOM-aware cleanup", () => {
       const second = applyBumps(filePath, [], [], bomMap);
       expect(second.droppedStale).toBeUndefined();
       expect(readGradle(filePath)).toBe(afterFirst);
+    });
+  });
+
+  it("keeps a protected vulnerability-escape pin while dropping other stale pins", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" },
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+      ]);
+
+      const result = applyBumps(filePath, [], [], bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(result.droppedStale).toEqual(["io.netty:netty-codec-http2@4.1.136"]);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).not.toContain("4.1.136");
+    });
+  });
+
+  it("drops a stale pin when it is not protected", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" }]);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toEqual(["org.glassfish.jaxb:jaxb-core@3.0.2"]);
+      expect(readGradle(filePath)).not.toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+    });
+  });
+
+  it("keeps the protected pin when new bumps are applied in the same run", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" }]);
+
+      applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.140", because: ["GHSA-w"] },
+      ], [], bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).toContain("io.netty:netty-handler:4.1.140");
+    });
+  });
+
+  it("findStaleManagedPins skips protected pins", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" },
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+      ]);
+
+      const stale = findStaleManagedPins(readGradle(filePath), bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(stale).toEqual([{ packageName: "io.netty:netty-codec-http2", version: "4.1.136", bomVersion: "4.1.139" }]);
     });
   });
 });

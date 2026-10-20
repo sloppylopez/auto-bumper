@@ -13,13 +13,13 @@ import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
 import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
-import { buildFixPlan, majorOf, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
+import { buildFixPlan, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
-import { findLatestAvailableVersion, findNextAvailableVersion, findPreviousAvailableVersion, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
-import { fetchBomManagedVersions } from "../src/lib/bom-managed.ts";
-import { compareMavenVersion, matchVulnerabilities } from "../src/lib/matcher.ts";
+import { findLatestAvailableVersion, findNextAvailableVersion, listAvailableVersions, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
+import { computeProtectedPins, fetchBomManagedVersions } from "../src/lib/bom-managed.ts";
+import { compareMavenVersion, isVersionAffected, matchVulnerabilities } from "../src/lib/matcher.ts";
 import {
   applyBumps as applyGradleBumps,
   applyRenames as applyGradleRenames,
@@ -284,7 +284,7 @@ function pushPlannedBumps(lines: string[], fixable: FixCandidate[]): void {
   for (const c of fixable) {
     lines.push(`| ${c.packageName} | ${c.installedVersion} | ${c.targetVersion}${c.isDowngrade ? " ↓" : ""} | ${c.isMajor ? "yes" : "no"} | ${c.findingIds.length > 0 ? c.findingIds.slice(0, 2).join(", ") : "—"} |`);
   }
-  if (fixable.some(c => c.isDowngrade)) lines.push("- Downgrades (↓) move to an OLDER release — applied only with --allow-downgrades; each is compile-checked and rolled back automatically if the build fails.");
+  if (fixable.some(c => c.isDowngrade)) lines.push("- Downgrades (↓) move to an OLDER GA release — pre-releases, milestones, RCs and Java builds are never downgrade targets. Applied only with --allow-downgrades; a downgrade crossing a major boundary is additionally gated by --allow-major. Each is compile-checked and rolled back automatically if the build fails.");
   lines.push("");
 }
 
@@ -321,7 +321,7 @@ function pushSkippedRenames(lines: string[], skippedRenames: FixCandidate[]): vo
 
 function pushSkippedMajors(lines: string[], skippedMajors: FixCandidate[]): void {
   if (skippedMajors.length === 0) return;
-  lines.push(`## Skipped major bumps (${skippedMajors.length})`, "");
+  lines.push(`## Skipped major version changes (${skippedMajors.length})`, "");
   for (const s of skippedMajors) {
     lines.push(`- ${s.packageName}: ${s.installedVersion} -> ${s.targetVersion} (declined or use --allow-major)`);
   }
@@ -352,7 +352,10 @@ function pushUnfixable(lines: string[], unfixable: FixCandidate[], unfixableRema
     if (excludeFailed?.has(u.packageName)) {
       lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV, and it cannot be excluded (likely a direct dependency) — remove it from the manifest manually, or use --exclude=${u.packageName}`);
     } else if (u.downgradeTarget) {
-      lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV; safe downgrade target ${u.downgradeTarget} available (below introduced ${u.introduced ?? "?"}) — pass --allow-downgrades to apply it`);
+      const crossesMajor = majorOf(u.downgradeTarget!) !== majorOf(u.installedVersion);
+      lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV; GA downgrade target ${u.downgradeTarget} available (below introduced ${u.introduced ?? "?"}) — pass --allow-downgrades to apply it${crossesMajor ? ` (crosses major boundary — also pass --allow-major)` : ""}${u.preReleaseOnlyFix ? ` (forward fix exists only as pre-release ${u.preReleaseOnlyFix})` : ""}`);
+    } else if (u.preReleaseOnlyFix) {
+      lines.push(`- ${u.packageName}@${u.installedVersion} — no GA fix available; only pre-release ${u.preReleaseOnlyFix} fixes this — manual decision required (accept the pre-release, or --exclude=${u.packageName})`);
     } else {
       lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV (consider --exclude=${u.packageName}, or re-run with --apply-excludes)`);
     }
@@ -375,7 +378,7 @@ function planMarkdown(plan: FixPlan, opts: PlanReportOptions): string {
   const lines = [`# Auto-Bumper ${label} Fix Report`, ""];
   pushHealthWarnings(lines, opts.healthWarnings ?? []);
   pushApplied(lines, opts.applied);
-  pushPlannedBumps(lines, plan.fixable);
+  pushPlannedBumps(lines, [...plan.fixable, ...plan.downgrades]);
   pushPlannedRenames(lines, plan.renames);
   pushSourceMigrations(lines, opts.sourceMigrations ?? null, opts.skippedSourceMigrations ?? false);
   pushSkippedRenames(lines, opts.skippedRenames ?? []);
@@ -386,7 +389,7 @@ function planMarkdown(plan: FixPlan, opts: PlanReportOptions): string {
   return lines.join("\n");
 }
 
-async function filterByMajorGate(candidates: FixCandidate[]) {
+async function filterByMajorGate(candidates: FixCandidate[], verb: "bump" | "downgrade" = "bump") {
   const approved: FixCandidate[] = [];
   const skipped: FixCandidate[] = [];
 
@@ -405,7 +408,7 @@ async function filterByMajorGate(candidates: FixCandidate[]) {
     }
     if (isTTY) {
       const ok = await ask(
-        `Major bump ${c.packageName}: ${c.installedVersion} -> ${c.targetVersion}? [y/N] `,
+        `Major ${verb} ${c.packageName}: ${c.installedVersion} -> ${c.targetVersion}? [y/N] `,
       );
       if (ok) approved.push(c);
       else skipped.push(c);
@@ -674,9 +677,9 @@ function discardManifestBackup(project: ProjectInfo): void {
   }
 }
 
-function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string }[], bomManaged: ReadonlyMap<string, string> | null = null): BumpApplyResult {
+function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): BumpApplyResult {
   if (project.kind === "maven") return normalizeBumpApplyResult(applyMavenBumps(project.manifestPath, bumps, excludes));
-  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged));
+  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged, protectedPins));
   if (project.kind === "npm") return normalizeBumpApplyResult(applyNpmBumps(project.manifestPath, bumps, excludes));
   if (project.kind === "crates.io") return normalizeBumpApplyResult(applyCargoBumps(project.manifestPath, bumps, excludes));
   if (project.manifestPath.endsWith("pyproject.toml")) return normalizeBumpApplyResult(applyToPyprojectToml(project.manifestPath, bumps, excludes));
@@ -737,13 +740,36 @@ async function loadBomManagedMaps(projects: ProjectInfo[]): Promise<Map<string, 
   return maps;
 }
 
-/** True when the project's managed block has pins that the BOM now manages at or above. */
-function bomPinCleanupNeeded(project: ProjectInfo, bomMaps: Map<string, Map<string, string>>): boolean {
+/** Per-project protected pins: stale managed pins whose removal would reintroduce a known vulnerability. */
+function computeProtectedPinsByProject(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>, advisories: readonly AdvisoryEntry[]): Map<string, Map<string, StaleManagedPin>> {
+  const out = new Map<string, Map<string, StaleManagedPin>>();
+  for (const p of projects) {
+    if (p.kind !== "gradle") continue;
+    const map = bomMaps.get(p.manifestPath);
+    if (!map) continue;
+    try {
+      const pins = computeProtectedPins(fs.readFileSync(p.manifestPath, "utf-8"), map, advisories);
+      if (pins.size > 0) out.set(p.manifestPath, pins);
+    } catch {
+      // Unreadable build file — skip.
+    }
+  }
+  return out;
+}
+
+/** Set of protected pin names for one project (undefined when there are none). */
+function protectedNames(protectedByProject: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>> | undefined, project: ProjectInfo): ReadonlySet<string> | undefined {
+  const pins = protectedByProject?.get(project.manifestPath);
+  return pins ? new Set(pins.keys()) : undefined;
+}
+
+/** True when the project's managed block has pins that the BOM now manages at or above (and are not vulnerability escapes). */
+function bomPinCleanupNeeded(project: ProjectInfo, bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): boolean {
   if (project.kind !== "gradle") return false;
   const map = bomMaps.get(project.manifestPath);
   if (!map) return false;
   try {
-    return findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map).length > 0;
+    return findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map, protectedNames(protectedByProject, project)).length > 0;
   } catch {
     return false;
   }
@@ -753,7 +779,7 @@ function bomPinCleanupNeeded(project: ProjectInfo, bomMaps: Map<string, Map<stri
  * Drop managed pins that the platform BOM now manages at or above (they only force older versions).
  * Runs on clean exits and nothing-approved breaks too, so a stale block gets cleaned up eventually.
  */
-async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>): Promise<void> {
+async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): Promise<void> {
   if (outputFormat === "json") return; // machine output stays pure
   const details: Array<{ project: ProjectInfo; stale: StaleManagedPin[] }> = [];
   for (const project of projects) {
@@ -761,7 +787,7 @@ async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string,
     const map = bomMaps.get(project.manifestPath);
     if (!map) continue;
     try {
-      const stale = findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map);
+      const stale = findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map, protectedNames(protectedByProject, project));
       if (stale.length > 0) details.push({ project, stale });
     } catch {
       // Unreadable build file — skip.
@@ -778,7 +804,7 @@ async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string,
   for (const { project } of details) {
     try {
       backupBuildGradle(project.manifestPath);
-      const result = applyGradleBumps(project.manifestPath, [], [], bomMaps.get(project.manifestPath)!);
+      const result = applyGradleBumps(project.manifestPath, [], [], bomMaps.get(project.manifestPath)!, protectedNames(protectedByProject, project));
       for (const w of result.warnings) console.log(`  [${project.label}] ${w}`);
       discardGradleBackup(project.manifestPath);
     } catch {
@@ -1166,8 +1192,19 @@ interface PassPlan {
   policy: RenameApplyPolicy;
 }
 
-/** When OSV only has last_affected, pin the next release published in the project's repositories. */
-async function promoteLastAffectedFixes(plan: FixPlan, projects: ProjectInfo[]): Promise<void> {
+/** True when `version` is still affected by any advisory that names this package — a proposed target must escape all of them. */
+function isUnsafeFor(advisories: AdvisoryEntry[], candidate: FixCandidate, eco: string): (version: string) => boolean {
+  const entries = packageAdvisoryEntries(advisories, candidate.packageName, eco);
+  return (version: string) => entries.some(e => isVersionAffected(candidate.packageName, version, eco, e));
+}
+
+/** When OSV only has last_affected, pin a published GA release that escapes every affected window of the package. */
+async function promoteLastAffectedFixes(
+  plan: FixPlan,
+  projects: ProjectInfo[],
+  advisories: AdvisoryEntry[],
+  versionsFor: (packageName: string) => Promise<string[] | null>,
+): Promise<void> {
   const project = projects.find(isMavenLike);
   if (!project || offlineFlag) return;
   const still: FixCandidate[] = [];
@@ -1176,15 +1213,13 @@ async function promoteLastAffectedFixes(plan: FixPlan, projects: ProjectInfo[]):
       still.push(candidate);
       continue;
     }
-    const next = await findNextAvailableVersion(
-      project.manifestPath,
-      project.kind,
-      candidate.packageName,
-      candidate.lastAffected,
-    );
-    const promoted = withNextFixVersion(candidate, next);
+    const eco = candidate.ecosystem || "maven";
+    const versions = await versionsFor(candidate.packageName);
+    const safe = versions ? pickSafeEscapeVersion(versions, candidate.installedVersion, "up", eco, isUnsafeFor(advisories, candidate, eco)) : null;
+    const promoted = withNextFixVersion(candidate, safe);
     if (!promoted) {
-      console.log(`  ~ ${candidate.packageName}: no published release after ${candidate.lastAffected}`);
+      // introduced set → the downgrade pass below reports the consolidated unsatisfiable verdict.
+      if (!candidate.introduced) console.log(`  ~ ${candidate.packageName}: last affected ${candidate.lastAffected}, no published release after it`);
       still.push(candidate);
       continue;
     }
@@ -1194,8 +1229,13 @@ async function promoteLastAffectedFixes(plan: FixPlan, projects: ProjectInfo[]):
   plan.unfixable = still;
 }
 
-/** When OSV has no forward fix, a release strictly below the advisory's introduced bound fixes the finding by leaving the affected window. */
-async function promoteDowngradeFixes(plan: FixPlan, projects: ProjectInfo[]): Promise<void> {
+/** When OSV has no forward fix, a published GA release below the installed one that escapes every affected window fixes the finding. */
+async function promoteDowngradeFixes(
+  plan: FixPlan,
+  projects: ProjectInfo[],
+  advisories: AdvisoryEntry[],
+  versionsFor: (packageName: string) => Promise<string[] | null>,
+): Promise<void> {
   const project = projects.find(isMavenLike);
   if (!project || offlineFlag) return;
   const still: FixCandidate[] = [];
@@ -1204,23 +1244,24 @@ async function promoteDowngradeFixes(plan: FixPlan, projects: ProjectInfo[]): Pr
       still.push(candidate);
       continue;
     }
-    const prev = await findPreviousAvailableVersion(
-      project.manifestPath,
-      project.kind,
-      candidate.packageName,
-      candidate.introduced,
-    );
-    const promoted = withDowngradeVersion(candidate, prev);
+    const eco = candidate.ecosystem || "maven";
+    const versions = await versionsFor(candidate.packageName);
+    const safe = versions ? pickSafeEscapeVersion(versions, candidate.installedVersion, "down", eco, isUnsafeFor(advisories, candidate, eco)) : null;
+    const promoted = withDowngradeVersion(candidate, safe);
     if (!promoted) {
-      console.log(`  ~ ${candidate.packageName}: no published release below introduced ${candidate.introduced}`);
+      if (candidate.lastAffected && versions) {
+        console.log(`  ~ ${candidate.packageName}: unsatisfiable — no published GA version escapes all affected windows (introduced ${candidate.introduced}, last_affected ${candidate.lastAffected}); manual decision required`);
+      } else {
+        console.log(`  ~ ${candidate.packageName}: no published release below introduced ${candidate.introduced}`);
+      }
       still.push(candidate);
       continue;
     }
     if (allowDowngrades) {
-      console.log(`  ~ ${candidate.packageName}: no forward fix; downgrading to ${promoted.targetVersion} (below introduced ${candidate.introduced})`);
+      console.log(`  ~ ${candidate.packageName}: no forward fix; downgrading to ${promoted.targetVersion} (escapes all affected windows)${promoted.isMajor ? ` — crosses major boundary, gated by --allow-major` : ""}`);
       plan.downgrades.push(promoted);
     } else {
-      console.log(`  ~ ${candidate.packageName}: no forward fix; safe downgrade target ${promoted.targetVersion} available (below introduced ${candidate.introduced}) — pass --allow-downgrades to apply it`);
+      console.log(`  ~ ${candidate.packageName}: no forward fix; safe downgrade target ${promoted.targetVersion} available (escapes all affected windows) — pass --allow-downgrades to apply it`);
       still.push({ ...candidate, downgradeTarget: promoted.targetVersion! });
     }
   }
@@ -1228,9 +1269,20 @@ async function promoteDowngradeFixes(plan: FixPlan, projects: ProjectInfo[]): Pr
 }
 
 async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCandidates: FixCandidate[]): Promise<PassPlan> {
-  const plan = buildFixPlan(scan.findings, dedupeAdvisories(scan.advisories));
-  await promoteLastAffectedFixes(plan, ctx.projects);
-  await promoteDowngradeFixes(plan, ctx.projects);
+  const advisories = dedupeAdvisories(scan.advisories);
+  const plan = buildFixPlan(scan.findings, advisories);
+  const versionLists = new Map<string, Promise<string[] | null>>();
+  const versionsFor = (packageName: string): Promise<string[] | null> => {
+    let pending = versionLists.get(packageName);
+    if (!pending) {
+      const project = ctx.projects.find(isMavenLike);
+      pending = project ? listAvailableVersions(project.manifestPath, project.kind, packageName) : Promise.resolve(null);
+      versionLists.set(packageName, pending);
+    }
+    return pending;
+  };
+  await promoteLastAffectedFixes(plan, ctx.projects, advisories, versionsFor);
+  await promoteDowngradeFixes(plan, ctx.projects, advisories, versionsFor);
   plan.renames = expandRenameBundle(plan.renames, scan.packages);
   if (latestFlag && latestCandidates.length > 0) mergeLatestCandidates(plan.fixable, latestCandidates);
 
@@ -1263,8 +1315,9 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
     effectiveRenames = dropUnresolvable(renamesForMixedClasspathCompletion(approvedRenames, scan.packages), ctx.sessionUnresolvable);
   }
   effectiveApproved = await dropUnpublishedTargets(effectiveApproved, ctx.projects, scan.findings);
-  const downgradeApproved = dropUnresolvable(plan.downgrades, ctx.sessionUnresolvable);
-  if (downgradeApproved.length > 0) effectiveApproved = [...effectiveApproved, ...downgradeApproved];
+  const { approved: downgradeApproved, skipped: skippedDowngrades } = await filterByMajorGate(plan.downgrades, "downgrade");
+  ctx.allSkippedMajors.push(...skippedDowngrades);
+  if (downgradeApproved.length > 0) effectiveApproved = [...effectiveApproved, ...dropUnresolvable(downgradeApproved, ctx.sessionUnresolvable)];
   const policy = applyPolicyForRenames(effectiveRenames.map(r => ({ fromPackage: r.packageName, toPackage: r.renameTo ?? "" })));
   return { plan, approved, skippedMajors: skipped, approvedRenames, skippedRenames, effectiveApproved, effectiveRenames, effectiveExcludes, policy };
 }
@@ -1280,14 +1333,14 @@ function handleNothingApproved(ctx: FixLoopContext, pass: PassPlan, findingCount
     }));
     return true;
   }
-  const showPlan = dryRun && (pass.plan.fixable.length > 0 || pass.plan.renames.length > 0);
+  const showPlan = dryRun && (pass.plan.fixable.length > 0 || pass.plan.downgrades.length > 0 || pass.plan.renames.length > 0);
   if (showPlan) {
     console.log(planMarkdown(pass.plan, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: sourceMigrationsForAppliedRenames(renamesForSourceMigrations(pass.plan.renames)), excludeFailed: ctx.excludeFailedCoords }));
     process.exit(0);
   }
   console.log(planMarkdown({ ...pass.plan, fixable: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords }));
   console.log("Nothing to apply.");
-  if (pass.skippedMajors.length > 0) console.log(`  - ${pass.skippedMajors.length} major bump(s) skipped — approve at prompt, or use --allow-major`);
+  if (pass.skippedMajors.length > 0) console.log(`  - ${pass.skippedMajors.length} major version change(s) skipped — approve at prompt, or use --allow-major`);
   if (pass.skippedRenames.length > 0) console.log(`  - ${pass.skippedRenames.length} rename(s) skipped — approve at prompt, or use --allow-renames`);
   if (pass.plan.unfixable.length > 0) console.log(`  - ${pass.plan.unfixable.length} package(s) have no OSV fix version — use --exclude=group:artifact to ignore, or re-run with --apply-excludes to exclude them from the dependency graph`);
   if (applyExcludes && pass.plan.unfixable.length > 0 && !ctx.projects.some(isMavenLike)) console.log("  - exclusions need a Maven/Gradle manifest — nothing to apply");
@@ -1466,11 +1519,11 @@ function recordRenameOutcome(outcome: ProjectApplyOutcome, method: "direct" | "c
 }
 
 /** Apply this project's share of approved bumps and record outcomes by method. */
-function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome, bomMap: ReadonlyMap<string, string> | null = null): void {
+function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): void {
   const projectBumps = bumpsForProject(project, batch);
   const hasExcludes = isMavenLike(project) && batch.excludes.length > 0;
   if (projectBumps.length === 0 && !hasExcludes && bomMap === null) return;
-  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap);
+  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap, protectedPins);
   for (const w of applyResult.warnings) console.log(`  [${project.label}] ${w}`);
   // Record applied bumps by method classification (direct + constrained are both written to disk)
   for (const c of batch.effectiveApproved) {
@@ -1499,9 +1552,9 @@ function applyProjectRenames(project: ProjectInfo, batch: ApplyBatch, ctx: FixLo
 }
 
 /** Apply this project's share of the batch and record applied entries. */
-function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, bomMap: ReadonlyMap<string, string> | null = null): ProjectApplyOutcome {
+function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): ProjectApplyOutcome {
   const outcome: ProjectApplyOutcome = { direct: 0, constrained: 0, fileChanges: 0, renamed: false, excludedWritten: [] };
-  applyProjectBumps(project, batch, ctx, outcome, bomMap);
+  applyProjectBumps(project, batch, ctx, outcome, bomMap, protectedPins);
   applyProjectRenames(project, batch, ctx, outcome);
   return outcome;
 }
@@ -1529,7 +1582,7 @@ function applySourceMigrationPass(ctx: FixLoopContext, effectiveRenames: FixCand
 interface ApplyPassOutcome { passFileChanges: number; totalDirect: number; totalConstrained: number }
 
 /** Transactional apply for one pass: backup touched manifests, apply per project (+ source migrations), restore on failure. */
-function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean, bomMaps: Map<string, Map<string, string>>): ApplyPassOutcome {
+function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean, bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): ApplyPassOutcome {
   const outcome: ApplyPassOutcome = { passFileChanges: 0, totalDirect: 0, totalConstrained: 0 };
   const perOutcomes: ProjectApplyOutcome[] = [];
   let renamesAppliedThisPass = false;
@@ -1544,7 +1597,7 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
       restore: () => restoreSession(ctx.projects, ctx.allSourceChanged),
       apply: () => {
         for (const project of projectsToTouch) {
-          const per = applyProjectFixes(project, batch, ctx, bomMaps.get(project.manifestPath) ?? null);
+          const per = applyProjectFixes(project, batch, ctx, bomMaps.get(project.manifestPath) ?? null, protectedNames(protectedByProject, project));
           perOutcomes.push(per);
           outcome.passFileChanges += per.fileChanges;
           outcome.totalDirect += per.direct;
@@ -1590,14 +1643,14 @@ async function reportOrConfirmApply(ctx: FixLoopContext, pass: PassPlan, planned
     console.log(planMarkdown(
       // Show what apply will actually execute (after unresolvable/unpublished drops), not the raw plan —
       // a raw candidate whose target is unpublished would otherwise appear as a phantom planned bump.
-      { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames },
+      { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames, downgrades: [] },
       { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: dryRun ? [] : ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource && !allowSourceMigrations, excludeFailed: ctx.excludeFailedCoords },
     ));
     process.exit(0);
   }
   if (!applyFlag && isTTY && ctx.iteration === 1) {
     console.log(planMarkdown(
-      { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames },
+      { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames, downgrades: [] },
       { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource, excludeFailed: ctx.excludeFailedCoords },
     ));
     const total = pass.effectiveApproved.length + pass.effectiveRenames.length + pass.effectiveExcludes.length;
@@ -1730,7 +1783,10 @@ function verifyDowngradeBuilds(ctx: FixLoopContext, projectsToTouch: ProjectInfo
     }
     console.log(`  Compiling ${project.label} after downgrade (${command.label})...`);
     const result = runCompileCheck(command, path.dirname(project.manifestPath));
-    if (result.ok) continue;
+    if (result.ok) {
+      console.log(`  ! ${project.label}: downgrade(s) compile-checked only — runtime behavior NOT verified; run the project's test suite`);
+      continue;
+    }
     console.log(`  ! ${project.label}: build failed after downgrade: ${result.detail}`);
     for (const r of downgrades) {
       const removePin = project.kind === "gradle" ? removeGradleManagedPin : removeMavenManagedPin;
@@ -1820,7 +1876,13 @@ async function main() {
     await rollBackUnresolvable(selectUnresolvableRollbacks(ctx.allApplied, scan.unresolved, scan.packages), projects, ctx.allApplied, ctx.appliedKeys, ctx.allSkippedUnresolvable, ctx.sessionUnresolvable);
     const latestCandidates = await buildLatestForProjects(ctx, scan.packages);
     const bomMaps = await loadBomManagedMaps(projects);
-    await cleanupStaleBomPins(projects, bomMaps);
+    const protectedByProject = computeProtectedPinsByProject(projects, bomMaps, scan.advisories);
+    if (outputFormat !== "json") {
+      for (const pins of protectedByProject.values()) {
+        for (const [pkg, st] of pins) console.log(`  ~ keeping pin ${pkg}@${st.version} — BOM-managed ${st.bomVersion} is still vulnerable; dropping it would reintroduce the finding`);
+      }
+    }
+    await cleanupStaleBomPins(projects, bomMaps, protectedByProject);
 
     if (scan.findings.length === 0 && (!latestFlag || latestCandidates.length === 0)) reportCleanExit(ctx);
 
@@ -1839,8 +1901,8 @@ async function main() {
     const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0);
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
-    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps));
-    const applied = runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps);
+    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps, protectedByProject));
+    const applied = runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps, protectedByProject);
     ctx.lastAppliedCount = applied.passFileChanges;
     if (applied.passFileChanges > 0) {
       refreshLocksAfterApply(ctx, projectsToTouch.map(p => path.dirname(p.manifestPath)));

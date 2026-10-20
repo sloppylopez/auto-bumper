@@ -3,6 +3,7 @@
  */
 import fs from "node:fs";
 import type { FixPlan } from "./fixer.ts";
+import { majorOf } from "./fixer.ts";
 import type { PackageRef } from "./types.ts";
 import { GRADLE_MARKERS } from "./brand.ts";
 import {
@@ -39,9 +40,34 @@ function mixedMigrationWarnings(groups: Set<string>): string[] {
   return warnings;
 }
 
+/** Logical artifact families whose coordinates moved across groups. Members resolving at
+ * different majors mean a mixed stack. Extend as relocations appear. */
+const RELOCATED_FAMILIES: string[][] = [
+  ["org.glassfish.jaxb:jaxb-core", "com.sun.xml.bind:jaxb-core"],
+];
+
+/** Warn when members of a relocated family resolve at different major versions. */
+function relocatedFamilyWarnings(packages: PackageRef[]): string[] {
+  const resolved = new Map<string, string>();
+  for (const pkg of packages) {
+    if (pkg.ecosystem === "maven") resolved.set(pkg.name.toLowerCase(), pkg.version);
+  }
+  const warnings: string[] = [];
+  for (const family of RELOCATED_FAMILIES) {
+    const present = family
+      .map(coord => ({ coord, version: resolved.get(coord.toLowerCase()) }))
+      .filter((e): e is { coord: string; version: string } => !!e.version);
+    if (present.length < 2) continue;
+    const majors = new Set(present.map(e => majorOf(e.version)));
+    if (majors.size < 2) continue;
+    warnings.push(`Mixed-major relocated family '${family[0].split(":")[1]}': ${present.map(e => `${e.coord}@${e.version}`).join(" vs ")} — verify the stack is compatible.`);
+  }
+  return warnings;
+}
+
 /** Warn when resolved tree mixes old and new groups from a known migration. */
 export function analyzeMavenPackages(packages: PackageRef[]): string[] {
-  return mixedMigrationWarnings(groupsOnClasspath(packages));
+  return [...mixedMigrationWarnings(groupsOnClasspath(packages)), ...relocatedFamilyWarnings(packages)];
 }
 
 export function analyzeBuildGradleFile(buildGradlePath: string): string[] {
