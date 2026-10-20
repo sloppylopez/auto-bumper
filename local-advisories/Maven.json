@@ -478,7 +478,7 @@
     "ecosystems": [
       "Maven"
     ],
-    "summary": "In Netty before 4.2.18.Final, HTTP request smuggling via insufficient Transfer-Encoding validation in netty-codec-http (parity entry: mirrors SNYK-JAVA-IONETTY-19778369, absent from the OSV Maven dump).",
+    "summary": "HTTP request smuggling via insufficient Transfer-Encoding validation in netty-codec-http: Netty 4.1.133.Final through 4.1.137.Final and 4.2.13.Final through 4.2.17.Final (fixed in 4.1.138.Final on the 4.1 line, 4.2.18.Final on the 4.2 line; parity entry: mirrors SNYK-JAVA-IONETTY-19778369, absent from the OSV Maven dump).",
     "severity": [
       {
         "type": "CVSS_V3_1",
@@ -496,7 +496,13 @@
             "type": "ECOSYSTEM",
             "events": [
               {
-                "introduced": "0"
+                "introduced": "4.1.133.Final"
+              },
+              {
+                "fixed": "4.1.138.Final"
+              },
+              {
+                "introduced": "4.2.13.Final"
               },
               {
                 "fixed": "4.2.18.Final"
