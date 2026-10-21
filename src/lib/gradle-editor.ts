@@ -757,14 +757,16 @@ export function detectGradlePlatform(buildFile: string): GradlePlatform | null {
   return { group, artifact, version, property: vm?.[1] };
 }
 
+/** First two numeric components of a Maven version as [major, minor]; missing parts become "0". */
+export function versionLine(v: string): [string, string] {
+  const m = /^(\d+)(?:\.(\d+))?/.exec(v);
+  return [m?.[1] ?? "0", m?.[2] ?? "0"];
+}
+
 /** True when major or minor differs between two versions (qualifiers ignored). */
 export function crossesMinorBoundary(from: string, to: string): boolean {
-  const parts = (v: string): [string, string] => {
-    const m = /^(\d+)(?:\.(\d+))?/.exec(v);
-    return [m?.[1] ?? "0", m?.[2] ?? "0"];
-  };
-  const [fMaj, fMin] = parts(from);
-  const [tMaj, tMin] = parts(to);
+  const [fMaj, fMin] = versionLine(from);
+  const [tMaj, tMin] = versionLine(to);
   return tMaj !== fMaj || tMin !== fMin;
 }
 
@@ -1003,10 +1005,11 @@ export function applyBumps(
   const catalogDirect = applyCatalogBumps(filePath, bumps);
   let remainingBumps = bumps.filter(b => !catalogDirect.includes(b.packageName));
 
-  // BOM policy: a fix crossing the minor/major line of a BOM-managed artifact family must never be
-  // force-pinned on a single artifact — it desynchronizes its siblings (e.g. netty-codec-http 4.2.x
-  // inside a 4.1.x stack breaks the HTTP pipeline). If the artifact belongs to the detected
-  // platform's family, bump the whole platform; otherwise skip and warn.
+  // BOM policy: a fix crossing the minor/major line of a BOM-managed artifact family is only safe
+  // to force-pin when no sibling shares the installed version's release line — otherwise it
+  // desynchronizes them (e.g. netty-codec-http 4.2.x inside a 4.1.x stack breaks the HTTP pipeline).
+  // If the artifact belongs to the detected platform's family, bump the whole platform; if a
+  // same-line sibling exists, skip and warn; independently-versioned families (e.g. guava) are pinned.
   const enforced = hasEnforcedPlatform(content);
   const platform = detectGradlePlatform(filePath);
   const appliedTargets: Record<string, string> = {};
@@ -1014,7 +1017,7 @@ export function applyBumps(
     remainingBumps = routePlatformBumps(platform, filePath, content, remainingBumps, result, appliedTargets);
   }
   if (enforced) {
-    remainingBumps = skipCrossMinorBomBumps(content, remainingBumps, result, platform);
+    remainingBumps = skipCrossMinorBomBumps(content, remainingBumps, result, platform, bomManaged);
   }
   if (bomManaged) {
     remainingBumps = filterBomCoveredBumps(remainingBumps, bomManaged, platform, result);
@@ -1121,15 +1124,27 @@ function routePlatformBumps(
 }
 
 /**
- * Force-pinning a BOM-managed artifact across a minor line would desynchronize it from its siblings.
+ * Force-pinning an artifact across a minor line desynchronizes it from siblings that share its
+ * current release line (e.g. netty-codec-http 4.2.x inside a 4.1.x stack breaks the HTTP pipeline).
  * Skip such candidates (downgrades keep their compile-gated path) and warn to align the family or
  * bump via the BOM/platform. Runs on all enforced-BOM projects, after platform routing.
+ *
+ * Families whose siblings are versioned independently (e.g. guava: failureaccess 1.0.x,
+ * listenablefuture 9999.0) have no shared line to desynchronize — their cross-line fixes are
+ * pinned normally. Without a BOM-managed map the risk cannot be ruled out; skip conservatively.
  */
-function skipCrossMinorBomBumps(content: string, bumps: BumpRequest[], result: ApplyResult, platform: GradlePlatform | null): BumpRequest[] {
+function skipCrossMinorBomBumps(
+  content: string,
+  bumps: BumpRequest[],
+  result: ApplyResult,
+  platform: GradlePlatform | null,
+  bomManaged: ReadonlyMap<string, string> | null,
+): BumpRequest[] {
   const kept: BumpRequest[] = [];
   for (const b of bumps) {
     if (!b.isDowngrade && readDeclaredVersion(content, b.packageName) === null
-      && b.installedVersion !== undefined && crossesMinorBoundary(b.installedVersion, b.targetVersion)) {
+      && b.installedVersion !== undefined && crossesMinorBoundary(b.installedVersion, b.targetVersion)
+      && hasLineSibling(b.packageName, b.installedVersion, bomManaged)) {
       const via = platform ? ` managed by ${platform.group}:${platform.artifact} ${platform.version}` : "";
       result.warnings.push(
         `${b.packageName}: BOM${via}-managed and ${b.installedVersion} → ${b.targetVersion} crosses a minor line — force-pinning would desynchronize its siblings; skipped. Align the whole family or bump via the BOM/platform`,
@@ -1139,6 +1154,24 @@ function skipCrossMinorBomBumps(content: string, bumps: BumpRequest[], result: A
     kept.push(b);
   }
   return kept;
+}
+
+/**
+ * True when the BOM manages another artifact of the same group family on the installed version's
+ * major.minor line — a sibling that tracks the shared release line and would fall behind a
+ * cross-line force-pin. Without a BOM map, assume the risk (conservative skip).
+ */
+function hasLineSibling(pkg: string, installedVersion: string, bomManaged: ReadonlyMap<string, string> | null): boolean {
+  if (!bomManaged) return true;
+  const group = pkg.split(":")[0] ?? "";
+  const [maj, min] = versionLine(installedVersion);
+  for (const [other, v] of bomManaged) {
+    if (other === pkg) continue;
+    if (!sameGroupFamily(other.split(":")[0] ?? "", group)) continue;
+    const [oMaj, oMin] = versionLine(v);
+    if (oMaj === maj && oMin === min) return true;
+  }
+  return false;
 }
 
 /**

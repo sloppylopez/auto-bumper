@@ -617,6 +617,40 @@ describe("applyBumps BOM-aware cleanup", () => {
     });
   });
 
+  it("pins cross-minor fixes whose family has no same-line siblings", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const guavaBom = new Map<string, string>([
+        ["com.google.guava:guava", "33.5.0-jre"],
+        ["com.google.guava:failureaccess", "1.0.2"],
+        ["com.google.guava:listenablefuture", "9999.0-empty-to-avoid-conflict-with-guava"],
+      ]);
+      const result = applyBumps(filePath, [
+        { packageName: "com.google.guava:guava", targetVersion: "33.7.2-jre", because: ["CVE-2026-102554"], installedVersion: "33.5.0-jre" },
+      ], [], guavaBom);
+      expect(result.constrained).toContain("com.google.guava:guava");
+      expect(result.forced).toContain("com.google.guava:guava");
+      expect(readGradle(filePath)).toContain("com.google.guava:guava:33.7.2-jre");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("still skips cross-minor fixes when a same-line sibling is BOM-managed", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const nettyBom = new Map<string, string>([
+        ["io.netty:netty-codec-http", "4.1.135.Final"],
+        ["io.netty:netty-codec", "4.1.136.Final"],
+        ["io.netty:netty-handler", "4.1.137.Final"],
+      ]);
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-codec-http", targetVersion: "4.2.0.Final", because: ["GHSA-test"], installedVersion: "4.1.135.Final" },
+      ], [], nettyBom);
+      expect(result.constrained).not.toContain("io.netty:netty-codec-http");
+      expect(result.forced).not.toContain("io.netty:netty-codec-http");
+      expect(readGradle(filePath)).not.toContain("io.netty:netty-codec-http");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+    });
+  });
+
   it("is idempotent across repeated cleanup runs", () => {
     withTempGradle(ENFORCED_FILE, filePath => {
       seed(filePath, [{ pkg: "io.netty:netty-codec-http2", version: "4.1.136" }]);
