@@ -15,9 +15,9 @@
 | Feature | Detail |
 |---------|--------|
 | **What it does** | Finds vulnerable dependencies → proposes minimal version bumps → edits your manifest files |
-| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; reviewed Maven advisories come from the GitHub global advisory list (cached, refreshed by `updated` time, and read again with `--offline`); locally-vendored advisory files in the package `local-advisories/` and in `<project>/local-advisories/` cover disclosures OSV and GitHub have not ingested yet. Set `AUTO_BUMPER_SUPPLEMENTAL=off` (or `0`/`false`, case-insensitive) to disable both supplemental sources and run strictly on the dump + local advisories |
+| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; reviewed Maven advisories come from the GitHub global advisory list (cached, refreshed by `updated` time, and read again with `--offline`); Snyk's public per-package advisory pages supplement both for Maven and npm packages (one request per unique package, cached 7 days); locally-vendored advisory files in the package `local-advisories/` and in `<project>/local-advisories/` cover disclosures OSV, GitHub, and Snyk have not ingested yet. Set `AUTO_BUMPER_SUPPLEMENTAL=off` (or `0`/`false`, case-insensitive) to disable all supplemental sources and run strictly on the dump + local advisories |
 | **Where data lives** | `.auto-bumper/db/osv/` in your current working directory — never leaves your machine |
-| **Network needed?** | Only to refresh the OSV advisory database. Each online run sends a lightweight HEAD probe (~ms, no project data) per ecosystem and re-downloads only when the remote dump changed; otherwise the local cache is used (7-day TTL fallback if the probe fails). All matching runs against the local DB — your package list is never sent anywhere. Pass `--offline` to skip even that |
+| **Network needed?** | Only to refresh vulnerability data. Each online run sends a lightweight HEAD probe (~ms, no project data) per OSV ecosystem and re-downloads only when the remote dump changed; otherwise the local cache is used (7-day TTL fallback if the probe fails). It also fetches Snyk's public advisory page for each unique Maven/npm package not yet cached (7-day TTL) — package coordinates are sent to Snyk, nothing else. All matching runs against the local DB — your full dependency tree is never sent anywhere. Pass `--offline` to skip even that |
 | **LLM involved?** | No. Fixed versions come directly from OSV advisory metadata |
 
 ---
@@ -436,13 +436,17 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
         ├── Maven.json.gz        ← ~3MB compressed
         ├── Maven-orphan-<hash>.json.gz ← package-less OSV CVEs bridged onto Maven coordinates (hash of the bridged product list; a changed product set re-fetches instead of serving a stale cache)
         ├── repo-advisories.json.gz ← reviewed GitHub Maven advisories
-        └── repo-advisories.since  ← UTC cursor for the next `updated>=` pull
+        ├── repo-advisories.since  ← UTC cursor for the next `updated>=` pull
+        └── snyk/                  ← Snyk public per-package advisory caches (7-day TTL)
+            ├── maven/<group>_<artifact>.json
+            └── npm/<name>.json
 ```
 
 - **Location:** Always under current working directory
 - **Format:** Gzip-compressed JSON arrays of OSV advisory entries
 - **Freshness:** every online run HEAD-probes each remote dump by ETag — if the remote object changed since the cache was written, it is re-downloaded immediately; otherwise the local cache is used. If the probe fails (no network), the 7-day TTL applies (configurable via `CACHE_TTL_MS` constant)
 - **GitHub Maven advisories:** reviewed advisories from the GitHub global advisory API (`ecosystem=maven`), cached as `repo-advisories.json.gz`. The first online refresh downloads the list. Later refreshes send `updated>=` the timestamp in `repo-advisories.since`, plus a withdrawn pass so revoked ids drop out of the cache. The request does not include project package names. A failed fetch keeps the last cache and does not move the cursor. Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the unauthenticated rate limit (the first full pull is many pages). `--offline` reads that cache and does not call GitHub
+- **Snyk public advisories (Maven + npm):** for every unique scanned Maven/npm package, Snyk's public per-package advisory page is fetched once and cached under `snyk/` with a 7-day TTL (a package absent from Snyk's database is cached as empty). Advisories are converted to OSV format — id is the first CVE alias when present, otherwise the SNYK id; severity maps critical/high/medium/low to CVSS 9.0/7.5/4.0/3.0. A failed fetch serves the stale cache when one exists (logged, no warning); with no cache at all the affected packages are reported as a single warning and simply go unmatched — the scan still succeeds. `--offline` reads the caches without fetching; never-fetched packages produce a "cache missing" warning
 - **Fallback strategy:** Stale cache > no cache. If download fails, uses whatever is cached
 - **Disk usage:** ~8MB total across all four ecosystems
 - **Local vendored advisories:** disclosures not yet in the OSV bulk dump can be added as OSV-format JSON files under `<packageRoot>/local-advisories/` (shipped with this package) and under `<project>/local-advisories/` (the repo you scan). A project file with the same advisory id replaces the packaged copy. Loaded on every scan, works offline, never fetched
@@ -470,7 +474,7 @@ What each data source does offline:
 | Per-ecosystem OSV dumps (GCS) | Fresh cache used; stale/missing → download | Cache used **regardless of TTL**. No cache file → exit `2` (no download). Run `update-db` online first |
 | Orphan-CVE bridge (Maven) | Same as above | Local cache or empty — never fetched |
 | GitHub reviewed Maven advisories | Full list on first pull, then `updated>=` cursor. On fetch failure the last cache is used and the cursor stays put. `GITHUB_TOKEN` or `GH_TOKEN` is sent when set. Fetch failure with no cache is an incomplete scan (exit 2, not clean) | Cache is read. A missing cache is a warning, not a download |
-| Local vendored advisories (`local-advisories/*.json`) | Loaded from the package and from `<project>/local-advisories/` | **Always loaded** — pure local files, no fetch involved |
+| Snyk public per-package advisories (Maven + npm) | One page fetch per unique package not yet cached (7-day TTL). Fetch failure serves the stale cache; with no cache it is one aggregated warning and those packages go unmatched | Caches are read **regardless of TTL**. Never-fetched packages → "cache missing" warning, no download |
 
 Practical notes:
 

@@ -13,6 +13,7 @@ import { loadRepoAdvisories } from "./lib/github-repo-advisories.ts";
 import { packagesNeedOrphanBridge } from "./lib/osv-package-bridge.ts";
 import { loadOrphanBridgedAdvisories } from "./lib/osv-orphan-cves.ts";
 import { loadLocalAdvisoriesForTarget } from "./lib/local-advisories.ts";
+import { loadSnykAdvisories } from "./lib/snyk-advisories.ts";
 import { readCacheFile, writeCacheFile, getCacheAgeMs, readCacheEtag, writeCacheEtag } from "./lib/osv-cache.ts";
 
 export { normalizeCliPath, pathHint, repairMangledCliPath, CACHE_DIR, getOsvDbDir } from "./path.ts";
@@ -24,8 +25,8 @@ export { readCacheFile, writeCacheFile } from "./lib/osv-cache.ts";
 export const DB_DIR = getOsvDbDir();
 /**
  * True when AUTO_BUMPER_SUPPLEMENTAL is set to `off`, `0`, or `false` (case-insensitive).
- * Disables both supplemental advisory sources (GitHub repo advisories + orphan-CVE bridge),
- * leaving runs strictly on the OSV bulk dump plus locally-vendored advisories. Unset/other → current behavior.
+ * Disables the supplemental advisory sources (GitHub repo advisories, orphan-CVE bridge,
+ * and Snyk public per-package advisories), leaving runs strictly on the OSV bulk dump plus locally-vendored advisories. Unset/other → current behavior.
  */
 export function supplementalDisabled(): boolean {
   const v = process.env.AUTO_BUMPER_SUPPLEMENTAL;
@@ -307,7 +308,22 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   if (localAdvisories.length > 0) {
     setText(`Loaded ${localAdvisories.length} locally-vendored advisories`);
   }
-  const combinedData = mergeAdvisories(allAdvData, [...repoAdvisories, ...localAdvisories]);
+  // Phase 3c: Snyk Open Source public advisories (per-package pages, cached per coordinate)
+  let snykAdvisories: AdvisoryEntry[] = [];
+  if (!supplementalDisabled()) {
+    try {
+      snykAdvisories = await loadSnykAdvisories(packages, {
+        offline: opts.offline,
+        setText,
+        onWarning: (msg) => warnings.push(msg),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(msg);
+      advisoryIncomplete = true;
+    }
+  }
+  const combinedData = mergeAdvisories(allAdvData, [...repoAdvisories, ...snykAdvisories, ...localAdvisories]);
 
   // Phase 4: Match & report — excluded coordinates are dropped before counting/reporting
   const allFindings = matchVulnerabilities(packages, combinedData);
