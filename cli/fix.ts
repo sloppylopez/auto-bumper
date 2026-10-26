@@ -13,11 +13,11 @@ import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
 import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
-import { buildFixPlan, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
+import { buildFixPlan, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
-import { findLatestAvailableVersion, findNextAvailableVersion, listAvailableVersions, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
+import { findLatestAvailableVersion, findNextAvailableVersion, isPreReleaseOrSnapshot, listAvailableVersions, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
 import { computeProtectedPins, fetchBomManagedVersions } from "../src/lib/bom-managed.ts";
 import { compareMavenVersion, isVersionAffected, matchVulnerabilities } from "../src/lib/matcher.ts";
 import {
@@ -73,7 +73,7 @@ import {
   analyzeBuildGradleFile,
   analyzeFixPlan,
 } from "../src/lib/gradle-health.ts";
-import { applyPolicyForRenames, expandRenameBundle, sourceMigrationsForAppliedRenames } from "../src/lib/maven-renames.ts";
+import { applyPolicyForRenames, consumerVariantsForFamily, expandRenameBundle, KNOWN_RENAMES, sourceMigrationsForAppliedRenames, topLevelAncestors } from "../src/lib/maven-renames.ts";
 import { scanEcosystemFilterForKind } from "../src/lib/ecosystem-filter.ts";
 import type { RenameApplyPolicy, SourceMigrationConfig } from "../src/lib/maven-renames.ts";
 import {
@@ -82,7 +82,7 @@ import {
   discardSourceMigrationBackups,
   restoreSourceMigrationBackups,
 } from "../src/lib/source-migrations.ts";
-import { runApplyTransaction } from "../src/lib/backup.ts";
+import { discardStaleBackup, runApplyTransaction } from "../src/lib/backup.ts";
 import type { AdvisoryEntry, Finding, PackageRef } from "../src/lib/types.ts";
 import {
   filterRedundantFixes,
@@ -161,6 +161,17 @@ interface AppliedBump {
   latest?: boolean;
   /** True when this bump moved the project to an OLDER release (downgrade-only fix). */
   isDowngrade?: boolean;
+}
+
+/** One coherent whole-family migration executed in this run (all members pinned to one version). */
+interface FamilyMigrationReport {
+  family: string;
+  targetVersion: string;
+  memberCount: number;
+  /** Members whose coordinate was renamed as part of the migration (old -> new). */
+  renamedMembers?: Record<string, string>;
+  /** Consumer artifacts swapped to an ecosystem-specific variant as part of the migration (base -> variant). */
+  consumerVariants?: Record<string, string>;
 }
 
 /** Detect ALL fixable projects in directory */
@@ -256,6 +267,7 @@ interface PlanReportOptions {
   remainingFindings?: Array<{ packageName: string; installedVersion: string; id: string; aliases: string[] }>;
   skippedRenames?: FixCandidate[];
   healthWarnings?: string[];
+  familyMigrations?: FamilyMigrationReport[];
   sourceMigrations?: SourceMigrationConfig | null;
   skippedSourceMigrations?: boolean;
   skippedUnresolvable?: AppliedBump[];
@@ -272,8 +284,19 @@ function pushApplied(lines: string[], applied: AppliedBump[]): void {
   if (applied.length === 0) return;
   lines.push(`## Applied (${applied.length})`, "");
   for (const a of applied) {
-    const ref = a.latest ? "(latest)" : `[${a.findingIds.join(", ")}]`;
+    const ref = a.latest ? "(latest)" : a.findingIds.length > 0 ? `[${a.findingIds.join(", ")}]` : "(co-versioned pin)";
     lines.push(`- ${a.packageName}: ${a.from} -> ${a.to} (${a.method}) ${ref}`);
+  }
+  lines.push("");
+}
+
+function pushFamilyMigrations(lines: string[], migrations: FamilyMigrationReport[]): void {
+  if (migrations.length === 0) return;
+  lines.push(`## Family migrations (${migrations.length})`, "");
+  for (const m of migrations) {
+    const renames = Object.entries(m.renamedMembers ?? {}).map(([from, to]) => `${from.split(":")[1]} -> ${to.split(":")[1]}`);
+    const variants = Object.entries(m.consumerVariants ?? {}).map(([from, to]) => `${from.split(":")[1]} -> ${to.split(":")[1]}`);
+    lines.push(`- family '${m.family}': ${m.memberCount} artifacts pinned to ${m.targetVersion}${renames.length + variants.length > 0 ? ` (${[...renames, ...variants].join(", ")})` : ""} — the co-versioned family moves together; verify compatibility with dependencies built against the old line (e.g. test-scope stubs)`);
   }
   lines.push("");
 }
@@ -351,6 +374,8 @@ function pushUnfixable(lines: string[], unfixable: FixCandidate[], unfixableRema
   for (const u of all) {
     if (excludeFailed?.has(u.packageName)) {
       lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV, and it cannot be excluded (likely a direct dependency) — remove it from the manifest manually, or use --exclude=${u.packageName}`);
+    } else if (u.familyClamped) {
+      lines.push(`- ${u.packageName}@${u.installedVersion} — ${u.familyClamped} (consider --exclude=${u.packageName}, or re-run with --apply-excludes)`);
     } else if (u.downgradeTarget) {
       const crossesMajor = majorOf(u.downgradeTarget!) !== majorOf(u.installedVersion);
       lines.push(`- ${u.packageName}@${u.installedVersion} — no fixed version in OSV; GA downgrade target ${u.downgradeTarget} available (below introduced ${u.introduced ?? "?"}) — pass --allow-downgrades to apply it${crossesMajor ? ` (crosses major boundary — also pass --allow-major)` : ""}${u.preReleaseOnlyFix ? ` (forward fix exists only as pre-release ${u.preReleaseOnlyFix})` : ""}`);
@@ -377,6 +402,7 @@ function planMarkdown(plan: FixPlan, opts: PlanReportOptions): string {
   const label = opts.labels.length === 1 ? opts.labels[0] : opts.labels.join(", ");
   const lines = [`# Auto-Bumper ${label} Fix Report`, ""];
   pushHealthWarnings(lines, opts.healthWarnings ?? []);
+  pushFamilyMigrations(lines, opts.familyMigrations ?? []);
   pushApplied(lines, opts.applied);
   pushPlannedBumps(lines, [...plan.fixable, ...plan.downgrades]);
   pushPlannedRenames(lines, plan.renames);
@@ -677,7 +703,7 @@ function discardManifestBackup(project: ProjectInfo): void {
   }
 }
 
-function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): BumpApplyResult {
+function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string; attachTo?: string[] }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): BumpApplyResult {
   if (project.kind === "maven") return normalizeBumpApplyResult(applyMavenBumps(project.manifestPath, bumps, excludes));
   if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged, protectedPins));
   if (project.kind === "npm") return normalizeBumpApplyResult(applyNpmBumps(project.manifestPath, bumps, excludes));
@@ -837,11 +863,14 @@ function renamesForProject(
   project: ProjectInfo,
   renames: RenameRequest[],
   findings: Array<{ packageName: string; ecosystem: string }>,
+  packages: PackageRef[],
 ): RenameRequest[] {
   const eco = projectEcosystemForKind(project.kind);
+  // Migration-bundled renames carry no finding on the old coordinate; apply them where that coordinate resolves.
+  const projectClasspath = new Set(packages.filter(p => p.manifestPath === project.manifestPath).map(p => p.name));
   return renames.filter(r => {
     const findingEco = findings.find(f => f.packageName === r.fromPackage)?.ecosystem;
-    if (findingEco !== eco) return false;
+    if (findingEco !== eco) return !!r.kind && projectClasspath.has(r.fromPackage);
     if (isRootProject(project)) return true;
     return projectDeclaresPackage(project, r.fromPackage);
   });
@@ -996,6 +1025,7 @@ function mapRenames(approved: FixCandidate[]): RenameRequest[] {
       toPackage: c.renameTo!,
       targetVersion: c.targetVersion!,
       because: c.findingIds,
+      ...(c.consumerVariant ? { kind: "consumerVariant" as const } : c.familyMigrated ? { kind: "familyMigrated" as const } : {}),
     }));
 }
 
@@ -1048,6 +1078,7 @@ interface FixLoopContext {
   approvedExcludeCoords: Set<string>;
   excludeFailedCoords: Set<string>;
   lastUnfixable: FixCandidate[];
+  lastFamilyMigrations: FamilyMigrationReport[];
   lastHealthWarnings: string[];
   iteration: number;
   prevFindingSig: string | null;
@@ -1165,11 +1196,11 @@ function reportCleanExit(ctx: FixLoopContext): never {
   if (outputFormat === "json") {
     console.log(JSON.stringify({ status: "clean", applied: ctx.allApplied, skippedMajors: ctx.allSkippedMajors, skippedUnresolvable: ctx.allSkippedUnresolvable, rolledBackDowngrades: ctx.allRolledBackDowngrades }, null, 2));
   } else if (ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) {
-    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
+    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
     if (ctx.allSkippedUnresolvable.length > 0) console.log(`Remaining issues: ${ctx.allSkippedUnresolvable.length} fix(es) rolled back — target version not resolvable from project repositories.`);
     if (ctx.allRolledBackDowngrades.length > 0) console.log(`Remaining issues: ${ctx.allRolledBackDowngrades.length} downgrade(s) rolled back — build failed after downgrade; original versions kept.`);
   } else if (ctx.allApplied.length > 0) {
-    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false }));
+    console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: null, skippedSourceMigrations: false }));
     console.log("All vulnerabilities fixed.");
   } else {
     console.log("No vulnerabilities found.");
@@ -1268,9 +1299,237 @@ async function promoteDowngradeFixes(
   plan.unfixable = still;
 }
 
+/**
+ * Co-versioned families (jetty, netty, vertx, jackson) that are stuck get a coherent whole-family
+ * move: pin every classpath member to a single published GA version on the newest installed line
+ * or a higher line where no member is affected by any advisory. A family is stuck when an affected
+ * member has no fixable candidate, a guard-clamped/demoted candidate, or a target that is not
+ * published in any project repository (e.g. the 11.x line went EOL below its own minimal fix).
+ * Maven only — Gradle coordinates the family through BOMs/platforms instead of pins.
+ */
+async function applyFamilyMigrations(
+  plan: FixPlan,
+  projects: ProjectInfo[],
+  advisories: AdvisoryEntry[],
+  versionsFor: (packageName: string) => Promise<string[] | null>,
+  classpath: ReadonlyArray<{ packageName: string; installedVersion: string; ecosystem: string }>,
+  findings: Finding[],
+  packages: PackageRef[],
+): Promise<FamilyMigrationReport[]> {
+  const project = projects.find(isMavenLike);
+  if (!project || offlineFlag) return [];
+  const migrations = planFamilyMigrations(classpath, findings);
+  if (migrations.length === 0) return [];
+  for (const mg of migrations) {
+    console.log(`  ~ family '${mg.familyName}': ${mg.memberPackages.length} members — ${mg.memberPackages.join(", ")}`);
+  }
+
+  const reports: FamilyMigrationReport[] = [];
+  for (const mig of migrations) {
+    const memberSet = new Set(mig.memberPackages);
+    const installedOf = new Map<string, string>();
+    for (const p of classpath) if (memberSet.has(p.packageName)) installedOf.set(p.packageName, p.installedVersion);
+    const findingIdsOf = new Map<string, string[]>();
+    for (const f of findings) {
+      if (!memberSet.has(f.packageName)) continue;
+      const ids = findingIdsOf.get(f.packageName) ?? [];
+      ids.push(f.id);
+      findingIdsOf.set(f.packageName, ids);
+    }
+
+    const lists = await Promise.all(mig.memberPackages.map(m => versionsFor(m)));
+    if (lists.some(l => l === null)) continue; // metadata unavailable — keep per-artifact verdicts
+    const listSets = lists.map(l => new Set(l!));
+
+    // Members whose coordinate was renamed upstream (e.g. Jetty 12's http2-* -> jetty-http2-*)
+    // can still migrate when the old coordinate no longer publishes on the target line.
+    const successorOf = new Map<string, string>();
+    for (const m of mig.memberPackages) {
+      const s = KNOWN_RENAMES[m];
+      if (s) successorOf.set(m, s);
+    }
+    const successors = [...new Set(successorOf.values())];
+    const succLists = await Promise.all(successors.map(s => versionsFor(s)));
+    if (succLists.some(l => l === null)) continue; // metadata unavailable — keep per-artifact verdicts
+    const succSets = new Map(successors.map((s, i) => [s, new Set(succLists[i]!)]));
+    // Stuck? An affected member whose candidate is missing, guard-clamped, or targets an
+    // unpublished version cannot be fixed by the per-artifact flow.
+    const stuck = mig.memberPackages.some((m, i) => {
+      if (!findingIdsOf.has(m)) return false;
+      const c = plan.fixable.find(x => x.packageName === m && (x.ecosystem || "maven") === "maven");
+      if (!c || c.targetVersion === null) return true;
+      if (c.familyClamped) return true;
+      return !listSets[i].has(c.targetVersion);
+    });
+    if (!stuck) continue; // per-artifact flow already handles this family
+
+    const unsafeAt = new Map<string, (v: string) => boolean>();
+    for (const m of mig.memberPackages) {
+      const successor = successorOf.get(m);
+      const entries = packageAdvisoryEntries(advisories, m, "maven");
+      const succEntries = successor ? packageAdvisoryEntries(advisories, successor, "maven") : [];
+      unsafeAt.set(m, v =>
+        entries.some(e => isVersionAffected(m, v, "maven", e)) ||
+        succEntries.some(e => isVersionAffected(successor!, v, "maven", e)),
+      );
+    }
+
+    let target: string | null = null;
+    let participating: string[] = [];
+    for (const lineMajor of mig.linesToTry) {
+      // Members available on this line: the own list while it still publishes there, otherwise
+      // the renamed successor's list. Discontinued members (e.g. Jetty 12 dropped the alpn
+      // modules) have no version on the line and stay at their current version.
+      const effective = new Map<string, Set<string>>();
+      mig.memberPackages.forEach((m, i) => {
+        const ownHasLine = [...listSets[i]].some(v => majorOf(v) === lineMajor && !isPreReleaseOrSnapshot(v));
+        if (ownHasLine) { effective.set(m, listSets[i]); return; }
+        const s = successorOf.get(m);
+        if (s) effective.set(m, succSets.get(s)!);
+      });
+      const membersOnLine = [...effective.keys()];
+      if (membersOnLine.length === 0) continue; // no member publishes on this line at all
+      const lineSets = membersOnLine.map(m => effective.get(m)!);
+      const common: string[] = [];
+      for (const v of lineSets[0]!) {
+        if (majorOf(v) !== lineMajor || isPreReleaseOrSnapshot(v)) continue;
+        if (lineSets.every(s => s.has(v))) common.push(v);
+      }
+      common.sort((a, b) => compareMavenVersion(a, b));
+      for (const v of common) {
+        if (membersOnLine.every(m => !unsafeAt.get(m)!(v))) { target = v; break; }
+      }
+      if (!target && common.length > 0) {
+        const blocker = membersOnLine.find(m => unsafeAt.get(m)!(common[common.length - 1]));
+        console.log(`  ~ family '${mig.familyName}': line ${lineMajor}: ${common.length} common version(s), none clears all advisories${blocker ? ` — ${blocker} still affected at ${common[common.length - 1]}` : ""}`);
+      }
+      if (target) { participating = membersOnLine; break; }
+    }
+
+    if (!target) {
+      console.log(`  ~ family '${mig.familyName}': no published release line clears all advisories — keeping per-artifact verdicts`);
+      continue;
+    }
+    // Participating members whose own coordinate no longer publishes on the target line migrate via rename.
+    const renamedOf = new Map<string, string>();
+    for (const m of participating) {
+      const i = mig.memberPackages.indexOf(m);
+      const s = successorOf.get(m);
+      if (!s) continue;
+      const ownHasTargetLine = [...listSets[i]].some(v => majorOf(v) === majorOf(target!) && !isPreReleaseOrSnapshot(v));
+      if (!ownHasTargetLine) renamedOf.set(m, s);
+    }
+    if (renamedOf.size > 0 && !allowRenames) {
+      console.log(`  ~ family '${mig.familyName}': migration to ${target} requires coordinate renames (${[...renamedOf.entries()].map(([f, t]) => `${f} -> ${t}`).join(", ")}) — pass --allow-renames to proceed`);
+      continue;
+    }
+    const crossMajor = participating.some(m => majorOf(target) !== majorOf(installedOf.get(m)!));
+    console.log(`  ~ family '${mig.familyName}': migrating ${participating.length} of ${mig.memberPackages.length} artifacts to ${target}${crossMajor ? " (cross-major, gated by --allow-major)" : ""}${participating.length < mig.memberPackages.length ? `; ${mig.memberPackages.length - participating.length} member(s) have no version on this line and stay put` : ""}`);
+
+    for (const m of participating) {
+      const installed = installedOf.get(m)!;
+      const findingIds = findingIdsOf.get(m) ?? [];
+      const isMajor = majorOf(target) !== majorOf(installed);
+      const successor = renamedOf.get(m);
+      if (successor) {
+        // The old coordinate dies on this line: emit a rename candidate instead of a pin.
+        plan.fixable = plan.fixable.filter(c => !(c.packageName === m && (c.ecosystem || "maven") === "maven"));
+        const reason = `family '${mig.familyName}' migrated to ${successor} @ ${target} for coherence`;
+        const existing = plan.renames.find(c => c.packageName === m && (c.ecosystem || "maven") === "maven");
+        if (existing) {
+          existing.renameTo = successor;
+          existing.targetVersion = target;
+          existing.isMajor = isMajor;
+          existing.findingIds = findingIds;
+          delete existing.familyClamped;
+          delete existing.sameMajorTarget;
+          existing.familyMigrated = reason;
+        } else {
+          plan.renames.push({
+            packageName: m,
+            installedVersion: installed,
+            targetVersion: target,
+            isMajor,
+            findingIds,
+            severity: "UNKNOWN",
+            ecosystem: "maven",
+            renameTo: successor,
+            isRename: true,
+            familyMigrated: reason,
+          });
+        }
+        continue;
+      }
+      const reason = `family '${mig.familyName}' pinned to ${target} for coherence`;
+      const existing = plan.fixable.find(c => c.packageName === m && (c.ecosystem || "maven") === "maven");
+      if (existing) {
+        existing.targetVersion = target;
+        existing.isMajor = isMajor;
+        existing.findingIds = findingIds;
+        delete existing.familyClamped;
+        delete existing.sameMajorTarget;
+        existing.familyMigrated = reason;
+      } else {
+        plan.fixable.push({
+          packageName: m,
+          installedVersion: installed,
+          targetVersion: target,
+          isMajor,
+          findingIds,
+          severity: "UNKNOWN",
+          ecosystem: "maven",
+          familyMigrated: reason,
+        });
+      }
+    }
+    // Consumer artifacts with ecosystem-specific builds must move to the matching variant, otherwise
+    // stripping their old transitive coordinates leaves them without an implementation layer.
+    const swappedVariants: Record<string, string> = {};
+    for (const variant of consumerVariantsForFamily(mig.familyName)) {
+      const installed = classpath.find(p => p.packageName === variant.from)?.installedVersion;
+      if (!installed) continue;
+      if (classpath.some(p => p.packageName === variant.to)) continue; // already on the migrated variant
+      // Only a direct dependency of the project (top-level in the resolved tree) can be swapped in place.
+      if (!topLevelAncestors(variant.from, packages).has(variant.from)) continue;
+      const reason = `consumer variant: ${variant.from} -> ${variant.to} for family '${mig.familyName}' coherence`;
+      const existing = plan.renames.find(c => c.packageName === variant.from && (c.ecosystem || "maven") === "maven");
+      if (existing) {
+        existing.renameTo = variant.to;
+        existing.targetVersion = installed;
+        existing.isMajor = false;
+        delete existing.familyClamped;
+        delete existing.sameMajorTarget;
+        existing.familyMigrated = reason;
+        existing.consumerVariant = true;
+      } else {
+        plan.renames.push({
+          packageName: variant.from,
+          installedVersion: installed,
+          targetVersion: installed, // the variant publishes the same version line
+          isMajor: false,
+          findingIds: [],
+          severity: "UNKNOWN",
+          ecosystem: "maven",
+          renameTo: variant.to,
+          isRename: true,
+          familyMigrated: reason,
+          consumerVariant: true,
+        });
+      }
+      swappedVariants[variant.from] = variant.to;
+    }
+    // Demoted (unfixable) copies of migrating members are now fixable through the migration.
+    const migratingSet = new Set(participating);
+    plan.unfixable = plan.unfixable.filter(c => !migratingSet.has(c.packageName) || (c.ecosystem || "maven") !== "maven");
+    reports.push({ family: mig.familyName, targetVersion: target, memberCount: participating.length, renamedMembers: Object.fromEntries(renamedOf), consumerVariants: swappedVariants });
+  }
+  return reports;
+}
+
 async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCandidates: FixCandidate[]): Promise<PassPlan> {
   const advisories = dedupeAdvisories(scan.advisories);
-  const plan = buildFixPlan(scan.findings, advisories);
+  const classpath = scan.packages.map(p => ({ packageName: p.name, installedVersion: p.version, ecosystem: p.ecosystem }));
+  const plan = buildFixPlan(scan.findings, advisories, classpath);
   const versionLists = new Map<string, Promise<string[] | null>>();
   const versionsFor = (packageName: string): Promise<string[] | null> => {
     let pending = versionLists.get(packageName);
@@ -1283,6 +1542,7 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
   };
   await promoteLastAffectedFixes(plan, ctx.projects, advisories, versionsFor);
   await promoteDowngradeFixes(plan, ctx.projects, advisories, versionsFor);
+  ctx.lastFamilyMigrations = await applyFamilyMigrations(plan, ctx.projects, advisories, versionsFor, classpath, scan.findings, scan.packages);
   plan.renames = expandRenameBundle(plan.renames, scan.packages);
   if (latestFlag && latestCandidates.length > 0) mergeLatestCandidates(plan.fixable, latestCandidates);
 
@@ -1335,10 +1595,10 @@ function handleNothingApproved(ctx: FixLoopContext, pass: PassPlan, findingCount
   }
   const showPlan = dryRun && (pass.plan.fixable.length > 0 || pass.plan.downgrades.length > 0 || pass.plan.renames.length > 0);
   if (showPlan) {
-    console.log(planMarkdown(pass.plan, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: sourceMigrationsForAppliedRenames(renamesForSourceMigrations(pass.plan.renames)), excludeFailed: ctx.excludeFailedCoords }));
+    console.log(planMarkdown(pass.plan, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: sourceMigrationsForAppliedRenames(renamesForSourceMigrations(pass.plan.renames)), excludeFailed: ctx.excludeFailedCoords }));
     process.exit(0);
   }
-  console.log(planMarkdown({ ...pass.plan, fixable: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords }));
+  console.log(planMarkdown({ ...pass.plan, fixable: [] }, { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords }));
   console.log("Nothing to apply.");
   if (pass.skippedMajors.length > 0) console.log(`  - ${pass.skippedMajors.length} major version change(s) skipped — approve at prompt, or use --allow-major`);
   if (pass.skippedRenames.length > 0) console.log(`  - ${pass.skippedRenames.length} rename(s) skipped — approve at prompt, or use --allow-renames`);
@@ -1391,12 +1651,13 @@ interface ApplyBatch {
   effectiveApproved: FixCandidate[];
   effectiveRenames: FixCandidate[];
   effectiveExcludes: FixCandidate[];
-  excludes: Array<{ packageName: string }>;
+  excludes: Array<{ packageName: string; attachTo?: string[] }>;
   findings: Finding[];
+  packages: PackageRef[];
 }
 
 /** Build the apply batch for one pass (policy pins, rename requests, exclude coordinates). */
-function buildApplyBatch(pass: PassPlan, findings: Finding[]): ApplyBatch {
+function buildApplyBatch(pass: PassPlan, findings: Finding[], packages: PackageRef[]): ApplyBatch {
   let bumps = mapBumps(pass.effectiveApproved).filter(b => !pass.policy.rejectPins.has(b.packageName));
   for (const p of pass.policy.extraPins) {
     if (!bumps.some(b => b.packageName === p.packageName)) {
@@ -1404,12 +1665,28 @@ function buildApplyBatch(pass: PassPlan, findings: Finding[]): ApplyBatch {
     }
   }
   const renames = mapRenames(pass.effectiveRenames);
+  // Old coordinates of migrated families are excluded from the configurations that still pull them in —
+  // unless a consumer-variant swap already removes them from the classpath entirely.
+  const swappedConsumers = new Set(pass.effectiveRenames.filter(r => r.consumerVariant).map(r => r.packageName));
+  const oldCoordExcludes: Array<{ packageName: string; attachTo?: string[] }> = [];
+  if (pass.policy.excludeOldCoordinates) {
+    for (const r of pass.effectiveRenames) {
+      if (r.consumerVariant) continue; // its from-coordinate is removed by the swap itself
+      if (!packages.some(p => p.name === r.packageName)) continue; // no longer on the resolved classpath
+      const sources = topLevelAncestors(r.packageName, packages);
+      if (sources.size > 0 && [...sources].every(s => swappedConsumers.has(s))) {
+        console.log(`  ~ exclusion of ${r.packageName} not needed — all sources (${[...sources].join(", ")}) are being swapped to a migrated variant`);
+        continue;
+      }
+      oldCoordExcludes.push({ packageName: r.packageName, attachTo: sources.size > 0 ? [...sources] : undefined });
+    }
+  }
   const excludes = [
     ...excludeArgs.map(coord => ({ packageName: coord })),
     ...pass.effectiveExcludes.filter(c => !excludeArgs.includes(c.packageName)).map(c => ({ packageName: c.packageName })),
-    ...(pass.policy.excludeOldCoordinates ? pass.effectiveRenames.map(r => ({ packageName: r.packageName })) : []),
+    ...oldCoordExcludes,
   ];
-  return { bumps, renames, effectiveApproved: pass.effectiveApproved, effectiveRenames: pass.effectiveRenames, effectiveExcludes: pass.effectiveExcludes, excludes, findings };
+  return { bumps, renames, effectiveApproved: pass.effectiveApproved, effectiveRenames: pass.effectiveRenames, effectiveExcludes: pass.effectiveExcludes, excludes, findings, packages };
 }
 
 function isRootProject(project: ProjectInfo): boolean {
@@ -1540,7 +1817,7 @@ function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoop
 
 /** Apply this project's share of approved renames and record outcomes by method. */
 function applyProjectRenames(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome): void {
-  const projectRenames = renamesForProject(project, batch.renames, batch.findings);
+  const projectRenames = renamesForProject(project, batch.renames, batch.findings, batch.packages);
   if (projectRenames.length === 0) return;
   const renameResult = applyManifestRenames(project, projectRenames);
   for (const w of renameResult.warnings) console.log(`  [${project.label}] ${w}`);
@@ -1644,14 +1921,14 @@ async function reportOrConfirmApply(ctx: FixLoopContext, pass: PassPlan, planned
       // Show what apply will actually execute (after unresolvable/unpublished drops), not the raw plan —
       // a raw candidate whose target is unpublished would otherwise appear as a phantom planned bump.
       { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames, downgrades: [] },
-      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: dryRun ? [] : ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource && !allowSourceMigrations, excludeFailed: ctx.excludeFailedCoords },
+      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: dryRun ? [] : ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource && !allowSourceMigrations, excludeFailed: ctx.excludeFailedCoords },
     ));
     process.exit(0);
   }
   if (!applyFlag && isTTY && ctx.iteration === 1) {
     console.log(planMarkdown(
       { ...pass.plan, fixable: pass.effectiveApproved, renames: pass.effectiveRenames, downgrades: [] },
-      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource, excludeFailed: ctx.excludeFailedCoords },
+      { applied: ctx.allApplied, unfixableRemaining: ctx.lastUnfixable, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: [], skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: plannedSourceMigrations, skippedSourceMigrations: plannedSourceMigrations !== null && !applySource, excludeFailed: ctx.excludeFailedCoords },
     ));
     const total = pass.effectiveApproved.length + pass.effectiveRenames.length + pass.effectiveExcludes.length;
     const proceed = await ask(`Apply ${total} change(s)? [y/N] `);
@@ -1809,8 +2086,12 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   console.log(planMarkdown(
     { fixable: [], unfixable: unfixableShown, renames: [], downgrades: [] },
-    { applied: reportApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: finalFindings.map(f => ({ packageName: f.packageName, installedVersion: f.installedVersion, id: f.id, aliases: f.aliases })), skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords },
+    { applied: reportApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, remainingFindings: finalFindings.map(f => ({ packageName: f.packageName, installedVersion: f.installedVersion, id: f.id, aliases: f.aliases })), skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable, excludeFailed: ctx.excludeFailedCoords },
   ));
+  // The run reached a terminal state — crash recovery is over, so clean up backups on every
+  // exit path; a leftover .bak would otherwise look like an unprocessed restore.
+  for (const p of ctx.projects) discardManifestBackup(p);
+  discardSourceMigrationBackups(ctx.allSourceChanged);
   if (ctx.lockUnsynced && reportApplied.length > 0) {
     console.error("Lockfile was not updated after apply. The lock may still pin the vulnerable version.");
     process.exit(1);
@@ -1821,8 +2102,6 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
       process.exit(2);
     }
     console.log(reportApplied.length > 0 ? "All vulnerabilities fixed." : "No vulnerabilities found.");
-    for (const p of ctx.projects) discardManifestBackup(p);
-    discardSourceMigrationBackups(ctx.allSourceChanged);
     process.exit(0);
   }
   if (finalFindings.length > 0) console.log(`Remaining vulnerabilities: ${finalFindings.length}`);
@@ -1859,6 +2138,7 @@ async function main() {
     approvedExcludeCoords: new Set<string>(),
     excludeFailedCoords: new Set<string>(),
     lastUnfixable: [],
+    lastFamilyMigrations: [],
     allRolledBackDowngrades: [],
     lastHealthWarnings: [],
     iteration: 0,
@@ -1870,6 +2150,12 @@ async function main() {
     incompleteScan: false,
   };
 
+  // Prune stale backups left by earlier runs: if the manifest has since diverged from its .bak,
+  // that snapshot is no longer a valid pre-state and could restore stale content on failure.
+  // An identical .bak (e.g. an interrupted run) is still valid and is kept. Never touch files in dry-run.
+  if (!dryRun && (applyFlag || isTTY)) {
+    for (const p of projects) discardStaleBackup(p.manifestPath);
+  }
   while (ctx.iteration < maxIterations) {
     ctx.iteration++;
     const scan = await runScanPass(ctx);
@@ -1897,11 +2183,11 @@ async function main() {
     if (loopStopped(ctx, scan.findings.length, currentSig, false, currentPlanSig, ctx.prevPlanSig)) break;
 
     const plannedSourceMigrations = plannedSourceMigrationsFor(pass);
-    const batch = buildApplyBatch(pass, scan.findings);
+    const batch = buildApplyBatch(pass, scan.findings, scan.packages);
     const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0);
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
-    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps, protectedByProject));
+    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings, batch.packages).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps, protectedByProject));
     const applied = runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps, protectedByProject);
     ctx.lastAppliedCount = applied.passFileChanges;
     if (applied.passFileChanges > 0) {

@@ -177,12 +177,94 @@ function parseExistingPins(block: string): Map<string, string> {
   return entries;
 }
 
-function renderManagedBlock(entries: Map<string, string>): string {
+/** Free-text bucket keys for comments that document the block rather than one pin. */
+const FREE_TEXT_HEADER = "\u0000header";
+const FREE_TEXT_FOOTER = "\u0000footer";
+
+/**
+ * Bucket user comments from an existing managed block by the pin they document, so a
+ * re-render keeps them above their entry. A comment attaches to the NEXT <dependency>
+ * below it (or to the footer when nothing follows). Blank lines are dropped (the
+ * renderer owns layout); multi-line XML comments are captured whole.
+ */
+function parsePomBlockFreeText(block: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  let pending: string[] = [];
+  let inComment = false;
+  const flush = (key: string) => {
+    if (pending.length === 0) return;
+    const lines = out.get(key);
+    if (lines) lines.push(...pending);
+    else out.set(key, [...pending]);
+    pending = [];
+  };
+  const lines = block.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed === "") continue;
+    if (POM_MARKERS.some(m => m.begin === trimmed || m.end === trimmed)) {
+      if (POM_MARKERS.some(m => m.end === trimmed)) flush(FREE_TEXT_FOOTER);
+      continue;
+    }
+    if (inComment) {
+      pending.push(trimmed);
+      if (trimmed.includes("-->")) inComment = false;
+      continue;
+    }
+    if (trimmed.startsWith("<!--")) {
+      pending.push(trimmed);
+      if (!trimmed.includes("-->")) inComment = true;
+      continue;
+    }
+    if (trimmed.startsWith("<dependency>")) {
+      let span = lines[i];
+      let j = i;
+      while (!span.includes("</dependency>") && j + 1 < lines.length) {
+        j++;
+        span += "\n" + lines[j];
+      }
+      const group = /<groupId>([^<]+)<\/groupId>/.exec(span)?.[1]?.trim();
+      const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(span)?.[1]?.trim();
+      if (group && artifact) flush(`${group}:${artifact}`);
+      i = j;
+      continue;
+    }
+    // Unrecognized structural line: treat pending text as block-level.
+    flush(FREE_TEXT_HEADER);
+  }
+  flush(FREE_TEXT_FOOTER);
+  return out;
+}
+
+/** Drop preserved comments whose pin no longer exists. */
+function prunePomFreeText(
+  freeText: Map<string, string[]> | null,
+  entries: Map<string, string>,
+): Map<string, string[]> | null {
+  if (!freeText || freeText.size === 0) return freeText;
+  const out = new Map<string, string[]>();
+  for (const [key, lines] of freeText) {
+    if (key === FREE_TEXT_HEADER || key === FREE_TEXT_FOOTER || entries.has(key)) out.set(key, lines);
+  }
+  return out;
+}
+
+/** Preserved comments for a pin, indented to align with <dependency>. */
+function pomFreeTextLines(freeText: Map<string, string[]> | null, key: string, indent: string): string[] {
+  const lines = freeText?.get(key) ?? [];
+  return lines.map(l => `${indent}${l}`);
+}
+
+/** Render the managed block as XML, preserving user comments. */
+function renderManagedBlock(entries: Map<string, string>, freeText: Map<string, string[]> | null = null): string {
   const lines = [MARKER_BEGIN];
+  lines.push(...pomFreeTextLines(freeText, FREE_TEXT_HEADER, "  "));
   const sorted = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [pkg, version] of sorted) {
+    lines.push(...pomFreeTextLines(freeText, pkg, "  "));
     lines.push(renderPinDependency(pkg, version));
   }
+  lines.push(...pomFreeTextLines(freeText, FREE_TEXT_FOOTER, "  "));
   lines.push(MARKER_END);
   return lines.join("\n");
 }
@@ -205,11 +287,13 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
   let before = content;
   let after = "";
   let hasBlock = found !== null;
+  let freeText: Map<string, string[]> | null = null;
 
   if (found) {
     const { begin: beginIdx, end: endIdx, endLen } = found;
     const existing = content.slice(beginIdx, endIdx + endLen);
     entries = parseExistingPins(existing);
+    freeText = parsePomBlockFreeText(existing);
     before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
     after = content.slice(endIdx + endLen).replace(/^\n+/, "\n");
   }
@@ -221,7 +305,7 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
   for (const ga of directlyHandled) entries.delete(ga);
   if (entries.size === 0) return hasBlock ? `${before}${after}` : content;
 
-  const block = renderManagedBlock(entries);
+  const block = renderManagedBlock(entries, prunePomFreeText(freeText, entries));
   if (hasBlock) {
     // A misplaced marker (e.g. left between </dependencies> and
     // </dependencyManagement>) must be relocated, not kept in place.
@@ -271,6 +355,7 @@ export function removeManagedPin(filePath: string, packageName: string): boolean
   const { begin: beginIdx, end: endIdx, endLen } = found;
   const block = content.slice(beginIdx, endIdx + endLen);
   const entries = parseExistingPins(block);
+  const freeText = prunePomFreeText(parsePomBlockFreeText(block), entries);
   if (!entries.delete(packageName)) return false;
 
   const before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
@@ -279,7 +364,7 @@ export function removeManagedPin(filePath: string, packageName: string): boolean
     fs.writeFileSync(filePath, `${before}${after}`);
     return true;
   }
-  const next = renderManagedBlock(entries);
+  const next = renderManagedBlock(entries, freeText);
   fs.writeFileSync(filePath, `${before}${next}\n${after}`);
   return true;
 }
@@ -424,7 +509,7 @@ function applyMavenExclusions(content: string, excludes: ExcludeRequest[], resul
   return next;
 }
 
-/** Attach one exclusion to every direct dependency block outside dependencyManagement. */
+/** Attach one exclusion to every direct dependency block outside dependencyManagement (or only to ex.attachTo when scoped). */
 function applyOneExclusion(
   content: string,
   ex: ExcludeRequest,
@@ -436,6 +521,7 @@ function applyOneExclusion(
     result.warnings.push(`${ex.packageName}: not a valid group:artifact exclusion`);
     return content;
   }
+  const scopedTo = ex.attachTo && ex.attachTo.length > 0 ? new Set(ex.attachTo) : null;
   const re = /<dependency>[\s\S]*?<\/dependency>/g;
   const edits: Array<{ start: number; end: number; text: string }> = [];
   let already = false;
@@ -444,6 +530,7 @@ function applyOneExclusion(
     if (insideSpan(match.index, spans)) continue;
     const block = match[0];
     if (blockCoordinates(block) === ex.packageName) continue;
+    if (scopedTo && !scopedTo.has(blockCoordinates(block) ?? "")) continue;
     if (blockHasExclusion(block, group, artifact)) {
       already = true;
       continue;
@@ -455,7 +542,7 @@ function applyOneExclusion(
     });
   }
   if (edits.length === 0 && !already) {
-    result.warnings.push(`${ex.packageName}: no direct dependency to attach <exclusion> to`);
+    result.warnings.push(scopedTo ? `${ex.packageName}: none of its resolved sources (${[...scopedTo].join(", ")}) are direct dependencies — nothing to attach <exclusion> to` : `${ex.packageName}: no direct dependency to attach <exclusion> to`);
     return content;
   }
   edits.sort((a, b) => b.start - a.start);

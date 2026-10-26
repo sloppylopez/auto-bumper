@@ -8,6 +8,7 @@
  * before OSV or the GitHub advisory list ingest them. It is a supplemental source:
  * disabled by `AUTO_BUMPER_SUPPLEMENTAL=off`, cache-only under `--offline`, and any
  * per-package failure degrades to whatever is cached instead of failing the scan.
+ * A failure with no cache is reported once and marks the scan incomplete.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -15,6 +16,7 @@ import type { AdvisoryEntry, PackageRef } from "./types.ts";
 import { getOsvDbDir } from "../path.ts";
 import { CACHE_TTL_MS } from "./osv-db.ts";
 import { fetchWithRetry } from "./fetch-retry.ts";
+import { unionAdvisory } from "./advisory-merge.ts";
 
 export const SNYK_SUPPORTED_ECOSYSTEMS = ["Maven", "npm"] as const;
 type SnykEcosystem = (typeof SNYK_SUPPORTED_ECOSYSTEMS)[number];
@@ -23,8 +25,9 @@ const SNYK_BASE = "https://security.snyk.io/package";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) auto-bumper";
 const CONCURRENCY = 4;
 
-/** Snyk severity label → CVSS-style score (same mapping as the GitHub source). */
+/** Snyk severity label → CVSS-style score. Unknown labels fall back to 3.0, matching GitHub. */
 const SNYK_SEVERITY_SCORE: Record<string, string> = { critical: "9.0", high: "7.5", medium: "4.0", low: "3.0" };
+const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 /** One affected-version window from a Snyk package page. */
 export interface SnykVersionBound {
@@ -40,6 +43,8 @@ export interface SnykVuln {
   id: string;
   title?: string;
   severity?: string;
+  /** Numeric CVSS from the page, when Snyk embeds one. Preferred over the label bucket. */
+  cvssScore?: number | string;
   affectedVersions?: SnykVersionWindow[];
   identifiers?: { CVE?: string[]; GHSA?: string[] };
 }
@@ -52,7 +57,8 @@ interface SnykCacheDoc {
 
 /** Build the public per-package page URL for a Snyk-supported ecosystem. */
 export function snykPackageUrl(ecosystem: SnykEcosystem, name: string): string {
-  const coord = ecosystem === "Maven" ? name.replace(/:/g, "%3A") : encodeURIComponent(name);
+  const coordName = ecosystem === "Maven" ? name.toLowerCase() : name;
+  const coord = ecosystem === "Maven" ? coordName.replace(/:/g, "%3A") : encodeURIComponent(coordName);
   return `${SNYK_BASE}/${ecosystem === "Maven" ? "maven" : "npm"}/${coord}`;
 }
 
@@ -103,11 +109,17 @@ export function parseSnykPayload(html: string): unknown[] {
   return nodes;
 }
 
+function assignResolved(o: Record<string, unknown>, key: unknown, value: unknown): void {
+  const name = String(key);
+  if (DANGEROUS_KEYS.has(name)) return;
+  o[name] = value;
+}
+
 /** Resolve one devalue node (numeric values are references into the node list). */
 function resolveNuxt(v: unknown, nodes: unknown[], depth: number, anc: Set<number>): unknown {
   if (depth > 64) return null;
   if (typeof v === "number") {
-    if (v < 0 || v >= nodes.length) return v < 0 ? null : v;
+    if (!Number.isInteger(v) || v < 0 || v >= nodes.length) return v < 0 ? null : v;
     if (anc.has(v)) return null;
     anc.add(v);
     try {
@@ -121,9 +133,9 @@ function resolveNuxt(v: unknown, nodes: unknown[], depth: number, anc: Set<numbe
     if (typeof tag === "string") {
       if (tag === "ShallowReactive" || tag === "Reactive") return resolveNuxt(rest[0], nodes, depth + 1, anc);
       if (tag === "Object") {
-        const o: Record<string, unknown> = {};
+        const o: Record<string, unknown> = Object.create(null);
         for (let k = 0; k < rest.length; k += 2) {
-          o[String(resolveNuxt(rest[k], nodes, depth + 1, anc))] = resolveNuxt(rest[k + 1], nodes, depth + 1, anc);
+          assignResolved(o, resolveNuxt(rest[k], nodes, depth + 1, anc), resolveNuxt(rest[k + 1], nodes, depth + 1, anc));
         }
         return o;
       }
@@ -132,41 +144,59 @@ function resolveNuxt(v: unknown, nodes: unknown[], depth: number, anc: Set<numbe
     return v.map((x) => resolveNuxt(x, nodes, depth + 1, anc));
   }
   if (v && typeof v === "object") {
-    const o: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) o[k] = resolveNuxt(val, nodes, depth + 1, anc);
+    const o: Record<string, unknown> = Object.create(null);
+    for (const [k, val] of Object.entries(v)) assignResolved(o, k, resolveNuxt(val, nodes, depth + 1, anc));
     return o;
   }
   return v;
 }
 
-/** Find the first `vulnerabilities` array in a resolved payload root. */
-function findVulnerabilities(node: unknown, depth = 0): SnykVuln[] | null {
-  if (depth > 24 || node === null || typeof node !== "object") return null;
-  if (Array.isArray(node)) {
-    for (const item of node) {
-      const found = findVulnerabilities(item, depth + 1);
-      if (found) return found;
+function isVulnList(val: unknown[]): boolean {
+  return val.every((v) => !!v && typeof v === "object" && typeof (v as SnykVuln).id === "string");
+}
+
+/**
+ * Find a `vulnerabilities` array in a resolved payload.
+ * A non-empty well-formed list wins. An empty array means the package has no
+ * advisories. Null means the key was not found (the caller must not cache that).
+ */
+function findVulnerabilities(node: unknown): SnykVuln[] | null {
+  let sawEmpty = false;
+
+  const walk = (current: unknown, depth: number): SnykVuln[] | null => {
+    if (depth > 24 || current === null || typeof current !== "object") return null;
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        const found = walk(item, depth + 1);
+        if (found && found.length > 0) return found;
+      }
+      return null;
+    }
+    for (const [k, val] of Object.entries(current as Record<string, unknown>)) {
+      if (k === "vulnerabilities" && Array.isArray(val) && isVulnList(val)) {
+        if (val.length > 0) return val as SnykVuln[];
+        sawEmpty = true;
+      }
+    }
+    for (const val of Object.values(current as Record<string, unknown>)) {
+      const found = walk(val, depth + 1);
+      if (found && found.length > 0) return found;
     }
     return null;
-  }
-  for (const [k, val] of Object.entries(node as Record<string, unknown>)) {
-    if (k === "vulnerabilities" && Array.isArray(val) && val.length > 0 &&
-        val.every((v) => v && typeof v === "object" && typeof (v as SnykVuln).id === "string")) {
-      return val as SnykVuln[];
-    }
-  }
-  for (const val of Object.values(node as Record<string, unknown>)) {
-    const found = findVulnerabilities(val, depth + 1);
-    if (found) return found;
-  }
-  return null;
+  };
+
+  const found = walk(node, 0);
+  if (found && found.length > 0) return found;
+  return sawEmpty ? [] : null;
 }
 
 /** Parse a Snyk package page into its vulnerability list. Empty array when the page has none. */
 export function parseSnykPackagePage(html: string): SnykVuln[] {
   const nodes = parseSnykPayload(html);
   const root = resolveNuxt(nodes[0], nodes, 0, new Set());
-  return findVulnerabilities(root) ?? [];
+  const vulns = findVulnerabilities(root);
+  if (!vulns) throw new Error("no vulnerabilities array in Snyk payload");
+  return vulns;
 }
 
 // ─── OSV conversion ─────────────────────────────────────
@@ -194,7 +224,7 @@ export function snykVulnToOsv(vuln: SnykVuln, pkgName: string, ecosystem: SnykEc
     },
   );
 
-  const score = SNYK_SEVERITY_SCORE[(vuln.severity ?? "").toLowerCase()] ?? "4.0";
+  const score = snykScore(vuln);
   return {
     id,
     aliases,
@@ -214,6 +244,17 @@ export function snykVulnToOsv(vuln: SnykVuln, pkgName: string, ecosystem: SnykEc
   };
 }
 
+/** Page CVSS when it is numeric; otherwise the label bucket; otherwise 3.0 (same as GitHub). */
+function snykScore(vuln: SnykVuln): string {
+  const raw = vuln.cvssScore;
+  if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  if (typeof raw === "string" && /^\d/.test(raw.trim())) {
+    const n = Number.parseFloat(raw.trim());
+    if (Number.isFinite(n)) return String(n);
+  }
+  return SNYK_SEVERITY_SCORE[(vuln.severity ?? "").toLowerCase()] ?? "3.0";
+}
+
 // ─── Loading ─────────────────────────────────────
 
 export interface SnykLoadOptions {
@@ -223,6 +264,8 @@ export interface SnykLoadOptions {
   forceRefresh?: boolean;
   setText?: (msg: string) => void;
   onWarning?: (msg: string) => void;
+  /** A coordinate failed and nothing was cached. The scan must not report a clean result. */
+  onIncomplete?: () => void;
 }
 
 interface SnykCoordinate {
@@ -243,10 +286,11 @@ function snykCoordinates(packages: PackageRef[]): SnykCoordinate[] {
   for (const p of packages) {
     const eco = snykEcosystemFor(p.ecosystem);
     if (!eco) continue;
-    const key = `${eco}:${p.name}`;
+    const name = eco === "Maven" ? p.name.toLowerCase() : p.name;
+    const key = `${eco}:${name}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ ecosystem: eco, name: p.name });
+    out.push({ ecosystem: eco, name });
   }
   return out;
 }
@@ -302,10 +346,11 @@ async function loadCoordinate(
  * Per-coordinate caches (7-day TTL) make repeat runs cheap; a coordinate that is not in
  * Snyk's database is cached as empty. Failures fall back to stale cache where one exists;
  * when no cache exists at all the failure is reported via `onWarning` and those packages
- * simply go unmatched (the scan itself still succeeds).
+ * simply go unmatched. That no-cache failure also calls `onIncomplete` so the
+ * scan is not reported as clean. The scan itself still returns.
  */
 export async function loadSnykAdvisories(packages: PackageRef[], opts: SnykLoadOptions = {}): Promise<AdvisoryEntry[]> {
-  const { offline = false, forceRefresh = false, setText, onWarning } = opts;
+  const { offline = false, forceRefresh = false, setText, onWarning, onIncomplete } = opts;
   const coords = snykCoordinates(packages);
   if (coords.length === 0) return [];
 
@@ -325,7 +370,10 @@ export async function loadSnykAdvisories(packages: PackageRef[], opts: SnykLoadO
           if (result.kind === "missing-cache") {
             missingOffline += 1;
           } else {
-            for (const e of result.entries) byId.set(e.id, e);
+            for (const e of result.entries) {
+              const existing = byId.get(e.id);
+              byId.set(e.id, existing ? unionAdvisory(existing, e) : e);
+            }
           }
         } catch (err) {
           failures.push(`${coord.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -345,6 +393,7 @@ export async function loadSnykAdvisories(packages: PackageRef[], opts: SnykLoadO
     );
   }
   if (failures.length > 0) {
+    onIncomplete?.();
     onWarning?.(
       `Snyk advisories unavailable for ${failures.length} of ${coords.length} packages (${failures[0]}); those packages were matched without Snyk data`,
     );

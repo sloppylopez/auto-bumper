@@ -70,6 +70,39 @@ describe("mergeAdvisories richness", () => {
     const merged = mergeAdvisories([local], [api]);
     expect(merged[0].aliases).toEqual(["CVE-1", "CVE-2"]);
   });
+
+  it("unions affected packages instead of letting the richer record delete one", () => {
+    const osv = baseAdv("CVE-2026-1", {
+      aliases: ["GHSA-a", "GHSA-b", "GHSA-c"],
+      summary: "A long OSV summary that is definitely richer than the snyk one",
+      links: [{ url: "https://osv.dev/x" }, { url: "https://nvd.example/x" }],
+      severity: [{ type: "CVSS_V3_1", score: "9.8" }],
+      affected: [
+        { package: { name: "org.demo:demo-a", ecosystem: "Maven" }, ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "0" }, { fixed: "1.0.0" }] }] },
+        { package: { name: "org.demo:demo-b", ecosystem: "Maven" }, ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "0" }, { fixed: "1.0.0" }] }] },
+      ],
+    });
+    const snyk = baseAdv("CVE-2026-1", {
+      aliases: ["SNYK-1"],
+      summary: "short",
+      severity: [{ type: "CVSS_V3_1", score: "7.5" }],
+      affected: [
+        { package: { name: "org.demo:demo-a", ecosystem: "Maven" }, ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "0" }, { fixed: "1.2.3" }] }] },
+      ],
+    });
+    expect(advisoryRichness(osv)).toBeGreaterThan(advisoryRichness(snyk));
+    const merged = mergeAdvisories([osv], [snyk]);
+    expect(merged).toHaveLength(1);
+    const names = merged[0].affected.map(a => a.package?.name).sort();
+    expect(names).toEqual(["org.demo:demo-a", "org.demo:demo-b"]);
+    const demoA = merged[0].affected.find(a => a.package?.name === "org.demo:demo-a");
+    const encoded = JSON.stringify(demoA?.ranges);
+    expect(encoded).toContain("1.2.3");
+    expect(encoded).toContain("1.0.0");
+    expect(merged[0].aliases).toContain("SNYK-1");
+    expect(merged[0].aliases).toContain("GHSA-a");
+    expect(merged[0].severity.map(s => s.score)).toEqual(["9.8", "7.5"]);
+  });
 });
 
 describe("matchesSemverRange fail-closed", () => {

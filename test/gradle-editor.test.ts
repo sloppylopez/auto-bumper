@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps, applyRenames, detectGradlePlatform, findStaleManagedPins, hasEnforcedPlatform, readDeclaredVersion } from "../src/lib/gradle-editor.ts";
+import { applyBumps, applyRenames, detectGradlePlatform, findStaleManagedPins, hasEnforcedPlatform, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
@@ -711,5 +711,115 @@ describe("applyBumps BOM-aware cleanup", () => {
       const stale = findStaleManagedPins(readGradle(filePath), bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
       expect(stale).toEqual([{ packageName: "io.netty:netty-codec-http2", version: "4.1.136", bomVersion: "4.1.139" }]);
     });
+  });
+});
+describe("managed block comment preservation", () => {
+  it("keeps a human comment above a pin when the managed block is re-rendered", () => {
+    withTempGradle(
+      `plugins { id 'java' }
+
+dependencies {
+    implementation 'com.example:json-schema-validator:2.2.13'
+}
+
+${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        // Pinned below 2.3.x: json-patch 1.13 is compiled against the 2.0 API and
+        // throws NoSuchMethodError under coreutils 1.12.
+        implementation('com.networknt:json-schema-validator:2.2.13') { because 'GHSA-json' }
+    }
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        applyBumps(filePath, [{
+          packageName: "com.example:other-lib",
+          targetVersion: "1.0.1",
+          because: ["CVE-TEST"],
+        }]);
+        const content = readGradle(filePath);
+        expect(content).toContain("throws NoSuchMethodError under coreutils 1.12.");
+        // The comment must still sit directly above its pin.
+        const lines = content.split("\n");
+        const pinIdx = lines.findIndex(l => l.includes("com.networknt:json-schema-validator:2.2.13"));
+        expect(lines[pinIdx - 1].trim()).toContain("throws NoSuchMethodError under coreutils 1.12.");
+      },
+    );
+  });
+
+  it("drops the comment of a removed pin but keeps the others", () => {
+    withTempGradle(
+      `${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        // Keep old: documents why this stays pinned.
+        implementation('com.example:keep-old:1.0.0') { because 'GHSA-keep' }
+        // Drop me: this pin is going away.
+        implementation('com.example:drop-me:1.0.0') { because 'GHSA-drop' }
+    }
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        expect(removeManagedPin(filePath, "com.example:drop-me")).toBe(true);
+        const content = readGradle(filePath);
+        expect(content).toContain("documents why this stays pinned.");
+        expect(content).not.toContain("this pin is going away.");
+        expect(content).toContain("com.example:keep-old:1.0.0");
+      },
+    );
+  });
+
+  it("moves a comment with its renamed coordinate and keeps force pins", () => {
+    withTempGradle(
+      `${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        // Old group is deprecated; new group follows.
+        implementation('com.fasterxml.jackson.core:jackson-databind:2.19.0') { because 'GHSA-5jmj' }
+    }
+}
+configurations.all {
+    resolutionStrategy {
+        force 'com.fasterxml.jackson.core:jackson-databind:2.19.4'
+        force 'org.example:sibling-lib:1.2.3'
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        applyRenames(filePath, [{
+          fromPackage: "com.fasterxml.jackson.core:jackson-databind",
+          toPackage: "tools.jackson.core:jackson-databind",
+          targetVersion: "3.1.4",
+          because: ["GHSA-5jmj-h7xm-6q6v"],
+        }]);
+        const content = readGradle(filePath);
+        expect(content).toContain("tools.jackson.core:jackson-databind:3.1.4");
+        // The comment follows the pin to its new coordinate...
+        const lines = content.split("\n");
+        const pinIdx = lines.findIndex(l => l.includes("tools.jackson.core:jackson-databind:3.1.4"));
+        expect(lines[pinIdx - 1].trim()).toContain("Old group is deprecated");
+        // The renamed package's force pin follows it, raised to the rename target...
+        expect(content).toContain("force 'tools.jackson.core:jackson-databind:3.1.4'");
+        // ...and an unrelated force pin survives the re-render (regression: renames used to drop all forces).
+        expect(content).toContain("force 'org.example:sibling-lib:1.2.3'");
+      },
+    );
+  });
+
+  it("does not report a shared-variable bump when the def already satisfies the target", () => {
+    withTempGradle(
+      `def pg_version = "42.7.14"
+
+dependencies {
+    implementation "org.postgresql:postgresql:\${pg_version}"
+}`,
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.postgresql:postgresql",
+          targetVersion: "42.7.14",
+          because: ["CVE-TEST"],
+        }]);
+        expect(result.warnings.some(w => w.includes("shared variable"))).toBe(false);
+      },
+    );
   });
 });

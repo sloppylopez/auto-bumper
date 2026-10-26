@@ -18,6 +18,15 @@ describe("analyzeMavenPackages", () => {
     expect(warnings.some(w => w.includes("Mixed Maven coordinates"))).toBe(true);
   });
 
+  it("stays silent when a migration renames within the same group", () => {
+    const packages: PackageRef[] = [
+      { ecosystem: "maven", name: "org.eclipse.jetty.http2:http2-server", version: "11.0.26", manifestPath: "build.gradle" },
+      { ecosystem: "maven", name: "org.eclipse.jetty.http2:jetty-http2-server", version: "12.0.39", manifestPath: "build.gradle" },
+    ];
+    const warnings = analyzeMavenPackages(packages);
+    expect(warnings.some(w => w.includes("Mixed Maven coordinates"))).toBe(false);
+  });
+
   it("warns when a relocated family resolves at different majors", () => {
     const packages: PackageRef[] = [
       { ecosystem: "maven", name: "org.glassfish.jaxb:jaxb-core", version: "3.0.2", manifestPath: "build.gradle" },

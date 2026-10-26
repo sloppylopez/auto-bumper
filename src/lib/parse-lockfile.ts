@@ -1201,15 +1201,17 @@ export function parseMavenTree(output: string, filePath: string): ParseResult {
   // so raw lengths compare correctly without assuming an exact cell width.
   const parentStack: Array<{ prefixLen: number; name: string }> = [];
 
-  for (const rawLine of output.split("\n")) {
-    const line = rawLine.replace(/^\[INFO\]\s*/, "").trim();
-    if (!line || /omitted for duplicate|omitted for conflict/i.test(line)) continue;
-
-    const prefixMatch = /^[|\s+\\-]+/.exec(line);
-    const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
-    const trimmed = line.slice(prefixLen);
-    const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
-    if (!match) continue;
+    for (const rawLine of output.split("\n")) {
+      // Strip only the "[INFO]" marker. The indentation that follows encodes tree depth; removing it
+      // collapses nodes drawn under a last-child branch (space-indented, no leading "|") into their grandparent.
+      const line = rawLine.replace(/^\[INFO\]/, "");
+      const prefixMatch = /^[|\s+\\-]+/.exec(line);
+      const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
+      const trimmed = line.slice(prefixLen).trim();
+      if (!trimmed) continue;
+      if (/omitted for duplicate|omitted for conflict/i.test(trimmed)) continue;
+      const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
+      if (!match) continue;
 
     const [, group, artifact, version] = match;
     if (!version || version.startsWith("(")) continue;

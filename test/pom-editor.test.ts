@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { POM_MARKER_BEGIN, POM_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps } from "../src/lib/pom-editor.ts";
+import { applyBumps, removeManagedPin } from "../src/lib/pom-editor.ts";
 
 function withTempPom(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-pom-"));
@@ -373,5 +373,105 @@ describe("applyBumps Maven exclusions", () => {
       expect(result.warnings.some(w => w.includes("no direct dependency"))).toBe(true);
     });
   });
+
+  it("attaches a scoped exclusion only to its resolved sources", () => {
+    const scopedPom = `<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>app</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>client</artifactId>
+      <version>2.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+`;
+    const blockOf = (xml: string, artifactId: string) => {
+      const i = xml.indexOf(`<artifactId>${artifactId}</artifactId>`);
+      const start = xml.lastIndexOf("<dependency>", i);
+      return xml.slice(start, xml.indexOf("</dependency>", i));
+    };
+    withTempPom(scopedPom, filePath => {
+      const result = applyBumps(filePath, [], [{ packageName: "org.bad:lib", attachTo: ["com.example:client"] }]);
+      expect(result.excluded).toEqual(["org.bad:lib"]);
+      const xml = readPom(filePath);
+      expect(blockOf(xml, "client")).toContain("<groupId>org.bad</groupId>");
+      expect(blockOf(xml, "app")).not.toContain("org.bad");
+    });
+  });
+
+  it("warns and changes nothing when a scoped source is not a direct dependency", () => {
+    withTempPom(pom, filePath => {
+      const before = readPom(filePath);
+      const result = applyBumps(filePath, [], [{ packageName: "org.bad:lib", attachTo: ["com.example:missing"] }]);
+      expect(result.excluded).toEqual([]);
+      expect(result.warnings.some(w => w.includes("none of its resolved sources"))).toBe(true);
+      expect(readPom(filePath)).toBe(before);
+    });
+  });
 });
 
+describe("managed block comment preservation (Maven)", () => {
+  function pomWithPins(pins: Array<{ pkg: string; version: string; comment?: string }>): string {
+    const lines = [
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+      "<project>",
+      "    <modelVersion>4.0.0</modelVersion>",
+      "    <groupId>com.example</groupId>",
+      "    <artifactId>email-app</artifactId>",
+      "    <version>1.0.0</version>",
+      "    <dependencyManagement>",
+      "        <dependencies>",
+      POM_MARKER_BEGIN,
+    ];
+    for (const { pkg, version, comment } of pins) {
+      const [group, artifact] = pkg.split(":");
+      if (comment) lines.push(`  <!-- ${comment} -->`);
+      lines.push(
+        "  <dependency>",
+        `    <groupId>${group}</groupId>`,
+        `    <artifactId>${artifact}</artifactId>`,
+        `    <version>${version}</version>`,
+        "  </dependency>",
+      );
+    }
+    lines.push(POM_MARKER_END, "        </dependencies>", "    </dependencyManagement>", "</project>");
+    return lines.join("\n");
+  }
+
+  it("keeps a human comment above a pin when the managed block is re-rendered", () => {
+    withTempPom(pomWithPins([
+      { pkg: "com.networknt:json-schema-validator", version: "2.2.13", comment: "Pinned below 2.3.x: json-patch 1.13 throws NoSuchMethodError under coreutils 1.12." },
+    ]), filePath => {
+      applyBumps(filePath, [{
+        packageName: "com.example:other-lib",
+        targetVersion: "1.0.1",
+        because: ["CVE-TEST"],
+      }]);
+      const after = readPom(filePath);
+      expect(after).toContain("NoSuchMethodError under coreutils 1.12.");
+      // The comment must still sit directly above its pin's dependency element.
+      const lines = after.split("\n");
+      const pinIdx = lines.findIndex(l => l.includes("<artifactId>json-schema-validator</artifactId>"));
+      expect(lines.slice(pinIdx - 5, pinIdx).join(" ")).toContain("NoSuchMethodError");
+    });
+  });
+
+  it("drops the comment of a removed pin but keeps the others", () => {
+    withTempPom(pomWithPins([
+      { pkg: "com.example:keep-old", version: "1.0.0", comment: "documents why this stays pinned" },
+      { pkg: "com.example:drop-me", version: "1.0.0", comment: "this pin is going away" },
+    ]), filePath => {
+      expect(removeManagedPin(filePath, "com.example:drop-me")).toBe(true);
+      const after = readPom(filePath);
+      expect(after).toContain("documents why this stays pinned");
+      expect(after).not.toContain("this pin is going away");
+      expect(versionOf(after, "com.example", "keep-old")).toBe("1.0.0");
+    });
+  });
+});

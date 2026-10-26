@@ -46,6 +46,8 @@ export interface RenameRequest {
   toPackage: string;
   targetVersion: string;
   because: string[];
+  /** Set when the rename carries no advisory finding of its own (migration coherence or consumer-variant swap). */
+  kind?: "familyMigrated" | "consumerVariant";
 }
 
 export interface ApplyRenamesOptions {
@@ -56,6 +58,8 @@ export interface ApplyRenamesOptions {
 export interface ExcludeRequest {
   /** Maven coordinates: "group:artifact" */
   packageName: string;
+  /** When set, attach the exclusion only to these direct dependencies (its resolved sources); otherwise to every direct dependency. */
+  attachTo?: string[];
 }
 
 export interface ApplyResult {
@@ -130,16 +134,22 @@ function rewriteDirect(
   const varRef = varRefRe.exec(content);
   if (varRef) {
     const varName = varRef[1];
-  const defRe = new RegExp(String.raw`((?:def|val)\s+${escapeRegex(varName)}\s*=\s*["'])([^"']+)(["'])`);
+    const defRe = new RegExp(String.raw`((?:def|val)\s+${escapeRegex(varName)}\s*=\s*["'])([^"']+)(["'])`);
+    let variableBumped = false;
     if (defRe.test(content)) {
       content = content.replace(defRe, (m, pre, oldVer, close) => {
         if (compareMavenVersion(oldVer, bump.targetVersion) >= 0) return m;
         changed = true;
+        variableBumped = true;
         return `${pre}${bump.targetVersion}${close}`;
       });
-      warnings.push(
-        `${bump.packageName}: bumped via shared variable \${${varName}} — other deps using it move too`,
-      );
+      // Only report a shared-variable bump when the def actually moved — otherwise the managed
+      // pin is what enforces the version and "bumped" would misreport a no-op.
+      if (variableBumped) {
+        warnings.push(
+          `${bump.packageName}: bumped via shared variable \${${varName}} — other deps using it move too`,
+        );
+      }
     } else {
       warnings.push(
         `${bump.packageName}: version variable \${${varName}} not defined as \`def\` in this file — falling back to constraint`,
@@ -264,11 +274,22 @@ function updateManagedBlock(
   const block = content.slice(begin, end + endLen);
   const entries = parseExistingConstraints(block);
   const excludeSet = parseExistingExcludes(block);
+  const forceMap = parseExistingForces(block);
+  const freeText = remapFreeTextKeys(parseBlockFreeText(block), renames);
   const renameMap = new Map(renames.map(r => [r.fromPackage, r]));
   const toToolsJackson = renames.some(r => r.toPackage.startsWith("tools.jackson.core"));
 
   for (const rename of renames) {
     updateConstraintEntry(entries, rename);
+    // A force pin on the old coordinate follows its package to the new one.
+    const forced = forceMap.get(rename.fromPackage);
+    if (forced !== undefined) {
+      forceMap.delete(rename.fromPackage);
+      const existingForce = forceMap.get(rename.toPackage);
+      if (existingForce === undefined || compareMavenVersion(forced, existingForce) > 0) {
+        forceMap.set(rename.toPackage, forced);
+      }
+    }
   }
 
   if (toToolsJackson) {
@@ -286,7 +307,7 @@ function updateManagedBlock(
 
   const before = collapseTrailingNewlines(content.slice(0, begin));
   const after = content.slice(end + endLen).replace(/^\n+/, "\n");
-  const newBlock = renderManagedBlock(entries, excludeSet, new Map(), kotlin);
+  const newBlock = renderManagedBlock(entries, excludeSet, forceMap, kotlin, pruneFreeText(freeText, entries, excludeSet, forceMap));
   return `${before}${newBlock}${after}`;
 }
 
@@ -407,28 +428,169 @@ export function findStaleManagedPins(
   return stale;
 }
 
-/** Render the managed block (constraints + forces + excludes). */
+/** Free-text bucket keys for comments that document the block rather than one entry. */
+const FREE_TEXT_HEADER = "\u0000header";
+const FREE_TEXT_FOOTER = "\u0000footer";
+
+/** Entry key of a structured managed-block line, or null for markers/headers/closers/comments. */
+function managedLineKey(line: string): string | null {
+  if (line.trim().startsWith("//")) return null;
+  const im = /implementation\((["'])([^"']+)\1\)/.exec(line);
+  if (im) {
+    const coord = im[2];
+    const i1 = coord.indexOf(":");
+    const i2 = i1 > 0 ? coord.indexOf(":", i1 + 1) : -1;
+    // Mirrors parseExistingConstraints: only full group:artifact:version lines are entries.
+    if (i1 > 0 && i2 > i1 + 1) return coord.slice(0, i2);
+    return null;
+  }
+  const fm = /force(?:\s*\(\s*|\s*)["']([^"':]+:[^"':]+):([^"']+)["']/.exec(line);
+  if (fm) return `force:${fm[1]}`;
+  if (line.includes("exclude")) {
+    const gm = /group\s*[:=]\s*["']([^"']+)["']/.exec(line);
+    const mm = /module\s*[:=]\s*["']([^"']+)["']/.exec(line);
+    if (gm && mm) return `exclude:${gm[1]}:${mm[1]}`;
+  }
+  return null;
+}
+
+/** Index of a trailing line comment on a structured line (skips "://" in URLs), or -1. */
+function trailingCommentIndex(line: string): number {
+  for (let i = 0; i + 1 < line.length; i++) {
+    if (line[i] === "/" && line[i + 1] === "/" && line[i - 1] !== ":") return i;
+  }
+  return -1;
+}
+
+/**
+ * Bucket user comments from an existing managed block by the entry they document, so a
+ * re-render keeps them next to their pin. A comment attaches to the NEXT structured line
+ * below it; text before any section goes to the block header, text after the last
+ * structured line to the footer. Blank lines are dropped (the renderer owns layout).
+ */
+function parseBlockFreeText(block: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  let pending: string[] = [];
+  let sectionEntered = false;
+  const flush = (key: string) => {
+    if (pending.length === 0) return;
+    const lines = out.get(key);
+    if (lines) lines.push(...pending);
+    else out.set(key, [...pending]);
+    pending = [];
+  };
+  for (const raw of block.split("\n")) {
+    const trimmed = raw.trim();
+    if (trimmed === "") continue;
+    if (trimmed === MARKER_BEGIN || trimmed === MARKER_END) {
+      if (trimmed === MARKER_END) flush(FREE_TEXT_FOOTER);
+      continue;
+    }
+    if (trimmed.startsWith("//")) {
+      pending.push(trimmed);
+      continue;
+    }
+    const key = managedLineKey(raw);
+    if (key !== null) {
+      flush(key);
+      // A trailing comment on the line itself documents the same entry.
+      const slash = trailingCommentIndex(raw);
+      if (slash !== -1) {
+        const tail = raw.slice(slash).trim();
+        if (tail.length >= 2) {
+          const lines = out.get(key);
+          if (lines) lines.push(tail);
+          else out.set(key, [tail]);
+        }
+      }
+      continue;
+    }
+    if (!sectionEntered && trimmed.includes("{")) {
+      // First section header: comments above it document the block as a whole.
+      flush(FREE_TEXT_HEADER);
+      sectionEntered = true;
+    }
+  }
+  flush(FREE_TEXT_FOOTER);
+  return out;
+}
+
+/** Drop preserved comments whose entry no longer exists (pin removed, excluded, or dropped). */
+function pruneFreeText(
+  freeText: Map<string, string[]> | null,
+  entries: Map<string, { version: string; because: string }>,
+  excludes: Set<string>,
+  forces: Map<string, string>,
+): Map<string, string[]> | null {
+  if (!freeText || freeText.size === 0) return freeText;
+  const out = new Map<string, string[]>();
+  for (const [key, lines] of freeText) {
+    if (key === FREE_TEXT_HEADER || key === FREE_TEXT_FOOTER) {
+      out.set(key, lines);
+    } else if (key.startsWith("force:")) {
+      if (forces.has(key.slice("force:".length))) out.set(key, lines);
+    } else if (key.startsWith("exclude:")) {
+      if (excludes.has(key.slice("exclude:".length))) out.set(key, lines);
+    } else if (entries.has(key)) {
+      out.set(key, lines);
+    }
+  }
+  return out;
+}
+
+/** Move preserved comments from a renamed coordinate to its replacement. */
+function remapFreeTextKeys(
+  freeText: Map<string, string[]> | null,
+  renames: RenameRequest[],
+): Map<string, string[]> | null {
+  if (!freeText || freeText.size === 0) return freeText;
+  const out = new Map<string, string[]>();
+  for (const [key, lines] of freeText) {
+    let moved = key;
+    for (const r of renames) {
+      if (moved === r.fromPackage || moved === `force:${r.fromPackage}`) {
+        moved = moved.startsWith("force:") ? `force:${r.toPackage}` : r.toPackage;
+        break;
+      }
+    }
+    const existing = out.get(moved);
+    if (existing) existing.push(...lines);
+    else out.set(moved, [...lines]);
+  }
+  return out;
+}
+
+/** Preserved comments for an entry, indented for their section. */
+function freeTextLines(freeText: Map<string, string[]> | null, key: string, indent: string): string[] {
+  const lines = freeText?.get(key) ?? [];
+  return lines.map(l => `${indent}${l}`);
+}
+
+/** Render the managed block (constraints + forces + excludes), preserving user comments. */
 function renderManagedBlock(
   entries: Map<string, { version: string; because: string }>,
   excludes: Set<string>,
   forces: Map<string, string> = new Map(),
   kotlin = false,
+  freeText: Map<string, string[]> | null = null,
 ): string {
   const lines: string[] = [MARKER_BEGIN];
+  lines.push(...freeTextLines(freeText, FREE_TEXT_HEADER, "    "));
 
   if (entries.size > 0) {
-    lines.push(...renderConstraintLines(entries, kotlin));
+    lines.push(...renderConstraintLines(entries, kotlin, freeText));
   }
 
   if (forces.size > 0 || excludes.size > 0) {
     lines.push(
       "configurations.all {",
-      ...renderForceLines(forces, kotlin),
-      ...renderExcludeLines(excludes, kotlin),
+      ...renderForceLines(forces, kotlin, freeText),
+      ...renderExcludeLines(excludes, kotlin, freeText),
       "}",
     );
   }
 
+  lines.push(...freeTextLines(freeText, FREE_TEXT_FOOTER, "    "));
   lines.push(MARKER_END);
   return lines.join("\n");
 }
@@ -436,10 +598,12 @@ function renderManagedBlock(
 function renderConstraintLines(
   entries: Map<string, { version: string; because: string }>,
   kotlin: boolean,
+  freeText: Map<string, string[]> | null = null,
 ): string[] {
   const lines = ["dependencies {", "    constraints {"];
   const sorted = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [pkg, { version, because }] of sorted) {
+    lines.push(...freeTextLines(freeText, pkg, "        "));
     lines.push(`        ${renderConstraintCall(pkg, version, because, kotlin)}`);
   }
   lines.push("    }", "}");
@@ -455,21 +619,23 @@ function renderConstraintCall(pkg: string, version: string, because: string, kot
   return call;
 }
 
-function renderForceLines(forces: Map<string, string>, kotlin: boolean): string[] {
+function renderForceLines(forces: Map<string, string>, kotlin: boolean, freeText: Map<string, string[]> | null = null): string[] {
   if (forces.size === 0) return [];
   const lines = ["    resolutionStrategy {"];
   for (const [pkg, version] of [...forces.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(...freeTextLines(freeText, `force:${pkg}`, "        "));
     lines.push(kotlin ? `        force("${pkg}:${version}")` : `        force '${pkg}:${version}'`);
   }
   lines.push("    }");
   return lines;
 }
 
-function renderExcludeLines(excludes: Set<string>, kotlin: boolean): string[] {
+function renderExcludeLines(excludes: Set<string>, kotlin: boolean, freeText: Map<string, string[]> | null = null): string[] {
   const q = kotlin ? '"' : "'";
   const lines: string[] = [];
   for (const coord of [...excludes].sort((a, b) => a.localeCompare(b))) {
     const [group, module] = coord.split(":");
+    lines.push(...freeTextLines(freeText, `exclude:${coord}`, "    "));
     lines.push(
       kotlin
         ? `    exclude(group = ${q}${group}${q}, module = ${q}${module}${q})`
@@ -524,6 +690,7 @@ function upsertManagedBlock(
   let entries = new Map<string, { version: string; because: string }>();
   let excludeSet = new Set<string>();
   let forceMap = new Map<string, string>();
+  let freeText: Map<string, string[]> | null = null;
   let before = content;
   let after = "";
   const hasBlock = found !== null;
@@ -534,6 +701,7 @@ function upsertManagedBlock(
     entries = parseExistingConstraints(block);
     excludeSet = parseExistingExcludes(block);
     forceMap = parseExistingForces(block);
+    freeText = parseBlockFreeText(block);
 
     // Drop pins the platform BOM now manages at or above — they only force an older version.
     // Protected pins (vulnerability escapes) survive: the BOM-managed version is itself affected.
@@ -590,7 +758,7 @@ function upsertManagedBlock(
     return `${collapseTrailingNewlines(content.slice(0, found.begin))}${afterClean}`;
   }
 
-  const block = renderManagedBlock(entries, excludeSet, forceMap, kotlin);
+  const block = renderManagedBlock(entries, excludeSet, forceMap, kotlin, pruneFreeText(freeText, entries, excludeSet, forceMap));
   if (hasBlock) {
     return `${before}${block}${after}`;
   }
@@ -611,6 +779,7 @@ export function removeManagedPin(filePath: string, packageName: string): boolean
   const entries = parseExistingConstraints(block);
   const excludeSet = parseExistingExcludes(block);
   const forceMap = parseExistingForces(block);
+  const freeText = pruneFreeText(parseBlockFreeText(block), entries, excludeSet, forceMap);
 
   let changed = false;
   if (entries.delete(packageName)) changed = true;
@@ -623,7 +792,7 @@ export function removeManagedPin(filePath: string, packageName: string): boolean
     fs.writeFileSync(filePath, `${before}${after}`);
     return true;
   }
-  const next = renderManagedBlock(entries, excludeSet, forceMap, filePath.endsWith(".kts"));
+  const next = renderManagedBlock(entries, excludeSet, forceMap, filePath.endsWith(".kts"), freeText);
   fs.writeFileSync(filePath, `${before}${next}\n${after}`);
   return true;
 }

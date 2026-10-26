@@ -80,7 +80,7 @@ export function matchVulnerabilities(packages: PackageRef[], osvData: any[]): Fi
       // Determine severity from CVSS scores
       const severity = extractSeverity(entry);
 
-      // Collect fixed versions from the matching affected block only
+      // Collect fixed versions from every affected block of this package (cross-line union)
       const fixedVersions = collectFixedVersions(entry, pkg.name, pkg.ecosystem);
 
       // Build finding

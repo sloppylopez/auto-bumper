@@ -1,5 +1,5 @@
 import type { Finding, AdvisoryEntry } from "../src/lib/types.ts";
-import { buildFixPlan, packageAdvisoryEntries, pickSafeEscapeVersion, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
+import { buildFixPlan, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 
 const makeFinding = (overrides: Partial<Finding>): Finding => ({
   id: "GHSA-test",
@@ -316,5 +316,146 @@ describe("packageAdvisoryEntries", () => {
 
   it("matches package names case-insensitively", () => {
     expect(packageAdvisoryEntries([mavenEntry], "COM.FASTERXML.JACKSON.CORE:JACKSON-DATABIND", "maven")).toEqual([mavenEntry]);
+  });
+});
+
+describe("family consistency", () => {
+  const mavenRef = (packageName: string, installedVersion: string) => ({ packageName, installedVersion, ecosystem: "maven" as const });
+
+  it("clamps a cross-major jetty bump to the best same-line fix when siblings stay on the old line", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["11.0.29"] }),
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["12.0.12"] }),
+    ];
+    const classpath = [
+      mavenRef("org.eclipse.jetty:jetty-http", "11.0.24"),
+      mavenRef("org.eclipse.jetty:jetty-server", "11.0.24"),
+      mavenRef("org.eclipse.jetty.http2:http2-common", "11.0.24"),
+    ];
+    const plan = buildFixPlan(findings, [], classpath);
+    expect(plan.fixable.length).toBe(1);
+    expect(plan.fixable[0].targetVersion).toBe("11.0.29");
+    expect(plan.fixable[0].isMajor).toBe(false);
+    expect(plan.unfixable).toEqual([]);
+  });
+
+  it("demotes to unfixable when no same-line fix exists", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["12.0.12"] }),
+    ];
+    const classpath = [
+      mavenRef("org.eclipse.jetty:jetty-http", "11.0.24"),
+      mavenRef("org.eclipse.jetty:jetty-server", "11.0.24"),
+      mavenRef("org.eclipse.jetty.http2:http2-common", "11.0.24"),
+    ];
+    const plan = buildFixPlan(findings, [], classpath);
+    expect(plan.fixable).toEqual([]);
+    expect(plan.unfixable.length).toBe(1);
+    expect(plan.unfixable[0].targetVersion).toBeNull();
+    expect(plan.unfixable[0].familyClamped).toContain("split family 'jetty'");
+  });
+
+  it("allows the whole family to move cross-major together", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["12.0.12"] }),
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-server", installedVersion: "11.0.24", fixedVersions: ["12.0.13"] }),
+    ];
+    const classpath = [
+      mavenRef("org.eclipse.jetty:jetty-http", "11.0.24"),
+      mavenRef("org.eclipse.jetty:jetty-server", "11.0.24"),
+    ];
+    const plan = buildFixPlan(findings, [], classpath);
+    expect(plan.fixable.length).toBe(2);
+    expect(plan.fixable.map(c => c.targetVersion)).toEqual(["12.0.12", "12.0.13"]);
+    expect(plan.fixable.every(c => c.isMajor)).toBe(true);
+  });
+
+  it("leaves a cross-major candidate alone when no family siblings are on the classpath", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["12.0.12"] }),
+    ];
+    const plan = buildFixPlan(findings, [], [mavenRef("org.eclipse.jetty:jetty-http", "11.0.24")]);
+    expect(plan.fixable.length).toBe(1);
+    expect(plan.fixable[0].targetVersion).toBe("12.0.12");
+    expect(plan.fixable[0].isMajor).toBe(true);
+    expect(plan.fixable[0].familyClamped).toBeUndefined();
+  });
+
+  it("does not touch packages outside the family table", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-x", ecosystem: "maven", packageName: "com.example:thing", installedVersion: "1.0.0", fixedVersions: ["2.0.0"] }),
+    ];
+    const classpath = [mavenRef("com.example:thing", "1.0.0"), mavenRef("com.example:other", "1.0.0")];
+    const plan = buildFixPlan(findings, [], classpath);
+    expect(plan.fixable.length).toBe(1);
+    expect(plan.fixable[0].targetVersion).toBe("2.0.0");
+    expect(plan.fixable[0].isMajor).toBe(true);
+  });
+
+  it("without a classpath argument keeps the legacy cross-major behavior", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["11.0.29"] }),
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["12.0.12"] }),
+    ];
+    const plan = buildFixPlan(findings);
+    expect(plan.fixable.length).toBe(1);
+    expect(plan.fixable[0].targetVersion).toBe("12.0.12");
+    expect(plan.fixable[0].isMajor).toBe(true);
+    expect(plan.fixable[0].familyClamped).toBeUndefined();
+  });
+});
+
+describe("planFamilyMigrations", () => {
+  const mavenRef = (packageName: string, installedVersion: string) => ({ packageName, installedVersion, ecosystem: "maven" as const });
+
+  it("plans a migration for a co-versioned family with an affected member and siblings", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["11.0.29", "12.0.12"] }),
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-server", installedVersion: "11.0.24", fixedVersions: ["12.0.13"] }),
+    ];
+    const classpath = [
+      mavenRef("org.eclipse.jetty:jetty-http", "11.0.24"),
+      mavenRef("org.eclipse.jetty:jetty-server", "11.0.24"),
+      mavenRef("org.eclipse.jetty.http2:http2-common", "11.0.24"),
+    ];
+    const migrations = planFamilyMigrations(classpath, findings);
+    expect(migrations.length).toBe(1);
+    expect(migrations[0].familyName).toBe("jetty");
+    expect([...migrations[0].memberPackages].sort()).toEqual([
+      "org.eclipse.jetty.http2:http2-common",
+      "org.eclipse.jetty:jetty-http",
+      "org.eclipse.jetty:jetty-server",
+    ]);
+    // Newest installed line (in-place pin) first, then the next line and any line carrying a fix.
+    expect(migrations[0].linesToTry).toEqual([11, 12]);
+  });
+
+  it("returns [] when no family member is affected", () => {
+    const findings = [makeFinding({ id: "GHSA-x", ecosystem: "maven", packageName: "com.example:thing", installedVersion: "1.0.0", fixedVersions: ["2.0.0"] })];
+    const classpath = [
+      mavenRef("org.eclipse.jetty:jetty-http", "11.0.24"),
+      mavenRef("org.eclipse.jetty:jetty-server", "11.0.24"),
+    ];
+    expect(planFamilyMigrations(classpath, findings)).toEqual([]);
+  });
+
+  it("skips a family with a single classpath member (no coherence to enforce)", () => {
+    const findings = [makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["12.0.12"] })];
+    const classpath = [mavenRef("org.eclipse.jetty:jetty-http", "11.0.24")];
+    expect(planFamilyMigrations(classpath, findings)).toEqual([]);
+  });
+
+  it("falls back to the next line above the installed one when no fix version exists", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["11.0.29"] }),
+      makeFinding({ id: "GHSA-b", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-server", installedVersion: "11.0.24", fixedVersions: [] }),
+    ];
+    const classpath = [
+      mavenRef("org.eclipse.jetty:jetty-http", "11.0.24"),
+      mavenRef("org.eclipse.jetty:jetty-server", "11.0.24"),
+    ];
+    const migrations = planFamilyMigrations(classpath, findings);
+    expect(migrations.length).toBe(1);
+    expect(migrations[0].linesToTry).toEqual([11, 12]);
   });
 });

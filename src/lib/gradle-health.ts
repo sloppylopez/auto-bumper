@@ -31,6 +31,7 @@ function mixedMigrationWarnings(groups: Set<string>): string[] {
   const warnings: string[] = [];
   for (const [clusterKey] of migrationsByCluster()) {
     const [fromGroup, toGroup] = clusterKey.split("|");
+    if (fromGroup === toGroup) continue; // intra-group rename — no group-level mixing possible
     if (groups.has(fromGroup) && groups.has(toGroup)) {
       warnings.push(
         `Mixed Maven coordinates during migration: ${fromGroup} and ${toGroup} both on classpath — align related artifacts.`,

@@ -18,6 +18,15 @@ describe("mixedMigrationClusters", () => {
     const mixed = mixedMigrationClusters(packages);
     expect(mixed.size).toBe(1);
   });
+
+  it("does not flag intra-group renames as mixed", () => {
+    const packages: PackageRef[] = [
+      { ecosystem: "maven", name: "org.eclipse.jetty.http2:http2-server", version: "11.0.26", manifestPath: "b" },
+      { ecosystem: "maven", name: "org.eclipse.jetty.http2:jetty-http2-server", version: "12.0.39", manifestPath: "b" },
+    ];
+    const mixed = mixedMigrationClusters(packages);
+    expect(mixed.size).toBe(0);
+  });
 });
 
 describe("filterRedundantFixes", () => {

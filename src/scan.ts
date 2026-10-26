@@ -14,6 +14,7 @@ import { packagesNeedOrphanBridge } from "./lib/osv-package-bridge.ts";
 import { loadOrphanBridgedAdvisories } from "./lib/osv-orphan-cves.ts";
 import { loadLocalAdvisoriesForTarget } from "./lib/local-advisories.ts";
 import { loadSnykAdvisories } from "./lib/snyk-advisories.ts";
+import { unionAdvisory } from "./lib/advisory-merge.ts";
 import { readCacheFile, writeCacheFile, getCacheAgeMs, readCacheEtag, writeCacheEtag } from "./lib/osv-cache.ts";
 
 export { normalizeCliPath, pathHint, repairMangledCliPath, CACHE_DIR, getOsvDbDir } from "./path.ts";
@@ -316,6 +317,7 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
         offline: opts.offline,
         setText,
         onWarning: (msg) => warnings.push(msg),
+        onIncomplete: () => { advisoryIncomplete = true; },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -461,18 +463,19 @@ export function advisoryRichness(entry: AdvisoryEntry): number {
 }
 
 /**
- * Merge local cache with live/API advisories by ID.
- * Same ID: keep the richer record so stale cache cannot shadow fresher fixedVersions/ranges.
+ * Merge advisory lists by id.
+ * Same id: union aliases, links, severity, and affected packages. Ranges for the
+ * same package are concatenated so a richer record cannot drop another package
+ * or a newer fixed version.
  */
 export function mergeAdvisories(local: AdvisoryEntry[], extra: AdvisoryEntry[]): AdvisoryEntry[] {
   const byId = new Map<string, AdvisoryEntry>();
-  for (const e of local) byId.set(e.id, e);
-  for (const e of extra) {
-    const existing = byId.get(e.id);
-    if (!existing || advisoryRichness(e) > advisoryRichness(existing)) {
-      byId.set(e.id, e);
-    }
-  }
+  const put = (entry: AdvisoryEntry) => {
+    const existing = byId.get(entry.id);
+    byId.set(entry.id, existing ? unionAdvisory(existing, entry) : entry);
+  };
+  for (const e of local) put(e);
+  for (const e of extra) put(e);
   return [...byId.values()];
 }
 

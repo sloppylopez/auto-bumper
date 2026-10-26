@@ -71,6 +71,7 @@
 │  buildFixPlan() (fixer.ts)                                          │
 │    group by package, pick minimal fix version                       │
 │    detectMavenRenames() — OSV + known group migrations              │
+│    family guard — cross-major splits stay on one line              │
 │        │                                                            │
 │        ▼                                                            │
 │  FixPlan: fixable | unfixable | renames                             │
@@ -416,7 +417,7 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
 | **scan** | `runAutoBumperScan()` — full scan pipeline (advisory loading, matching, reporting) |
 | **ghsa** | `loadRepoAdvisories()` — reviewed Maven advisories from `GET /advisories?ecosystem=maven`. The first pull caches the list; later pulls send only `updated>=` the last sync. The query never includes your package names |
 | **local-advisories** | `loadLocalAdvisories()`, `loadLocalAdvisoriesForTarget()`, `getLocalAdvisoriesDir()` — OSV-format JSON in the package `local-advisories/` plus `<target>/local-advisories/`; always loaded, no network involved |
-| **fixer** | `buildFixPlan(findings[])` → `{ fixable[], unfixable[], renames[] }` |
+| **fixer** | `buildFixPlan(findings[], advisories?, classpath?)` → `{ fixable[], unfixable[], renames[] }` — a cross-major target that would split a co-versioned family (jetty, netty, vertx, jackson) is clamped to the best same-line fix or reported unfixable |
 | **matcher** | `matchVulnerabilities(packages[], advisories[])` → `Finding[]` |
 | **reporter** | `reportMarkdown()`, `reportJson()`, `reportSummary()` |
 | **editors** | `applyNpmBumps()`, `applyCargoBumps()`, `applyMavenBumps()`, etc. |
@@ -446,7 +447,7 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
 - **Format:** Gzip-compressed JSON arrays of OSV advisory entries
 - **Freshness:** every online run HEAD-probes each remote dump by ETag — if the remote object changed since the cache was written, it is re-downloaded immediately; otherwise the local cache is used. If the probe fails (no network), the 7-day TTL applies (configurable via `CACHE_TTL_MS` constant)
 - **GitHub Maven advisories:** reviewed advisories from the GitHub global advisory API (`ecosystem=maven`), cached as `repo-advisories.json.gz`. The first online refresh downloads the list. Later refreshes send `updated>=` the timestamp in `repo-advisories.since`, plus a withdrawn pass so revoked ids drop out of the cache. The request does not include project package names. A failed fetch keeps the last cache and does not move the cursor. Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the unauthenticated rate limit (the first full pull is many pages). `--offline` reads that cache and does not call GitHub
-- **Snyk public advisories (Maven + npm):** for every unique scanned Maven/npm package, Snyk's public per-package advisory page is fetched once and cached under `snyk/` with a 7-day TTL (a package absent from Snyk's database is cached as empty). Advisories are converted to OSV format — id is the first CVE alias when present, otherwise the SNYK id; severity maps critical/high/medium/low to CVSS 9.0/7.5/4.0/3.0. A failed fetch serves the stale cache when one exists (logged, no warning); with no cache at all the affected packages are reported as a single warning and simply go unmatched — the scan still succeeds. `--offline` reads the caches without fetching; never-fetched packages produce a "cache missing" warning
+- **Snyk public advisories (Maven + npm):** for every unique scanned Maven/npm package, Snyk's public per-package advisory page is fetched once and cached under `snyk/` with a 7-day TTL (a package absent from Snyk's database is cached as empty). Advisories are converted to OSV format — id is the first CVE alias when present, otherwise the SNYK id; the same CVE on several packages keeps every affected package. Severity uses the page's numeric CVSS score when present, otherwise critical/high/medium/low map to 9.0/7.5/4.0/3.0, and a missing label maps to 3.0. A failed fetch serves the stale cache when one exists (logged, no warning); with no cache at all the affected packages are reported as a single warning, those packages go unmatched, and the scan is marked incomplete so `fix` will not report a clean result. `--offline` reads the caches without fetching; never-fetched packages produce a "cache missing" warning
 - **Fallback strategy:** Stale cache > no cache. If download fails, uses whatever is cached
 - **Disk usage:** ~8MB total across all four ecosystems
 - **Local vendored advisories:** disclosures not yet in the OSV bulk dump can be added as OSV-format JSON files under `<packageRoot>/local-advisories/` (shipped with this package) and under `<project>/local-advisories/` (the repo you scan). A project file with the same advisory id replaces the packaged copy. Loaded on every scan, works offline, never fetched
@@ -474,7 +475,7 @@ What each data source does offline:
 | Per-ecosystem OSV dumps (GCS) | Fresh cache used; stale/missing → download | Cache used **regardless of TTL**. No cache file → exit `2` (no download). Run `update-db` online first |
 | Orphan-CVE bridge (Maven) | Same as above | Local cache or empty — never fetched |
 | GitHub reviewed Maven advisories | Full list on first pull, then `updated>=` cursor. On fetch failure the last cache is used and the cursor stays put. `GITHUB_TOKEN` or `GH_TOKEN` is sent when set. Fetch failure with no cache is an incomplete scan (exit 2, not clean) | Cache is read. A missing cache is a warning, not a download |
-| Snyk public per-package advisories (Maven + npm) | One page fetch per unique package not yet cached (7-day TTL). Fetch failure serves the stale cache; with no cache it is one aggregated warning and those packages go unmatched | Caches are read **regardless of TTL**. Never-fetched packages → "cache missing" warning, no download |
+| Snyk public per-package advisories (Maven + npm) | One page fetch per unique package not yet cached (7-day TTL). Fetch failure serves the stale cache; with no cache it is one aggregated warning, those packages go unmatched, and the scan is incomplete | Caches are read **regardless of TTL**. Never-fetched packages → "cache missing" warning, no download |
 
 Practical notes:
 

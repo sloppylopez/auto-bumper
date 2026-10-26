@@ -97,12 +97,109 @@ const MIGRATION_CLUSTERS: MigrationCluster[] = [
     rejectPins: ["tools.jackson.core:jackson-annotations"],
     extraPins: [{ packageName: JACKSON3_ANNOTATIONS_COORD, version: JACKSON3_ANNOTATIONS_VERSION }],
   },
+  {
+    // Jetty 12 renamed the org.eclipse.jetty.http2 module artifacts (http2-* -> jetty-http2-*);
+    // the old coordinates stopped publishing at 11.0.26, so a 12.x migration must rename them.
+    key: "org.eclipse.jetty.http2|org.eclipse.jetty.http2",
+    maven: {
+      "org.eclipse.jetty.http2:http2-client": "org.eclipse.jetty.http2:jetty-http2-client",
+      "org.eclipse.jetty.http2:http2-common": "org.eclipse.jetty.http2:jetty-http2-common",
+      "org.eclipse.jetty.http2:http2-hpack": "org.eclipse.jetty.http2:jetty-http2-hpack",
+      "org.eclipse.jetty.http2:http2-http-client-transport": "org.eclipse.jetty.http2:jetty-http2-client-transport",
+      "org.eclipse.jetty.http2:http2-server": "org.eclipse.jetty.http2:jetty-http2-server",
+    },
+    excludeOldCoordinates: true,
+  },
 ];
 
-/** Fallback Maven renames derived from migration clusters. */
-const KNOWN_RENAMES: Record<string, string> = Object.fromEntries(
-  MIGRATION_CLUSTERS.flatMap(c => Object.entries(c.maven)),
-);
+/**
+ * Known successor coordinates that are not part of a full group-migration cluster. The Jetty
+ * 12 ee10 modules moved to the org.eclipse.jetty.ee10 group while the rest of Jetty stayed in
+ * org.eclipse.jetty, so group-level "mixed classpath" detection does not apply to them.
+ */
+const EXTRA_KNOWN_RENAMES: Record<string, string> = {
+  "org.eclipse.jetty:jetty-servlet": "org.eclipse.jetty.ee10:jetty-ee10-servlet",
+  "org.eclipse.jetty:jetty-servlets": "org.eclipse.jetty.ee10:jetty-ee10-servlets",
+  "org.eclipse.jetty:jetty-webapp": "org.eclipse.jetty.ee10:jetty-ee10-webapp",
+};
+
+/** Fallback Maven renames derived from migration clusters plus standalone successor coordinates. */
+export const KNOWN_RENAMES: Record<string, string> = {
+  ...Object.fromEntries(MIGRATION_CLUSTERS.flatMap(c => Object.entries(c.maven))),
+  ...EXTRA_KNOWN_RENAMES,
+};
+
+/**
+ * Consumer artifacts that publish ecosystem-specific builds: the base coordinate is an
+ * aggregator, and the real implementation ships in a variant artifact on the same version line.
+ * When a migration family forces the underlying library to a new major (e.g. Jetty 12),
+ * swapping the consumer to the matching variant keeps it functional — excluding the old
+ * transitive coordinates instead would strip its server implementation out from under it.
+ */
+export interface ConsumerVariant {
+  /** Co-versioned family this variant belongs to (COVERSIONED_FAMILIES name, e.g. "jetty"). */
+  family: string;
+  /** Base coordinate as declared by the project ("group:artifact"). */
+  from: string;
+  /** Variant coordinate providing the migrated major, same version line ("group:artifact"). */
+  to: string;
+}
+
+export const CONSUMER_VARIANTS: ConsumerVariant[] = [
+  {
+    // Since WireMock 3.x the base artifact is an empty aggregator; the Jetty 12 build lives in wiremock-jetty12.
+    family: "jetty",
+    from: "org.wiremock:wiremock",
+    to: "org.wiremock:wiremock-jetty12",
+  },
+];
+
+export function consumerVariantsForFamily(family: string): ConsumerVariant[] {
+  return CONSUMER_VARIANTS.filter(v => v.family === family);
+}
+
+/**
+ * Top-level dependencies (direct manifest entries) that transitively require a coordinate,
+ * walked up the resolved classpath's requiredBy edges. A coordinate with no parents is itself
+ * top-level. The project's own artifact — either absent from the package list or present as a
+ * root-line entry that nothing requires — marks the boundary: the node it directly requires IS
+ * top-level and is returned, not the project artifact.
+ */
+export function topLevelAncestors(
+  coord: string,
+  packages: ReadonlyArray<{ name: string; requiredBy?: string[] }>,
+): Set<string> {
+  const occurrences = new Map<string, Array<ReadonlyArray<string>>>();
+  for (const p of packages) {
+    const list = occurrences.get(p.name);
+    if (list) list.push(p.requiredBy ?? []);
+    else occurrences.set(p.name, [p.requiredBy ?? []]);
+  }
+  const out = new Set<string>();
+  const seen = new Set<string>();
+  const visit = (name: string): void => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    const parents = occurrences.get(name);
+    if (!parents) { out.add(name); return; } // absent from the list — root boundary, name is top-level
+    for (const ps of parents) {
+      if (ps.length === 0) {
+        out.add(name); // direct dependency in the manifest
+        continue;
+      }
+      let direct = false;
+      for (const parent of ps) {
+        const pOcc = occurrences.get(parent);
+        // A parent that is itself a root-line entry (never required by anything) is the project artifact.
+        if (!pOcc || pOcc.every(qs => qs.length === 0)) { direct = true; continue; }
+        visit(parent);
+      }
+      if (direct) out.add(name);
+    }
+  };
+  visit(coord);
+  return out;
+}
 
 export function mavenGroup(coord: string): string {
   return coord.split(":")[0] || "";
