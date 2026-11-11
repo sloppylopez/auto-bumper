@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps, applyRenames, detectGradlePlatform, findStaleManagedPins, hasEnforcedPlatform, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
+import { applyBumps, applyRenames, detectGradlePlatform, findShadowedManagedPins, findStaleManagedPins, hasEnforcedPlatform, parseUserForces, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
@@ -106,13 +106,16 @@ configurations.all {
     }
 }`,
       filePath => {
-        // A previous run pinned a higher release in the managed block.
-        applyBumps(filePath, [{
+        // A previous run rewrote the shared variable — the user's own force already enforces 4.1.0,
+        // so a managed pin at that same version is redundant and must be skipped, not duplicated.
+        const first = applyBumps(filePath, [{
           packageName: "org.glassfish.jaxb:jaxb-core",
           targetVersion: "4.1.0",
           because: ["CVE-OLD"],
         }]);
-        expect(readGradle(filePath)).toContain("org.glassfish.jaxb:jaxb-core:4.1.0");
+        expect(first.direct).toContain("org.glassfish.jaxb:jaxb-core");
+        expect(readGradle(filePath)).not.toContain(GRADLE_MARKER_BEGIN);
+        expect(first.warnings.some(w => w.includes("skipped managed pin"))).toBe(true);
 
         const result = applyBumps(filePath, [{
           packageName: "org.glassfish.jaxb:jaxb-core",
@@ -121,6 +124,8 @@ configurations.all {
           isDowngrade: true,
         }]);
         expect(result.constrained).toContain("org.glassfish.jaxb:jaxb-core");
+        // A pin that conflicts with the user's own force is written (approved downgrade) but called out.
+        expect(result.warnings.some(w => w.includes("overrides the project's own force"))).toBe(true);
         const content = readGradle(filePath);
         // The downgrade must not be raised back to the declared 4.0.9 nor masked by the stale pin.
         expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
@@ -747,6 +752,46 @@ ${GRADLE_MARKER_END}`,
     );
   });
 
+  it("preserves existing because clauses when the managed block is re-rendered", () => {
+    withTempGradle(
+      `plugins { id 'java' }
+
+dependencies {
+    implementation 'com.example:json-schema-validator:2.2.13'
+}
+
+${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        implementation('org.json:json:20260719') { because 'GHSA-ghc9-756g-vrcv' }
+    }
+}
+configurations.all {
+    resolutionStrategy {
+        force 'org.json:json:20260719'
+    }
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        applyBumps(filePath, [{
+          packageName: "org.glassfish.jaxb:jaxb-core",
+          targetVersion: "3.0.2",
+          because: ["CVE-2026-92877"],
+          isDowngrade: true,
+          installedVersion: "4.0.9",
+        }]);
+        const content = readGradle(filePath);
+        // The carried-over pin must keep its advisory annotation (regression: the
+        // because clause was lost on every re-render because the parser sliced from
+        // the match length instead of the match end).
+        expect(content).toContain("implementation('org.json:json:20260719') { because 'GHSA-ghc9-756g-vrcv' }");
+        expect(content).toContain("force 'org.json:json:20260719'");
+        // The new pin carries its own annotation.
+        expect(content).toContain("implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }");
+      },
+    );
+  });
+
   it("drops the comment of a removed pin but keeps the others", () => {
     withTempGradle(
       `${GRADLE_MARKER_BEGIN}
@@ -821,5 +866,255 @@ dependencies {
         expect(result.warnings.some(w => w.includes("shared variable"))).toBe(false);
       },
     );
+  });
+});
+
+describe("parseUserForces", () => {
+  it("resolves variable-referenced forces outside the managed block and ignores managed pins", () => {
+    const content = [
+      `def jaxb_version = "4.0.9"`,
+      `dependencies { implementation "com.example:app" }`,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+      `        force 'org.glassfish.jaxb:jaxb-runtime:\${jaxb_version}'`,
+      `        force "com.example:direct:1.2.3"`,
+      `        force "com.example:mystery:\${undefined_var}"`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_BEGIN,
+      `force "org.glassfish.jaxb:jaxb-core:9.9.9" // managed pin must not be read as a user force`,
+      GRADLE_MARKER_END,
+      ``,
+    ].join("\n");
+
+    const forces = parseUserForces(content);
+    expect(forces.get("org.glassfish.jaxb:jaxb-core")).toBe("4.0.9");
+    expect(forces.get("org.glassfish.jaxb:jaxb-runtime")).toBe("4.0.9");
+    expect(forces.get("com.example:direct")).toBe("1.2.3");
+    expect(forces.has("com.example:mystery")).toBe(false);
+  });
+
+  it("returns an empty map when the project has no forces", () => {
+    expect(parseUserForces(`dependencies {\n    implementation "a:b:1.0"\n}\n`).size).toBe(0);
+  });
+});
+
+describe("findShadowedManagedPins", () => {
+  const SHADOW_FILE = [
+    `def jaxb_version = "4.0.9"`,
+    ``,
+    `configurations.all {`,
+    `    resolutionStrategy {`,
+    `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+    `        force 'com.example:direct:1.2.3'`,
+    `        force 'org.low:below-user:2.3.0'`,
+    `    }`,
+    `}`,
+    ``,
+    GRADLE_MARKER_BEGIN,
+    `dependencies {`,
+    `    constraints {`,
+    `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+    `        implementation('com.example:direct:1.2.3') { because 'GHSA-test' }`,
+    `        implementation('org.low:below-user:3.0.2') { because 'GHSA-low' }`,
+    `    }`,
+    `}`,
+    `configurations.all {`,
+    `    resolutionStrategy {`,
+    `        force 'org.glassfish.jaxb:jaxb-core:3.0.2'`,
+    `        force 'org.low:below-user:3.0.2'`,
+    `    }`,
+    `}`,
+    GRADLE_MARKER_END,
+  ].join("\n");
+
+  it("reports pins the user's own force covers at or above, once per package", () => {
+    const shadowed = findShadowedManagedPins(SHADOW_FILE);
+    expect(shadowed).toEqual([
+      { packageName: "org.glassfish.jaxb:jaxb-core", version: "3.0.2", userVersion: "4.0.9" },
+      { packageName: "com.example:direct", version: "1.2.3", userVersion: "1.2.3" },
+    ]);
+  });
+
+  it("keeps pins above the user's force and skips packages rewritten this run", () => {
+    const all = findShadowedManagedPins(SHADOW_FILE);
+    expect(all.some(s => s.packageName === "org.low:below-user")).toBe(false);
+    const touched = findShadowedManagedPins(SHADOW_FILE, new Set(["org.glassfish.jaxb:jaxb-core"]));
+    expect(touched.map(s => s.packageName)).toEqual(["com.example:direct"]);
+  });
+
+  it("returns empty when there is no managed block or no user forces", () => {
+    expect(findShadowedManagedPins(`dependencies {\n    implementation "a:b:1.0"\n}\n`)).toEqual([]);
+    const noForces = SHADOW_FILE.replace(`force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`, ``)
+      .replace(`force 'com.example:direct:1.2.3'`, ``)
+      .replace(`force 'org.low:below-user:2.3.0'`, ``);
+    expect(findShadowedManagedPins(noForces)).toEqual([]);
+  });
+});
+
+describe("applyBumps stale shadow cleanup", () => {
+  it("removes a pre-existing managed pin the project's own force already covers, and keeps pins above the user force", () => {
+    const file = [
+      `def jaxb_version = "4.0.9"`,
+      ``,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+      `        force 'org.low:below-user:2.3.0'`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `        implementation('org.low:below-user:3.0.2') { because 'GHSA-low' }`,
+      `    }`,
+      `}`,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'org.glassfish.jaxb:jaxb-core:3.0.2'`,
+      `        force 'org.low:below-user:3.0.2'`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(file, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.tomcat.embed:tomcat-embed-core",
+        targetVersion: "11.0.27",
+        because: ["CVE-2026-101356"],
+      }]);
+      expect(result.warnings.some(w => w === "removed stale managed pin org.glassfish.jaxb:jaxb-core@3.0.2 — the project's own resolutionStrategy.force already pins it at 4.0.9")).toBe(true);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.apache.tomcat.embed:tomcat-embed-core:11.0.27");
+      expect(content).not.toContain("jaxb-core:3.0.2");
+      expect(content).not.toContain("'org.glassfish.jaxb:jaxb-core:3.0.2'");
+      // Pin above the user's own force survives — it enforces a newer fix version.
+      expect(content).toContain("org.low:below-user:3.0.2");
+    });
+  });
+
+  it("when the user's own force is bumped in place, the now-redundant managed pin is cleaned up", () => {
+    const file = [
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'com.example:direct:1.2.3'`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('com.example:direct:1.2.3') { because 'GHSA-test' }`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(file, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "com.example:direct",
+        targetVersion: "1.2.4",
+        because: ["GHSA-next"],
+      }]);
+      // The project's own force line is the direct declaration — bumped in place to 1.2.4.
+      expect(result.direct).toContain("com.example:direct");
+      const content = readGradle(filePath);
+      expect(content).toContain(`force 'com.example:direct:1.2.4'`);
+      // The managed pin (rewritten in place to 1.2.4 like the force line) is shadowed by the user's
+      // own force and removed, not kept twice.
+      expect(result.warnings.some(w => w === "removed stale managed pin com.example:direct@1.2.4 — the project's own resolutionStrategy.force already pins it at 1.2.4")).toBe(true);
+      expect(content).not.toContain("com.example:direct:1.2.3");
+    });
+  });
+
+  it("keeps a protected vulnerability-escape pin even when the project's own force covers it — the forced version is itself affected", () => {
+    const file = [
+      `def jaxb_version = "4.0.9"`,
+      ``,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `    }`,
+      `}`,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'org.glassfish.jaxb:jaxb-core:3.0.2'`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    const bomManaged = new Map([["org.glassfish.jaxb:jaxb-core", "4.0.9"]]);
+    withTempGradle(file, filePath => {
+      // Cleanup-only run: the pin is BOM-stale (3.0.2 <= 4.0.9) AND protected (the BOM-managed
+      // version is still vulnerable). The user's own force pins it at 4.0.9 — but that forced
+      // version is itself affected, and last resolutionStrategy.force wins: our pin (last in the
+      // file) keeps the tree clean. Dropping it would reintroduce the finding.
+      const result = applyBumps(filePath, [], [], bomManaged, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(result.warnings).toEqual([]);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).toContain(GRADLE_MARKER_BEGIN);
+    });
+  });
+
+  it("still removes a non-protected shadowed pin when the project's own force covers it", () => {
+    const file = [
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'org.glassfish.jaxb:jaxb-core:4.0.9'`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    // BOM manages 3.0.1 (below the pin) so the pin is NOT BOM-stale — only the shadow path applies.
+    const bomManaged = new Map([["org.glassfish.jaxb:jaxb-core", "3.0.1"]]);
+    withTempGradle(file, filePath => {
+      // Not protected (the forced version is clean) and shadowed by the user's own force —
+      // the explicit user decision governs and the redundant pin goes.
+      const result = applyBumps(filePath, [], [], bomManaged);
+      expect(result.warnings.some(w => w === "removed stale managed pin org.glassfish.jaxb:jaxb-core@3.0.2 — the project's own resolutionStrategy.force already pins it at 4.0.9")).toBe(true);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("jaxb-core:3.0.2");
+      // The block held only this pin — fully cleaned, so the markers go too (idempotent re-runs).
+      expect(content).not.toContain(GRADLE_MARKER_BEGIN);
+    });
+  });
+
+  it("keeps a protected vulnerability-escape pin when no user force shadows it", () => {
+    const file = [
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    const bomManaged = new Map([["org.glassfish.jaxb:jaxb-core", "4.0.9"]]);
+    withTempGradle(file, filePath => {
+      // BOM-stale but protected and not shadowed by any user force — dropping it would reintroduce
+      // the finding, so cleanup-only runs leave it alone.
+      const result = applyBumps(filePath, [], [], bomManaged, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(result.warnings).toEqual([]);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).toContain(GRADLE_MARKER_BEGIN);
+    });
   });
 });

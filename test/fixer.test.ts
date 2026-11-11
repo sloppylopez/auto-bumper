@@ -392,6 +392,34 @@ describe("family consistency", () => {
     expect(plan.fixable[0].isMajor).toBe(true);
   });
 
+  it("demotes a cross-major jaxb bump when siblings stay on the old line", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-j", ecosystem: "maven", packageName: "org.glassfish.jaxb:jaxb-core", installedVersion: "3.0.9", fixedVersions: ["4.0.5"] }),
+    ];
+    const classpath = [
+      mavenRef("org.glassfish.jaxb:jaxb-core", "3.0.9"),
+      mavenRef("org.glassfish.jaxb:jaxb-runtime", "3.0.9"),
+    ];
+    const plan = buildFixPlan(findings, [], classpath);
+    expect(plan.fixable).toEqual([]);
+    expect(plan.unfixable.length).toBe(1);
+    expect(plan.unfixable[0].familyClamped).toContain("split family 'jaxb'");
+  });
+
+  it("lets the whole jaxb family move cross-major together", () => {
+    const findings = [
+      makeFinding({ id: "GHSA-j", ecosystem: "maven", packageName: "org.glassfish.jaxb:jaxb-core", installedVersion: "3.0.9", fixedVersions: ["4.0.5"] }),
+      makeFinding({ id: "GHSA-k", ecosystem: "maven", packageName: "org.glassfish.jaxb:jaxb-runtime", installedVersion: "3.0.9", fixedVersions: ["4.0.5"] }),
+    ];
+    const classpath = [
+      mavenRef("org.glassfish.jaxb:jaxb-core", "3.0.9"),
+      mavenRef("org.glassfish.jaxb:jaxb-runtime", "3.0.9"),
+    ];
+    const plan = buildFixPlan(findings, [], classpath);
+    expect(plan.fixable.length).toBe(2);
+    expect(plan.fixable.every(c => c.isMajor)).toBe(true);
+  });
+
   it("without a classpath argument keeps the legacy cross-major behavior", () => {
     const findings = [
       makeFinding({ id: "GHSA-a", ecosystem: "maven", packageName: "org.eclipse.jetty:jetty-http", installedVersion: "11.0.24", fixedVersions: ["11.0.29"] }),

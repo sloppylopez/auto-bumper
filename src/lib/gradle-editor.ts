@@ -359,7 +359,9 @@ function parseExistingConstraints(block: string): Map<string, { version: string;
     const pkg = `${coord.slice(0, idx1)}:${coord.slice(idx1 + 1, idx2)}`;
     const version = coord.slice(idx2 + 1);
     if (!version) continue;
-    entries.set(pkg, { version, because: parseBecauseClause(line.slice(m[0].length)) });
+    // m.index + m[0].length (not m[0].length): constraint lines are indented, so slicing from the
+    // match length alone cuts into the line and the because clause is never recognized.
+    entries.set(pkg, { version, because: parseBecauseClause(line.slice(m.index + m[0].length)) });
   }
   return entries;
 }
@@ -390,6 +392,30 @@ function parseExistingForces(block: string): Map<string, string> {
     forces.set(m[1]!, m[2]!);
   }
   return forces;
+}
+
+/**
+ * Parse the project's OWN resolutionStrategy.force pins — anywhere in the file outside the
+ * managed block. `force 'g:a:v'` / `force("g:a:v")`; `${var}` versions are resolved from
+ * version-variable declarations (`def var = "..."`, `val/var`) in the same file. Pins inside
+ * the managed block are ours, not the project's, and are excluded. An unresolvable variable
+ * reference is dropped rather than reported as an empty pin. Pure — unit-testable.
+ */
+export function parseUserForces(content: string): Map<string, string> {
+  const vars = new Map<string, string>();
+  for (const m of content.matchAll(/^\s*(?:def|val|var|final\s+)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*["']([^"']+)["']/gm)) {
+    vars.set(m[1]!, m[2]!);
+  }
+  const found = findManagedBlock(content);
+  const out = new Map<string, string>();
+  const forceRe = /force(?:\s*\(\s*|\s*)["']([^"':]+:[^"':]+):([^"']+)["']/g;
+  for (const m of content.matchAll(forceRe)) {
+    if (found && m.index >= found.begin && m.index < found.end + found.endLen) continue; // managed block — our own pins
+    const version = m[2]!.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => vars.get(name) ?? "");
+    if (!version || version.includes("${")) continue;
+    out.set(m[1]!, version);
+  }
+  return out;
 }
 
 /**
@@ -426,6 +452,49 @@ export function findStaleManagedPins(
     }
   }
   return stale;
+}
+
+/** A managed pin the project's own resolutionStrategy.force already pins at or above, and this run does not rewrite. */
+export interface ShadowedManagedPin {
+  packageName: string;
+  version: string;
+  userVersion: string;
+}
+
+/**
+ * Managed pins (constraints and forces) that the project's OWN resolutionStrategy.force —
+ * outside the managed block — already covers at or above, and that no package in `touched`
+ * rewrites this run. The managed block sits after the user's forces, so such a pin would only
+ * silently shadow an explicit decision; it must be removed. Pins ABOVE the user's force are
+ * kept: they enforce a newer fix version and last-force-wins preserves them. Pure — unit-testable.
+ */
+export function findShadowedManagedPins(
+  content: string,
+  touched: ReadonlySet<string> = new Set(),
+): ShadowedManagedPin[] {
+  const userForces = parseUserForces(content);
+  if (userForces.size === 0) return [];
+  const found = findManagedBlock(content);
+  if (!found) return [];
+  const block = content.slice(found.begin, found.end + found.endLen);
+  const out: ShadowedManagedPin[] = [];
+  const reported = new Set<string>();
+  for (const [pkg, e] of parseExistingConstraints(block)) {
+    if (touched.has(pkg) || reported.has(pkg)) continue;
+    const uv = userForces.get(pkg);
+    if (uv !== undefined && compareMavenVersion(uv, e.version) >= 0) {
+      out.push({ packageName: pkg, version: e.version, userVersion: uv });
+      reported.add(pkg);
+    }
+  }
+  for (const [pkg, v] of parseExistingForces(block)) {
+    if (touched.has(pkg) || reported.has(pkg)) continue;
+    const uv = userForces.get(pkg);
+    if (uv !== undefined && compareMavenVersion(uv, v) >= 0) {
+      out.push({ packageName: pkg, version: v, userVersion: uv });
+    }
+  }
+  return out;
 }
 
 /** Free-text bucket keys for comments that document the block rather than one entry. */
@@ -673,7 +742,10 @@ function findManagedBlock(content: string): { begin: number; end: number; endLen
  * Replace (or append) the auto-bumper managed block, merging new pins/excludes
  * with any existing ones. New pins win on version conflicts. When a BOM managed-version
  * map is given, existing pins at or below the BOM-managed version are dropped first —
- * they would only force an older version than the current platform provides.
+ * they would only force an older version than the current platform provides. Existing pins
+ * the project's own resolutionStrategy.force already covers at or above (and this run does
+ * not rewrite) are dropped too — the block sits after the user's forces, so they would only
+ * silently shadow an explicit pin.
  */
 function upsertManagedBlock(
   content: string,
@@ -684,6 +756,7 @@ function upsertManagedBlock(
   bomManaged: ReadonlyMap<string, string> | null = null,
   droppedOut?: StaleManagedPin[],
   protectedPins?: ReadonlySet<string>,
+  shadowedOut?: ShadowedManagedPin[],
 ): string {
   const found = findManagedBlock(content);
 
@@ -729,6 +802,23 @@ function upsertManagedBlock(
         }
       }
     }
+    // Drop pins the project's own force already covers at or above and this run does not rewrite —
+    // they would only shadow an explicit decision (last resolutionStrategy.force wins, ours is last).
+    const touched = new Set<string>([
+      ...pins.map(p => p.packageName),
+      ...forces.map(f => f.packageName),
+      ...excludes.map(e => e.packageName),
+    ]);
+    for (const s of findShadowedManagedPins(content, touched)) {
+      // Vulnerability escapes survive even when the project's own force covers them at or above:
+      // that forced version is itself affected, and last resolutionStrategy.force wins — ours is last.
+      if (protectedPins?.has(s.packageName)) continue;
+      if (!entries.has(s.packageName) && !forceMap.has(s.packageName)) continue; // already dropped by the BOM pass
+      entries.delete(s.packageName);
+      forceMap.delete(s.packageName);
+      shadowedOut?.push(s);
+    }
+
     before = collapseTrailingNewlines(content.slice(0, beginIdx));
     after = content.slice(endIdx + endLen).replace(/^\n+/, "\n");
   }
@@ -1153,7 +1243,10 @@ function applyCatalogBumps(buildFile: string, bumps: BumpRequest[]): string[] {
  * for backing up the file first. With a BOM managed-version map, existing pins at or below
  * the BOM-managed version are dropped (the BOM already covers them), and new pins that would
  * force a downgrade against the BOM are skipped — except pins in `protectedPins`, whose
- * removal would reintroduce a vulnerability the BOM-managed version still carries.
+ * removal would reintroduce a vulnerability the BOM-managed version still carries. Managed pins
+ * the project's own resolutionStrategy.force already covers at or above are always removed (the
+ * managed block sits last, so such a pin would silently override an explicit decision) — even when
+ * protected, because the user's explicit force wins over our escape pin.
  */
 export function applyBumps(
   filePath: string,
@@ -1169,7 +1262,8 @@ export function applyBumps(
   // Cleanup-only runs (no bumps/excludes) proceed when the BOM map marks existing pins stale.
   if (bumps.length === 0 && excludes.length === 0) {
     const stale = bomManaged ? findStaleManagedPins(content, bomManaged, protectedPins) : [];
-    if (stale.length === 0) return result;
+    const shadowedDroppable = findShadowedManagedPins(content).some(s => !protectedPins?.has(s.packageName));
+    if (stale.length === 0 && !shadowedDroppable) return result;
   }
   const catalogDirect = applyCatalogBumps(filePath, bumps);
   let remainingBumps = bumps.filter(b => !catalogDirect.includes(b.packageName));
@@ -1196,8 +1290,36 @@ export function applyBumps(
   content = classified.content;
 
   const effectiveBumps = remainingBumps.map(b => withEffectiveVersion(content, b));
-  const pins = mergePinsToEffective(content, classified.pinned, effectiveBumps);
-  const forces = enforced ? collectForcePins(content, effectiveBumps) : [];
+  let pins = mergePinsToEffective(content, classified.pinned, effectiveBumps);
+  let forces = enforced ? collectForcePins(content, effectiveBumps) : [];
+
+  // The project's own resolutionStrategy.force pins (outside the managed block) express an explicit
+  // decision. A managed pin at the same version is redundant and skipped; one at a different
+  // version would silently override that decision, so it must be called out before being written.
+  const userForces = parseUserForces(content);
+  if (userForces.size > 0) {
+    pins = pins.filter(pin => {
+      const uv = userForces.get(pin.packageName);
+      if (uv === undefined) return true;
+      if (compareMavenVersion(uv, pin.targetVersion) === 0) {
+        result.warnings.push(`skipped managed pin ${pin.packageName}@${pin.targetVersion} — the project already forces it at that version via its own resolutionStrategy`);
+        return false;
+      }
+      result.warnings.push(`managed pin ${pin.packageName}@${pin.targetVersion} overrides the project's own force ${pin.packageName}@${uv} — last resolutionStrategy.force wins`);
+      return true;
+    });
+    forces = forces.filter(force => {
+      const uv = userForces.get(force.packageName);
+      if (uv === undefined) return true;
+      if (compareMavenVersion(uv, force.targetVersion) === 0) {
+        result.warnings.push(`skipped managed force ${force.packageName}@${force.targetVersion} — the project already forces it at that version via its own resolutionStrategy`);
+        return false;
+      }
+      result.warnings.push(`managed force ${force.packageName}@${force.targetVersion} overrides the project's own force ${force.packageName}@${uv} — last resolutionStrategy.force wins`);
+      return true;
+    });
+  }
+
   if (forces.length > 0) {
     result.forced.push(...forces.map(f => f.packageName));
     result.warnings.push(
@@ -1206,12 +1328,16 @@ export function applyBumps(
   }
 
   const dropped: StaleManagedPin[] = [];
-  content = upsertManagedBlock(content, pins, excludes, forces, kotlin, bomManaged, dropped, protectedPins);
+  const shadowed: ShadowedManagedPin[] = [];
+  content = upsertManagedBlock(content, pins, excludes, forces, kotlin, bomManaged, dropped, protectedPins, shadowed);
   if (dropped.length > 0) {
     result.droppedStale = dropped.map(d => `${d.packageName}@${d.version}`);
     for (const d of dropped) {
       result.warnings.push(`dropped stale pin ${d.packageName}@${d.version} — BOM now manages ${d.bomVersion}`);
     }
+  }
+  for (const s of shadowed) {
+    result.warnings.push(`removed stale managed pin ${s.packageName}@${s.version} — the project's own resolutionStrategy.force already pins it at ${s.userVersion}`);
   }
   result.direct.push(...catalogDirect, ...classified.direct);
   result.constrained.push(...pins.map(p => p.packageName));

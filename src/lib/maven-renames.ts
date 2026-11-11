@@ -458,7 +458,8 @@ function mavenArtifact(coord: string): string {
 
 function isVersionLike(value: string): boolean {
   const v = value.trim();
-  return /^\d/.test(v) && !/^[0-9a-f]{8,}$/i.test(v);
+  // Only hex strings containing letters are git hashes; all-digit 8+ char strings are date-style versions.
+  return /^\d/.test(v) && !(/^[0-9a-f]{8,}$/i.test(v) && /[a-f]/i.test(v));
 }
 
 function fixedVersionsForAffected(affected: AdvisoryEntry["affected"][number]): string[] {

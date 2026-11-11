@@ -13,7 +13,7 @@ import { extractRepoUrls, fetchText, MAVEN_CENTRAL, stripTrailingSlashes } from 
 import { getCacheRoot } from "../path.ts";
 import { findStaleManagedPins } from "./gradle-editor.ts";
 import type { StaleManagedPin } from "./gradle-editor.ts";
-import { matchVulnerabilities } from "./matcher.ts";
+import { isVersionAffectedByAdvisories } from "./matcher.ts";
 import type { AdvisoryEntry } from "./types.ts";
 
 /**
@@ -154,9 +154,12 @@ export function computeProtectedPins(
   for (const stale of findStaleManagedPins(content, bomManaged)) {
     // Probe each version in its own matcher call: matchVulnerabilities dedupes findings
     // per (advisory, package), so a single two-version probe would collapse to one finding.
-    const affectedAt = (version: string): boolean =>
-      matchVulnerabilities([{ ecosystem: "maven", name: stale.packageName, version, manifestPath: "" }], [...advisories]).length > 0;
-    if (affectedAt(stale.bomVersion) && !affectedAt(stale.version)) protectedPins.set(stale.packageName, stale);
+    if (
+      isVersionAffectedByAdvisories(stale.packageName, stale.bomVersion, "maven", advisories) &&
+      !isVersionAffectedByAdvisories(stale.packageName, stale.version, "maven", advisories)
+    ) {
+      protectedPins.set(stale.packageName, stale);
+    }
   }
   return protectedPins;
 }

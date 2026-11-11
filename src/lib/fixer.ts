@@ -152,6 +152,7 @@ export const COVERSIONED_FAMILIES: ReadonlyArray<{ name: string; prefixes: reado
   { name: "netty", prefixes: ["io.netty"] },
   { name: "vertx", prefixes: ["io.vertx"] },
   { name: "jackson", prefixes: ["com.fasterxml.jackson"] },
+  { name: "jaxb", prefixes: ["org.glassfish.jaxb"] },
 ];
 
 /** Family for a package (Maven "group:artifact"; subgroups match via dot boundary); longest prefix wins. */

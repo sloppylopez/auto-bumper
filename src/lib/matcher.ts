@@ -180,6 +180,16 @@ export function isVersionAffected(packageName: string, version: string, ecosyste
   return checkAffected(packageName, version, ecosystem, entry).isAffected;
 }
 
+/** True when `version` of the package is affected by any entry in `advisories`. */
+export function isVersionAffectedByAdvisories(
+  packageName: string,
+  version: string,
+  ecosystem: string,
+  advisories: readonly AdvisoryEntry[],
+): boolean {
+  return matchVulnerabilities([{ ecosystem, name: packageName, version, manifestPath: "" }], [...advisories]).length > 0;
+}
+
 /** True when the entry carries at least one affected block for `packageName` in this ecosystem (any window or version list). */
 export function entryAffectsPackage(entry: AdvisoryEntry, packageName: string, ecosystem: string): boolean {
   const eco = ecosystem.toLowerCase();
@@ -227,8 +237,17 @@ function tryRanges(version: string, affected: { ranges?: Array<{ type?: string; 
 function tryEventRange(version: string, range: { type?: string; events?: unknown[]; database_specific?: { extracted_events?: unknown[] } }, eco: string): AffectedResult {
   if (!range.events || !(range.type === "ECOSYSTEM" || range.type === "GIT")) return { isAffected: false };
   const extracted = range.database_specific?.extracted_events;
-  const eventsToUse = extracted && extracted.length > 0 ? extracted : range.events;
-  return matchesEcosystemEvents(version, eventsToUse as EcoEvent[], eco);
+  let eventsToUse = (extracted && extracted.length > 0 ? extracted : range.events) as EcoEvent[];
+  // ECOSYSTEM ranges must carry real versions. Bad Snyk/OSV data sometimes puts git hashes in
+  // `fixed`/`introduced`; left in, a hash terminator corrupts the segment window and hides true
+  // positives. (GIT ranges legitimately use commit hashes — untouched.)
+  if (range.type === "ECOSYSTEM") {
+    eventsToUse = eventsToUse.filter(ev =>
+      [ev.introduced, ev.fixed, ev.last_affected, ev.latest, ev.deprecated]
+        .every(v => v === undefined || v === "" || isVersionLike(v)),
+    );
+  }
+  return matchesEcosystemEvents(version, eventsToUse, eco);
 }
 
 /** Match against representation-level ranges (semver, pep440, maven) */
@@ -846,7 +865,9 @@ function extractSeverity(entry: any): Finding["severity"] {
 function isVersionLike(value: string): boolean {
   const v = value.trim();
   if (!/^\d/.test(v)) return false;
-  if (/^[\da-f]{8,}$/i.test(v)) return false;
+  // Git hashes are hex and real ones contain letters. An all-digit 8+ char "hash" is a
+  // date-style version (org.json's 20150729 / 20260719) — it must be kept.
+  if (/^[\da-f]{8,}$/i.test(v) && /[a-f]/i.test(v)) return false;
   return true;
 }
 

@@ -13,25 +13,27 @@ import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
 import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
-import { buildFixPlan, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
+import { buildFixPlan, familyOf, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
 import { findLatestAvailableVersion, findNextAvailableVersion, isPreReleaseOrSnapshot, listAvailableVersions, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
 import { computeProtectedPins, fetchBomManagedVersions } from "../src/lib/bom-managed.ts";
-import { compareMavenVersion, isVersionAffected, matchVulnerabilities } from "../src/lib/matcher.ts";
+import { compareMavenVersion, isVersionAffected, isVersionAffectedByAdvisories, matchVulnerabilities } from "../src/lib/matcher.ts";
 import {
   applyBumps as applyGradleBumps,
   applyRenames as applyGradleRenames,
   backupBuildGradle,
   detectGradlePlatform,
   discardBackup as discardGradleBackup,
+  findShadowedManagedPins,
   findStaleManagedPins,
+  parseUserForces,
   removeManagedPin as removeGradleManagedPin,
   restoreBuildGradle,
   restoreDeclaredVersion as restoreGradleDeclaredVersion,
 } from "../src/lib/gradle-editor.ts";
-import type { GradlePlatform, RenameRequest, StaleManagedPin } from "../src/lib/gradle-editor.ts";
+import type { GradlePlatform, RenameRequest, ShadowedManagedPin, StaleManagedPin } from "../src/lib/gradle-editor.ts";
 import {
   applyBumps as applyMavenBumps,
   applyRenames as applyMavenRenames,
@@ -767,14 +769,29 @@ async function loadBomManagedMaps(projects: ProjectInfo[]): Promise<Map<string, 
 }
 
 /** Per-project protected pins: stale managed pins whose removal would reintroduce a known vulnerability. */
-function computeProtectedPinsByProject(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>, advisories: readonly AdvisoryEntry[]): Map<string, Map<string, StaleManagedPin>> {
+export function computeProtectedPinsByProject(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>, advisories: readonly AdvisoryEntry[]): Map<string, Map<string, StaleManagedPin>> {
   const out = new Map<string, Map<string, StaleManagedPin>>();
   for (const p of projects) {
     if (p.kind !== "gradle") continue;
     const map = bomMaps.get(p.manifestPath);
     if (!map) continue;
     try {
-      const pins = computeProtectedPins(fs.readFileSync(p.manifestPath, "utf-8"), map, advisories);
+      const content = fs.readFileSync(p.manifestPath, "utf-8");
+      let pins = computeProtectedPins(content, map, advisories);
+      // A pin the project's own force already covers at or above is normally not protected: the
+      // user's explicit decision wins, and keeping our escape pin would split the co-versioned
+      // family. Exception: when the user-forced version is itself affected — then our pin (last
+      // resolutionStrategy.force wins) is what keeps the tree clean, and dropping it would
+      // reintroduce the vulnerability.
+      const shadowed = findShadowedManagedPins(content);
+      if (shadowed.length > 0) {
+        pins = new Map(
+          [...pins].filter(([pkg]) => {
+            const sh = shadowed.find(s => s.packageName === pkg);
+            return !sh || isVersionAffectedByAdvisories(pkg, sh.userVersion, "maven", advisories);
+          }),
+        );
+      }
       if (pins.size > 0) out.set(p.manifestPath, pins);
     } catch {
       // Unreadable build file — skip.
@@ -789,54 +806,69 @@ function protectedNames(protectedByProject: ReadonlyMap<string, ReadonlyMap<stri
   return pins ? new Set(pins.keys()) : undefined;
 }
 
-/** True when the project's managed block has pins that the BOM now manages at or above (and are not vulnerability escapes). */
+/** True when the managed block has pins to clean up: BOM-stale (not vulnerability escapes) or shadowed by the project's own force. */
 function bomPinCleanupNeeded(project: ProjectInfo, bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): boolean {
   if (project.kind !== "gradle") return false;
-  const map = bomMaps.get(project.manifestPath);
-  if (!map) return false;
   try {
-    return findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map, protectedNames(protectedByProject, project)).length > 0;
+    const content = fs.readFileSync(project.manifestPath, "utf-8");
+    const map = bomMaps.get(project.manifestPath);
+    const prot = protectedNames(protectedByProject, project);
+    if (map && findStaleManagedPins(content, map, prot).length > 0) return true;
+    return findShadowedManagedPins(content).some(s => !prot?.has(s.packageName));
   } catch {
     return false;
   }
 }
 
 /**
- * Drop managed pins that the platform BOM now manages at or above (they only force older versions).
- * Runs on clean exits and nothing-approved breaks too, so a stale block gets cleaned up eventually.
+ * Drop managed pins that the platform BOM now manages at or above (they only force older versions),
+ * and pins the project's own resolutionStrategy.force already covers (they would silently shadow an
+ * explicit decision). Runs on clean exits and nothing-approved breaks too, so a stale block gets
+ * cleaned up eventually. Returns true when it rewrote a manifest.
  */
-async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): Promise<void> {
-  if (outputFormat === "json") return; // machine output stays pure
-  const details: Array<{ project: ProjectInfo; stale: StaleManagedPin[] }> = [];
+async function cleanupStaleBomPins(projects: ProjectInfo[], bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): Promise<boolean> {
+  if (outputFormat === "json") return false; // machine output stays pure
+  const details: Array<{ project: ProjectInfo; stale: StaleManagedPin[]; shadowed: ShadowedManagedPin[] }> = [];
   for (const project of projects) {
     if (project.kind !== "gradle") continue;
-    const map = bomMaps.get(project.manifestPath);
-    if (!map) continue;
     try {
-      const stale = findStaleManagedPins(fs.readFileSync(project.manifestPath, "utf-8"), map, protectedNames(protectedByProject, project));
-      if (stale.length > 0) details.push({ project, stale });
+      const content = fs.readFileSync(project.manifestPath, "utf-8");
+      const map = bomMaps.get(project.manifestPath);
+      // Protected pins (vulnerability escapes) are never dropped as shadowed: the project's own
+      // force is itself affected, so our pin — last resolutionStrategy.force wins — keeps it clean.
+      const prot = protectedNames(protectedByProject, project);
+      const shadowed = findShadowedManagedPins(content).filter(s => !prot?.has(s.packageName));
+      const shadowedNames = new Set(shadowed.map(s => s.packageName));
+      const stale = (map ? findStaleManagedPins(content, map, prot) : []).filter(s => !shadowedNames.has(s.packageName));
+      if (stale.length > 0 || shadowed.length > 0) details.push({ project, stale, shadowed });
     } catch {
       // Unreadable build file — skip.
     }
   }
-  if (details.length === 0) return;
-  const list = details.flatMap(d => d.stale.map(s => `${s.packageName}@${s.version}`)).join(", ");
+  if (details.length === 0) return false;
+  const list = details.flatMap(d => [
+    ...d.stale.map(s => `${s.packageName}@${s.version} (BOM manages ${s.bomVersion})`),
+    ...d.shadowed.map(s => `${s.packageName}@${s.version} (project force already pins ${s.userVersion})`),
+  ]).join(", ");
   if (dryRun || (!applyFlag && !isTTY)) {
     console.log(`  ~ stale pin(s): ${list} — run with --apply to drop`);
-    return;
+    return false;
   }
-  const proceed = applyFlag || await ask(`Drop ${details.reduce((n, d) => n + d.stale.length, 0)} stale managed pin(s)? [y/N] `);
-  if (!proceed) return;
+  const proceed = applyFlag || await ask(`Drop ${details.reduce((n, d) => n + d.stale.length + d.shadowed.length, 0)} stale managed pin(s)? [y/N] `);
+  if (!proceed) return false;
+  let changed = false;
   for (const { project } of details) {
     try {
       backupBuildGradle(project.manifestPath);
-      const result = applyGradleBumps(project.manifestPath, [], [], bomMaps.get(project.manifestPath)!, protectedNames(protectedByProject, project));
+      const result = applyGradleBumps(project.manifestPath, [], [], bomMaps.get(project.manifestPath) ?? null, protectedNames(protectedByProject, project));
       for (const w of result.warnings) console.log(`  [${project.label}] ${w}`);
       discardGradleBackup(project.manifestPath);
+      changed = true;
     } catch {
       restoreBuildGradle(project.manifestPath);
     }
   }
+  return changed;
 }
 function renamesForSourceMigrations(renames: FixCandidate[]): Array<{
   packageName: string;
@@ -1260,12 +1292,75 @@ async function promoteLastAffectedFixes(
   plan.unfixable = still;
 }
 
+/**
+ * Co-versioned-family gate for cross-major downgrades. A downgrade that moves a family member to
+ * another major line splits the family unless every classpath sibling moves with it. A sibling
+ * pinned by the project's own resolutionStrategy.force on another line makes the move unsafe —
+ * refuse. The candidate's own such pin is respected only when the pinned version is not affected:
+ * a managed force written after the project's forces wins (last-wins in Gradle), so a pin to an
+ * affected version does not make the split permanent — that is the escape-pin case, and only the
+ * candidate moves (siblings stay on their line; no advisory requires moving them). Otherwise each
+ * sibling is pulled along to the newest safe GA release on the target line, preferring the
+ * primary's exact version when published for that artifact.
+ */
+export async function downgradeFamilyGate(
+  familyName: string,
+  candidate: FixCandidate,
+  targetVersion: string,
+  classpath: ReadonlyArray<{ packageName: string; installedVersion: string; ecosystem: string }>,
+  manifestPath: string,
+  advisories: AdvisoryEntry[],
+  versionsFor: (packageName: string) => Promise<string[] | null>,
+): Promise<{ refuse: string } | { pullAlong: FixCandidate[]; note?: string }> {
+  const targetMajor = majorOf(targetVersion);
+  let userForces: Map<string, string> | undefined;
+  const loadUserForces = (): Map<string, string> => {
+    if (!userForces) userForces = parseUserForces(fs.readFileSync(manifestPath, "utf-8"));
+    return userForces;
+  };
+  const selfPin = loadUserForces().get(candidate.packageName);
+  if (selfPin !== undefined && majorOf(selfPin) !== targetMajor) {
+    if (!isVersionAffectedByAdvisories(candidate.packageName, selfPin, "maven", advisories)) {
+      return { refuse: `the project pins ${candidate.packageName} itself via its own resolutionStrategy.force at ${selfPin}` };
+    }
+    return { pullAlong: [], note: `escape pin: overriding the project's own force at ${selfPin} (last resolutionStrategy.force wins; the pinned version is affected)` };
+  }
+  const pullAlong: FixCandidate[] = [];
+  const siblings = classpath.filter(
+    p => p.ecosystem === "maven" && p.packageName !== candidate.packageName && familyOf(p.packageName)?.name === familyName && majorOf(p.installedVersion) !== targetMajor,
+  );
+  for (const sib of siblings) {
+    const pin = loadUserForces().get(sib.packageName);
+    if (pin !== undefined && majorOf(pin) !== targetMajor) {
+      return { refuse: `sibling ${sib.packageName} is pinned by the project's own resolutionStrategy.force at ${pin}` };
+    }
+    const versions = await versionsFor(sib.packageName);
+    if (!versions) return { refuse: `cannot verify published releases for sibling ${sib.packageName}` };
+    const unsafe = isUnsafeFor(advisories, { ...candidate, packageName: sib.packageName }, "maven");
+    const line = versions.filter(v => majorOf(v) === targetMajor && !isPreReleaseOrSnapshot(v) && !unsafe(v));
+    if (line.length === 0) return { refuse: `no safe ${targetMajor}.x release exists for sibling ${sib.packageName}` };
+    const chosen = line.find(v => compareMavenVersion(v, targetVersion) === 0) ?? line.reduce((a, b) => (compareMavenVersion(a, b) >= 0 ? a : b));
+    pullAlong.push({
+      packageName: sib.packageName,
+      installedVersion: sib.installedVersion,
+      targetVersion: chosen,
+      isMajor: true,
+      findingIds: candidate.findingIds,
+      severity: candidate.severity,
+      ecosystem: "maven",
+      isDowngrade: true,
+    });
+  }
+  return { pullAlong };
+}
+
 /** When OSV has no forward fix, a published GA release below the installed one that escapes every affected window fixes the finding. */
 async function promoteDowngradeFixes(
   plan: FixPlan,
   projects: ProjectInfo[],
   advisories: AdvisoryEntry[],
   versionsFor: (packageName: string) => Promise<string[] | null>,
+  classpath: ReadonlyArray<{ packageName: string; installedVersion: string; ecosystem: string }>,
 ): Promise<void> {
   const project = projects.find(isMavenLike);
   if (!project || offlineFlag) return;
@@ -1288,11 +1383,26 @@ async function promoteDowngradeFixes(
       still.push(candidate);
       continue;
     }
+    // Co-versioned-family gate: a cross-major downgrade must not leave family siblings on the old line.
+    let pullAlong: FixCandidate[] = [];
+    const fam = familyOf(candidate.packageName);
+    if (fam && majorOf(promoted.targetVersion!) !== majorOf(candidate.installedVersion)) {
+      const gate = await downgradeFamilyGate(fam.name, candidate, promoted.targetVersion!, classpath, project.manifestPath, advisories, versionsFor);
+      if ("refuse" in gate) {
+        console.log(`  ~ ${candidate.packageName}: no forward fix; downgrade to ${promoted.targetVersion} refused — ${gate.refuse}`);
+        still.push({ ...candidate, familyClamped: `downgrade to ${promoted.targetVersion!} would split family '${fam.name}': ${gate.refuse}` });
+        continue;
+      }
+      pullAlong = gate.pullAlong;
+      if (gate.note) console.log(`  ~ ${candidate.packageName}: ${gate.note}`);
+    }
     if (allowDowngrades) {
       console.log(`  ~ ${candidate.packageName}: no forward fix; downgrading to ${promoted.targetVersion} (escapes all affected windows)${promoted.isMajor ? ` — crosses major boundary, gated by --allow-major` : ""}`);
-      plan.downgrades.push(promoted);
+      plan.downgrades.push(promoted, ...pullAlong);
+      for (const sib of pullAlong) console.log(`  ~ ${sib.packageName}: moved with ${candidate.packageName} downgrade — ${sib.installedVersion} -> ${sib.targetVersion}`);
     } else {
-      console.log(`  ~ ${candidate.packageName}: no forward fix; safe downgrade target ${promoted.targetVersion} available (escapes all affected windows) — pass --allow-downgrades to apply it`);
+      const siblings = pullAlong.length > 0 ? `; would also move ${pullAlong.map(s => `${s.packageName} ${s.installedVersion} -> ${s.targetVersion}`).join(", ")}` : "";
+      console.log(`  ~ ${candidate.packageName}: no forward fix; safe downgrade target ${promoted.targetVersion} available (escapes all affected windows)${siblings} — pass --allow-downgrades to apply it`);
       still.push({ ...candidate, downgradeTarget: promoted.targetVersion! });
     }
   }
@@ -1541,7 +1651,7 @@ async function buildPassPlan(ctx: FixLoopContext, scan: ScanPassResult, latestCa
     return pending;
   };
   await promoteLastAffectedFixes(plan, ctx.projects, advisories, versionsFor);
-  await promoteDowngradeFixes(plan, ctx.projects, advisories, versionsFor);
+  await promoteDowngradeFixes(plan, ctx.projects, advisories, versionsFor, classpath);
   ctx.lastFamilyMigrations = await applyFamilyMigrations(plan, ctx.projects, advisories, versionsFor, classpath, scan.findings, scan.packages);
   plan.renames = expandRenameBundle(plan.renames, scan.packages);
   if (latestFlag && latestCandidates.length > 0) mergeLatestCandidates(plan.fixable, latestCandidates);
@@ -2168,16 +2278,23 @@ async function main() {
         for (const [pkg, st] of pins) console.log(`  ~ keeping pin ${pkg}@${st.version} — BOM-managed ${st.bomVersion} is still vulnerable; dropping it would reintroduce the finding`);
       }
     }
-    await cleanupStaleBomPins(projects, bomMaps, protectedByProject);
+    const cleanedStalePins = await cleanupStaleBomPins(projects, bomMaps, protectedByProject);
 
-    if (scan.findings.length === 0 && (!latestFlag || latestCandidates.length === 0)) reportCleanExit(ctx);
+    // A pin dropped this iteration can expose a finding the pre-cleanup scan did not see — rescan first.
+    if (scan.findings.length === 0 && !cleanedStalePins && (!latestFlag || latestCandidates.length === 0)) reportCleanExit(ctx);
 
     const currentSig = findingSignature(scan.findings);
     ctx.findingCountHistory.push(scan.findings.length);
     if (loopStopped(ctx, scan.findings.length, currentSig, true)) break;
 
     const pass = await buildPassPlan(ctx, scan, latestCandidates);
-    if (pass.effectiveApproved.length === 0 && pass.effectiveRenames.length === 0 && pass.effectiveExcludes.length === 0 && handleNothingApproved(ctx, pass, scan.findings.length)) break;
+    const nothingToApply = pass.effectiveApproved.length === 0 && pass.effectiveRenames.length === 0 && pass.effectiveExcludes.length === 0;
+    if (nothingToApply) {
+      // Pin cleanup rewrote a manifest this iteration — the scan predates it, so rescan once for a
+      // report that reflects the new resolution instead of exiting on stale findings.
+      if (cleanedStalePins) continue;
+      if (handleNothingApproved(ctx, pass, scan.findings.length)) break;
+    }
 
     const currentPlanSig = planSignature(pass.effectiveApproved, pass.effectiveRenames);
     if (loopStopped(ctx, scan.findings.length, currentSig, false, currentPlanSig, ctx.prevPlanSig)) break;

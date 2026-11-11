@@ -327,6 +327,36 @@ describe("matchVulnerabilities", () => {
     expect(findings[0].fixedVersions).toContain("3.1.4");
   });
 
+  it("keeps all-digit date-style fixed versions (org.json) but still drops real hex hashes", () => {
+    const packages = [{
+      ecosystem: "maven",
+      name: "org.json:json",
+      version: "20240303",
+      manifestPath: "build.gradle",
+    }];
+    const osvData = [{
+      id: "SNYK-JAVA-ORGJSON-1234567",
+      aliases: ["CVE-2026-1234"],
+      ecosystems: ["Maven"],
+      affected: [{
+        package: { name: "org.json:json", ecosystem: "Maven" },
+        ranges: [{
+          type: "ECOSYSTEM",
+          events: [
+            { introduced: "0" },
+            { fixed: "20260719" },
+            // A genuine git hash (hex with letters) must still be rejected as a version.
+            { fixed: "a1b2c3d4e5f6" },
+          ],
+        }],
+      }],
+    }];
+    const findings = matchVulnerabilities(packages, osvData);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].fixedVersions).toContain("20260719");
+    expect(findings[0].fixedVersions).not.toContain("a1b2c3d4e5f6");
+  });
+
   it("collects fixed versions only from matching affected package", () => {
     const packages = [{
       ecosystem: "maven",
