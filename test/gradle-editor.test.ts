@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps, applyRenames, detectGradlePlatform, findShadowedManagedPins, findStaleManagedPins, hasEnforcedPlatform, parseUserForces, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
+import { applyBumps, applyRenames, detectGradlePlatform, findShadowedManagedPins, findStaleManagedPins, hasEnforcedPlatform, hasSpringDependencyManagement, parseUserForces, predictAlignedChecks, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
@@ -1194,7 +1194,7 @@ describe("applyBumps Spring dependency management", () => {
     });
   });
 
-  it("still skips cross-minor fixes with same-line siblings on non-Spring-DM projects", () => {
+  it("aligns the whole classpath family on non-Spring-DM projects too (managed pins + forces, no dependencyManagement block)", () => {
     const build = [
       "plugins {",
       "    id 'java'",
@@ -1215,10 +1215,91 @@ describe("applyBumps Spring dependency management", () => {
         because: ["GHSA-test"],
         installedVersion: "2.25.5",
       }], [], null, undefined, classpath);
-      expect(result.constrained).not.toContain("org.apache.logging.log4j:log4j-api");
-      expect(readGradle(filePath)).not.toContain("log4j-api");
-      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-api");
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-to-slf4j");
+      const content = readGradle(filePath);
+      // No dependencyManagement extension on this build — alignment rides on managed pins + forces.
+      expect(content).not.toContain("dependencyManagement {");
+      expect(content).toContain("org.apache.logging.log4j:log4j-to-slf4j:2.26.1");
+      expect(result.warnings.some(w => w.includes("aligned the whole family"))).toBe(true);
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
     });
+  });
+
+  it("skips an aligned family member whose target version is not published (predicate gate)", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "}",
+    ].join("\n");
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-api", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+    ];
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.logging.log4j:log4j-api",
+        targetVersion: "2.26.1",
+        because: ["GHSA-test"],
+        installedVersion: "2.25.5",
+      }], [], null, undefined, classpath, name => (name === "org.apache.logging.log4j:log4j-to-slf4j" ? false : true));
+      // The anchor is pinned; the unpublished member stays at its current version.
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-api");
+      expect(result.constrained).not.toContain("org.apache.logging.log4j:log4j-to-slf4j");
+      const content = readGradle(filePath);
+      expect(content).toContain("org.apache.logging.log4j:log4j-api:2.26.1");
+      expect(content).not.toContain("log4j-to-slf4j");
+      expect(result.warnings.some(w => w.includes("log4j-to-slf4j") && w.includes("not published"))).toBe(true);
+    });
+  });
+
+  it("does not render dependencyManagement when only the Spring Boot plugin is applied", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "    id 'org.springframework.boot' version '3.2.5'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "}",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      }], [], null, undefined, [{ name: "net.minidev:json-smart", version: "2.6.0" }]);
+      const content = readGradle(filePath);
+      // The Boot plugin does not provide the dependencyManagement extension — a block here breaks the build.
+      expect(content).not.toContain("dependencyManagement {");
+      expect(result.constrained).toContain("net.minidev:json-smart");
+      expect(content).toContain("net.minidev:json-smart:2.6.1");
+    });
+  });
+
+  it("detects the Spring dependency-management plugin only when explicitly applied", () => {
+    expect(hasSpringDependencyManagement("plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}")).toBe(false);
+    expect(hasSpringDependencyManagement("plugins {\n    id 'io.spring.dependency-management'\n}")).toBe(true);
+    expect(hasSpringDependencyManagement("apply plugin: 'org.springframework.boot'")).toBe(false);
+  });
+
+  it("predicts the superset of family-alignment checks before applying", () => {
+    const bumps = [{ packageName: "org.apache.logging.log4j:log4j-api", targetVersion: "2.26.1", because: ["GHSA-test"], installedVersion: "2.25.5" }];
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-core", version: "2.26.1" },
+      { name: "com.google.guava:guava", version: "33.0.0-jre" },
+    ];
+    expect(predictAlignedChecks(bumps, classpath)).toEqual([
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.26.1" },
+    ]);
+    expect(predictAlignedChecks(bumps, null)).toEqual([]);
   });
 
   it("does not render dependencyManagement for a bare boot-starter dependency (no extension applied)", () => {

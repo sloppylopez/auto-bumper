@@ -1082,20 +1082,17 @@ export function hasEnforcedPlatform(content: string): boolean {
 }
 
 /**
- * True when the project applies the Spring dependency-management extension (directly or via
- * the Spring Boot plugin), so `dependencyManagement { dependencies { ... } }` pins are valid
- * DSL and outrank BOM imports. Strictly plugin-shaped matches: a bare
- * `org.springframework.boot:spring-boot-starter-*` DEPENDENCY does not count — rendering a
- * dependencyManagement block without the extension would break the build. The managed block
- * we render is excluded from the probe so re-runs don't self-trigger.
+ * True when the project explicitly applies the Spring dependency-management plugin, so
+ * `dependencyManagement { dependencies { ... } }` pins are valid DSL and outrank BOM imports.
+ * ONLY the explicit `io.spring.dependency-management` plugin counts: the Spring Boot plugin
+ * (`org.springframework.boot`) does NOT provide the extension — a Boot-only build has no
+ * `dependencyManagement` method, and rendering one breaks configuration evaluation. The
+ * managed block we render is excluded from the probe so re-runs don't self-trigger.
  */
 export function hasSpringDependencyManagement(content: string): boolean {
   const mb = findManagedBlock(content);
   const probe = mb ? content.slice(0, mb.begin) + content.slice(mb.end + mb.endLen) : content;
-  return /io\.spring\.dependency-management/.test(probe)
-    || /id\s*\(?\s*["']org\.springframework\.boot["']/.test(probe)
-    || /apply\s+plugin\s*:\s*["']org\.springframework\.boot["']/.test(probe)
-    || /org\.springframework\.boot:spring-boot-gradle-plugin/.test(probe);
+  return /io\.spring\.dependency-management/.test(probe);
 }
 
 /** A BOM/platform whose coordinate and version could be resolved from the build file. */
@@ -1381,8 +1378,11 @@ function applyCatalogBumps(buildFile: string, bumps: BumpRequest[]): string[] {
  * force a downgrade against the BOM are skipped — except pins in `protectedPins`, whose
  * removal would reintroduce a vulnerability the BOM-managed version still carries. Managed pins
  * the project's own resolutionStrategy.force already covers at or above are always removed (the
- * managed block sits last, so such a pin would silently override an explicit decision) — even when
- * protected, because the user's explicit force wins over our escape pin.
+ * the managed block sits last, so such a pin would silently override an explicit decision) — even when
+ * protected, because the user's explicit force wins over our escape pin. `classpathPackages` (the
+ * resolved classpath) enables cross-minor family expansion; `alignedMemberOk(name, version)` gates
+ * each aligned member: false = skip that member (e.g. its target is unpublished in the project's
+ * repositories), true/null = allow.
  */
 export function applyBumps(
   filePath: string,
@@ -1391,6 +1391,7 @@ export function applyBumps(
   bomManaged: ReadonlyMap<string, string> | null = null,
   protectedPins?: ReadonlySet<string>,
   classpathPackages?: readonly { name: string; version: string }[],
+  alignedMemberOk?: (packageName: string, version: string) => boolean | null,
 ): ApplyResult {
   const result: ApplyResult = { direct: [], constrained: [], excluded: [], forced: [], warnings: [] };
 
@@ -1418,7 +1419,7 @@ export function applyBumps(
     remainingBumps = routePlatformBumps(platform, filePath, content, remainingBumps, result, appliedTargets);
   }
   if (enforced) {
-    remainingBumps = skipCrossMinorBomBumps(content, remainingBumps, result, platform, bomManaged, springDm, classpathPackages ?? null);
+    remainingBumps = skipCrossMinorBomBumps(content, remainingBumps, result, platform, bomManaged, classpathPackages ?? null, alignedMemberOk);
   }
   if (bomManaged) {
     remainingBumps = filterBomCoveredBumps(remainingBumps, bomManaged, platform, result);
@@ -1611,12 +1612,14 @@ function routePlatformBumps(
  * at that line count) over the BOM-managed map; without either, the risk cannot be ruled out and
  * the candidate is skipped conservatively.
  *
- * On Spring dependency-management projects a cross-line fix with real siblings is not skipped but
- * EXPANDED: every classpath member of the family below the highest fix target gets a pin at that
- * target, so the whole family moves together (the dependencyManagement rule keeps them in sync).
- * Families whose siblings are versioned independently (e.g. guava: failureaccess 1.0.x,
- * listenablefuture 9999.0) have no shared line to desynchronize — their cross-line fixes are
- * pinned normally.
+ * A cross-line fix with real siblings is not skipped but EXPANDED: every classpath member of the
+ * family below the highest fix target gets a pin at that target, so the whole family moves
+ * together (via managed pins/forces, plus dependencyManagement entries on Spring DM projects).
+ * Members whose target version is not published in the project's repositories are left at their
+ * current version — `alignedMemberOk` answers false for them (null = unknown, allowed
+ * best-effort); without the predicate the expansion assumes every target exists. Families whose
+ * siblings are versioned independently (e.g. guava: failureaccess 1.0.x, listenablefuture 9999.0)
+ * have no shared line to desynchronize — their cross-line fixes are pinned normally.
  */
 function skipCrossMinorBomBumps(
   content: string,
@@ -1624,8 +1627,8 @@ function skipCrossMinorBomBumps(
   result: ApplyResult,
   platform: GradlePlatform | null,
   bomManaged: ReadonlyMap<string, string> | null,
-  springDm: boolean,
   classpathPackages: readonly { name: string; version: string }[] | null,
+  alignedMemberOk?: (packageName: string, version: string) => boolean | null,
 ): BumpRequest[] {
   const kept: BumpRequest[] = [];
   const alignedGroups = new Set<string>();
@@ -1648,19 +1651,25 @@ function skipCrossMinorBomBumps(
       ? hasLineSibling(b.packageName, b.installedVersion, bomManaged)
       : lineSiblings.length > 0;
     if (!hasSibling) { kept.push(b); continue; }
-    if (springDm && alignedGroups.has(group)) { kept.push(b); continue; } // family already expanded below its first candidate
+    if (alignedGroups.has(group)) { kept.push(b); continue; } // family already expanded below its first candidate
     // Expansion needs classpath ground truth to know which members to align; without it, skip conservatively.
-    if (springDm && classpathPackages) {
+    if (classpathPackages) {
       alignedGroups.add(group);
       const maxTarget = familyMaxTarget(bumps, group, b.targetVersion);
       const added: BumpRequest[] = [];
       for (const p of classpathPackages ?? []) {
         if (p.name === b.packageName || !sameGroupFamily(p.name.split(":")[0] ?? "", group)) continue;
         if (compareMavenVersion(p.version, maxTarget) >= 0) continue;
+        if (alignedMemberOk?.(p.name, maxTarget) === false) {
+          result.warnings.push(
+            `${p.name}: family alignment to ${maxTarget} skipped — version not published in the project's repositories`,
+          );
+          continue;
+        }
         added.push({ packageName: p.name, targetVersion: maxTarget, because: [`family alignment with ${b.packageName}`], installedVersion: p.version });
       }
       result.warnings.push(
-        `${group}: cross-minor fix ${b.installedVersion} → ${maxTarget} — aligned the whole family on the classpath to ${maxTarget} (${[b.packageName, ...added.map(a => a.packageName)].join(", ")}) via dependency management`,
+        `${group}: cross-minor fix ${b.installedVersion} → ${maxTarget} — aligned the whole family on the classpath to ${maxTarget} (${[b.packageName, ...added.map(a => a.packageName)].join(", ")}) via managed pins`,
       );
       kept.push(b, ...added);
       continue;
@@ -1681,6 +1690,35 @@ function familyMaxTarget(bumps: BumpRequest[], group: string, floor: string): st
     if (compareMavenVersion(b.targetVersion, max) > 0) max = b.targetVersion;
   }
   return max;
+}
+
+/**
+ * Superset of the (member, target) pairs that cross-minor family expansion may check when
+ * applying `bumps` against `classpathPackages`: for every non-downgrade bump, the family
+ * members below the batch's highest fix target for that group. Callers pre-check these versions
+ * against the project's repositories and pass the answers back as an `alignedMemberOk`
+ * predicate. The superset can exceed what expansion actually aligns (trigger conditions are
+ * evaluated inside applyBumps), which only costs extra metadata lookups — never a wrong pin.
+ */
+export function predictAlignedChecks(
+  bumps: BumpRequest[],
+  classpathPackages: readonly { name: string; version: string }[] | null,
+): { name: string; version: string }[] {
+  if (!classpathPackages) return [];
+  const out = new Map<string, { name: string; version: string }>();
+  for (const b of bumps) {
+    if (b.isDowngrade) continue;
+    const group = b.packageName.split(":")[0] ?? "";
+    if (group === "") continue;
+    const maxTarget = familyMaxTarget(bumps, group, b.targetVersion);
+    for (const p of classpathPackages) {
+      if (p.name === b.packageName || !sameGroupFamily(p.name.split(":")[0] ?? "", group)) continue;
+      if (compareMavenVersion(p.version, maxTarget) >= 0) continue;
+      const key = `${p.name.toLowerCase()}@${maxTarget.toLowerCase()}`;
+      out.set(key, { name: p.name, version: maxTarget });
+    }
+  }
+  return [...out.values()];
 }
 
 /**

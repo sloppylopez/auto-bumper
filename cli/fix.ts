@@ -29,6 +29,7 @@ import {
   findShadowedManagedPins,
   findStaleManagedPins,
   parseUserForces,
+  predictAlignedChecks,
   removeManagedPin as removeGradleManagedPin,
   restoreBuildGradle,
   restoreDeclaredVersion as restoreGradleDeclaredVersion,
@@ -84,6 +85,7 @@ import {
   discardSourceMigrationBackups,
   restoreSourceMigrationBackups,
 } from "../src/lib/source-migrations.ts";
+import { findJavaImportUsages } from "../src/lib/java-import-editor.ts";
 import { discardStaleBackup, runApplyTransaction } from "../src/lib/backup.ts";
 import type { AdvisoryEntry, Finding, PackageRef } from "../src/lib/types.ts";
 import {
@@ -504,6 +506,16 @@ export async function filterByExcludeGate(
       warnings.push(`Refused to exclude ${c.packageName} (no fix version): required by ${dependents.join(", ")} on the resolved classpath — removing it from all configurations breaks class loading. Exclude it manually in the manifest if you accept the risk, or pass --force-exclude=${c.packageName}.`);
       continue;
     }
+    // Source-import guard: excluding an artifact whose packages the code imports directly breaks compilation
+    // (the requiredBy graph does not see direct source usage). Over-rejection is safe — forceExclude overrides.
+    const group = c.packageName.split(":")[0]?.toLowerCase() ?? "";
+    if (group) {
+      const importers = projects.filter(isMavenLike).flatMap(p => findJavaImportUsages(path.dirname(p.manifestPath), group));
+      if (importers.length > 0 && !forceExclude.has(c.packageName.toLowerCase())) {
+        warnings.push(`Refused to exclude ${c.packageName} (no fix version): source code imports ${group}.* (${importers.slice(0, 3).join(", ")}${importers.length > 3 ? ", …" : ""}) — excluding it breaks compilation. Exclude it manually in the manifest if you accept the risk, or pass --force-exclude=${c.packageName}.`);
+        continue;
+      }
+    }
     if (dryRun) continue;
     if (applyExcludes || preApproved.has(c.packageName)) {
       approved.push(c);
@@ -705,9 +717,9 @@ function discardManifestBackup(project: ProjectInfo): void {
   }
 }
 
-function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string; attachTo?: string[] }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>, classpathPackages?: PackageRef[]): BumpApplyResult {
+function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string; attachTo?: string[] }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>, classpathPackages?: PackageRef[], alignedMemberOk?: (packageName: string, version: string) => boolean | null): BumpApplyResult {
   if (project.kind === "maven") return normalizeBumpApplyResult(applyMavenBumps(project.manifestPath, bumps, excludes));
-  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged, protectedPins, classpathPackages));
+  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged, protectedPins, classpathPackages, alignedMemberOk));
   if (project.kind === "npm") return normalizeBumpApplyResult(applyNpmBumps(project.manifestPath, bumps, excludes));
   if (project.kind === "crates.io") return normalizeBumpApplyResult(applyCargoBumps(project.manifestPath, bumps, excludes));
   if (project.manifestPath.endsWith("pyproject.toml")) return normalizeBumpApplyResult(applyToPyprojectToml(project.manifestPath, bumps, excludes));
@@ -1906,11 +1918,11 @@ function recordRenameOutcome(outcome: ProjectApplyOutcome, method: "direct" | "c
 }
 
 /** Apply this project's share of approved bumps and record outcomes by method. */
-function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): void {
+function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>, alignedMemberOk?: (packageName: string, version: string) => boolean | null): void {
   const projectBumps = bumpsForProject(project, batch);
   const hasExcludes = isMavenLike(project) && batch.excludes.length > 0;
   if (projectBumps.length === 0 && !hasExcludes && bomMap === null) return;
-  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap, protectedPins, batch.packages);
+  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap, protectedPins, batch.packages, alignedMemberOk);
   for (const w of applyResult.warnings) console.log(`  [${project.label}] ${w}`);
   // Record applied bumps by method classification (direct + constrained are both written to disk)
   const recorded = new Set<string>();
@@ -1957,11 +1969,34 @@ function applyProjectRenames(project: ProjectInfo, batch: ApplyBatch, ctx: FixLo
 }
 
 /** Apply this project's share of the batch and record applied entries. */
-function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): ProjectApplyOutcome {
+function applyProjectFixes(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>, alignedMemberOk?: (packageName: string, version: string) => boolean | null): ProjectApplyOutcome {
   const outcome: ProjectApplyOutcome = { direct: 0, constrained: 0, fileChanges: 0, renamed: false, excludedWritten: [] };
-  applyProjectBumps(project, batch, ctx, outcome, bomMap, protectedPins);
+  applyProjectBumps(project, batch, ctx, outcome, bomMap, protectedPins, alignedMemberOk);
   applyProjectRenames(project, batch, ctx, outcome);
   return outcome;
+}
+
+/**
+ * Pre-check the targets of cross-minor family expansion against the project's repositories so the
+ * transaction never force-pins a version that does not exist there (e.g. aligning spring-boot 4.x
+ * to 7.0.9). Returns the gradle-editor predicate: false = unpublished (member skipped),
+ * true/null = published or unknown (allowed, best-effort as before); undefined when nothing to check.
+ */
+async function buildAlignedMemberPredicate(
+  manifestPath: string,
+  projectBumps: BumpRequest[],
+  classpathPackages: readonly { name: string; version: string }[] | null,
+): Promise<((packageName: string, version: string) => boolean | null) | undefined> {
+  const checks = predictAlignedChecks(projectBumps, classpathPackages);
+  if (checks.length === 0) return undefined;
+  const answers = new Map<string, boolean | null>();
+  await Promise.all(checks.map(async check => {
+    answers.set(
+      `${check.name.toLowerCase()}@${check.version.toLowerCase()}`,
+      await versionPublishedInRepos(manifestPath, "gradle", check.name, check.version),
+    );
+  }));
+  return (name, version) => answers.get(`${name.toLowerCase()}@${version.toLowerCase()}`) ?? null;
 }
 
 /** Run the source-migration pass after renames landed (returns changed file count). */
@@ -1987,10 +2022,18 @@ function applySourceMigrationPass(ctx: FixLoopContext, effectiveRenames: FixCand
 interface ApplyPassOutcome { passFileChanges: number; totalDirect: number; totalConstrained: number }
 
 /** Transactional apply for one pass: backup touched manifests, apply per project (+ source migrations), restore on failure. */
-function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean, bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): ApplyPassOutcome {
+async function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch: ApplyBatch, applySource: boolean, bomMaps: Map<string, Map<string, string>>, protectedByProject?: ReadonlyMap<string, ReadonlyMap<string, StaleManagedPin>>): Promise<ApplyPassOutcome> {
   const outcome: ApplyPassOutcome = { passFileChanges: 0, totalDirect: 0, totalConstrained: 0 };
   const perOutcomes: ProjectApplyOutcome[] = [];
   let renamesAppliedThisPass = false;
+  // Pre-check family-expansion targets against each Gradle project's repositories BEFORE the
+  // transaction (the apply callback must stay synchronous): unpublished members get skipped.
+  const alignedPredicates = new Map<string, (name: string, version: string) => boolean | null>();
+  for (const project of projectsToTouch) {
+    if (project.kind !== "gradle") continue;
+    const predicate = await buildAlignedMemberPredicate(project.manifestPath, bumpsForProject(project, batch), batch.packages);
+    if (predicate) alignedPredicates.set(project.manifestPath, predicate);
+  }
   const applySpinner = defaultSpinnerFactory(
     maxIterations > 1 ? `Pass ${ctx.iteration}/${maxIterations} · Applying fixes...` : "Applying fixes...",
   ).start();
@@ -2002,7 +2045,7 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
       restore: () => restoreSession(ctx.projects, ctx.allSourceChanged),
       apply: () => {
         for (const project of projectsToTouch) {
-          const per = applyProjectFixes(project, batch, ctx, bomMaps.get(project.manifestPath) ?? null, protectedNames(protectedByProject, project));
+          const per = applyProjectFixes(project, batch, ctx, bomMaps.get(project.manifestPath) ?? null, protectedNames(protectedByProject, project), alignedPredicates.get(project.manifestPath));
           perOutcomes.push(per);
           outcome.passFileChanges += per.fileChanges;
           outcome.totalDirect += per.direct;
@@ -2325,7 +2368,7 @@ async function main() {
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
     const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings, batch.packages).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps, protectedByProject));
-    const applied = runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps, protectedByProject);
+    const applied = await runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps, protectedByProject);
     ctx.lastAppliedCount = applied.passFileChanges;
     if (applied.passFileChanges > 0) {
       refreshLocksAfterApply(ctx, projectsToTouch.map(p => path.dirname(p.manifestPath)));
