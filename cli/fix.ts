@@ -705,9 +705,9 @@ function discardManifestBackup(project: ProjectInfo): void {
   }
 }
 
-function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string; attachTo?: string[] }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>): BumpApplyResult {
+function applyManifestBumps(project: ProjectInfo, bumps: BumpRequest[], excludes: { packageName: string; attachTo?: string[] }[], bomManaged: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>, classpathPackages?: PackageRef[]): BumpApplyResult {
   if (project.kind === "maven") return normalizeBumpApplyResult(applyMavenBumps(project.manifestPath, bumps, excludes));
-  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged, protectedPins));
+  if (project.kind === "gradle") return normalizeBumpApplyResult(applyGradleBumps(project.manifestPath, bumps, excludes, bomManaged, protectedPins, classpathPackages));
   if (project.kind === "npm") return normalizeBumpApplyResult(applyNpmBumps(project.manifestPath, bumps, excludes));
   if (project.kind === "crates.io") return normalizeBumpApplyResult(applyCargoBumps(project.manifestPath, bumps, excludes));
   if (project.manifestPath.endsWith("pyproject.toml")) return normalizeBumpApplyResult(applyToPyprojectToml(project.manifestPath, bumps, excludes));
@@ -1910,12 +1910,30 @@ function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoop
   const projectBumps = bumpsForProject(project, batch);
   const hasExcludes = isMavenLike(project) && batch.excludes.length > 0;
   if (projectBumps.length === 0 && !hasExcludes && bomMap === null) return;
-  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap, protectedPins);
+  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap, protectedPins, batch.packages);
   for (const w of applyResult.warnings) console.log(`  [${project.label}] ${w}`);
   // Record applied bumps by method classification (direct + constrained are both written to disk)
+  const recorded = new Set<string>();
   for (const c of batch.effectiveApproved) {
     const method = bumpApplyMethod(applyResult, c.packageName);
-    if (method === "direct" || method === "constrained") recordBumpOutcome(outcome, method, c, ctx, project, applyResult.appliedTargets?.[c.packageName]);
+    if (method === "direct" || method === "constrained") {
+      recordBumpOutcome(outcome, method, c, ctx, project, applyResult.appliedTargets?.[c.packageName]);
+      recorded.add(c.packageName);
+    }
+  }
+  // Family-alignment siblings expanded by the editor are not approved candidates of their own —
+  // record them so the report and re-run dedupe see the pins that were actually written.
+  for (const pkg of applyResult.constrained) {
+    if (recorded.has(pkg)) continue;
+    const ref = batch.packages.find(p => p.name === pkg);
+    recordBumpOutcome(outcome, "constrained", {
+      packageName: pkg,
+      installedVersion: ref?.version ?? "",
+      targetVersion: applyResult.appliedTargets?.[pkg] ?? null,
+      isMajor: false,
+      findingIds: [],
+      severity: "UNKNOWN",
+    }, ctx, project, applyResult.appliedTargets?.[pkg]);
   }
   // Exclusions: report which were actually written to this manifest; runApplyPass aggregates across projects before recording.
   for (const c of batch.effectiveExcludes) {
@@ -2019,7 +2037,9 @@ function runApplyPass(ctx: FixLoopContext, projectsToTouch: ProjectInfo[], batch
       ? `Applied ${outcome.passFileChanges} file change(s): ${outcome.totalDirect} direct, ${outcome.totalConstrained} constrained.`
       : batch.effectiveExcludes.length > 0 && ctx.excludeFailedCoords.size > 0
         ? "No file changes — approved exclusions could not be written (see warnings)."
-        : `No file changes needed (plan already satisfied).`,
+        : batch.effectiveApproved.length > 0
+          ? "No file changes — planned fixes are already in the manifests but still vulnerable on the classpath; a pin may be overridden by BOM/Spring dependency management (see warnings)."
+          : `No file changes needed (plan already satisfied).`,
   );
   return outcome;
 }

@@ -1022,9 +1022,9 @@ describe("applyBumps stale shadow cleanup", () => {
       expect(result.direct).toContain("com.example:direct");
       const content = readGradle(filePath);
       expect(content).toContain(`force 'com.example:direct:1.2.4'`);
-      // The managed pin (rewritten in place to 1.2.4 like the force line) is shadowed by the user's
-      // own force and removed, not kept twice.
-      expect(result.warnings.some(w => w === "removed stale managed pin com.example:direct@1.2.4 — the project's own resolutionStrategy.force already pins it at 1.2.4")).toBe(true);
+      // The managed pin is not rewritten in place by the direct bump (that would misclassify it as
+      // "direct"); it stays at 1.2.3, is shadowed by the user's own force (now 1.2.4), and removed.
+      expect(result.warnings.some(w => w === "removed stale managed pin com.example:direct@1.2.3 — the project's own resolutionStrategy.force already pins it at 1.2.4")).toBe(true);
       expect(content).not.toContain("com.example:direct:1.2.3");
     });
   });
@@ -1115,6 +1115,204 @@ describe("applyBumps stale shadow cleanup", () => {
       const content = readGradle(filePath);
       expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
       expect(content).toContain(GRADLE_MARKER_BEGIN);
+    });
+  });
+});
+
+describe("applyBumps Spring dependency management", () => {
+  const SPRING_DM_BUILD = [
+    "plugins {",
+    "    id 'java'",
+    "    id 'io.spring.dependency-management'",
+    "}",
+    "",
+    "dependencies {",
+    "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+    "}",
+  ].join("\n");
+
+  it("pins a transitive fix via dependencyManagement (which beats BOM imports and forces) and stays idempotent", () => {
+    const classpath = [{ name: "net.minidev:json-smart", version: "2.6.0" }];
+    withTempGradle(SPRING_DM_BUILD, filePath => {
+      const bump = {
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      };
+      const result = applyBumps(filePath, [bump], [], null, undefined, classpath);
+      expect(result.constrained).toContain("net.minidev:json-smart");
+      let content = readGradle(filePath);
+      expect(content).toContain("dependencyManagement {");
+      expect(content).toContain("dependency 'net.minidev:json-smart:2.6.1'");
+      expect(content).toContain("// SNYK-JAVA-NETMINIDEV-21715438");
+      expect(result.warnings.some(w => w.includes("pinned 1 package(s) via dependencyManagement"))).toBe(true);
+
+      // Re-run: the pin already exists — no duplicate entries or advisory comments.
+      applyBumps(filePath, [bump], [], null, undefined, classpath);
+      content = readGradle(filePath);
+      expect(countOccurrences(content, "dependency 'net.minidev:json-smart")).toBe(1);
+      expect(countOccurrences(content, "// SNYK-JAVA-NETMINIDEV-21715438")).toBe(1);
+      expect(content).toContain("dependency 'net.minidev:json-smart:2.6.1'");
+    });
+  });
+
+  it("aligns the whole classpath family when a cross-minor fix has same-line siblings", () => {
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-api", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+    ];
+    withTempGradle(SPRING_DM_BUILD, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.logging.log4j:log4j-api",
+        targetVersion: "2.26.1",
+        because: ["GHSA-test"],
+        installedVersion: "2.25.5",
+      }], [], null, undefined, classpath);
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-api");
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-to-slf4j");
+      const content = readGradle(filePath);
+      expect(content).toContain("dependency 'org.apache.logging.log4j:log4j-api:2.26.1'");
+      expect(content).toContain("dependency 'org.apache.logging.log4j:log4j-to-slf4j:2.26.1'");
+      expect(result.warnings.some(w => w.includes("aligned the whole family"))).toBe(true);
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("pins a cross-minor fix when the classpath shows no same-line sibling", () => {
+    const classpath = [{ name: "org.ow2.asm:asm", version: "9.7.1" }];
+    withTempGradle(SPRING_DM_BUILD, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.ow2.asm:asm",
+        targetVersion: "9.11",
+        because: ["SNYK-JAVA-ORGOW2ASM-21715452"],
+        installedVersion: "9.7.1",
+      }], [], null, undefined, classpath);
+      expect(result.constrained).toContain("org.ow2.asm:asm");
+      expect(readGradle(filePath)).toContain("dependency 'org.ow2.asm:asm:9.11'");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("still skips cross-minor fixes with same-line siblings on non-Spring-DM projects", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "}",
+    ].join("\n");
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-api", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+    ];
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.logging.log4j:log4j-api",
+        targetVersion: "2.26.1",
+        because: ["GHSA-test"],
+        installedVersion: "2.25.5",
+      }], [], null, undefined, classpath);
+      expect(result.constrained).not.toContain("org.apache.logging.log4j:log4j-api");
+      expect(readGradle(filePath)).not.toContain("log4j-api");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+    });
+  });
+
+  it("does not render dependencyManagement for a bare boot-starter dependency (no extension applied)", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "    implementation 'org.springframework.boot:spring-boot-starter-web:3.4.0'",
+      "}",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      }], [], null, undefined, [{ name: "net.minidev:json-smart", version: "2.6.0" }]);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("dependencyManagement {");
+      expect(result.constrained).toContain("net.minidev:json-smart");
+    });
+  });
+
+  it("credits a dependencyManagement pin written this run even when a managed constraint already sits at the target", () => {
+    // Leftover from an earlier run: the constraints block pins json-smart at the fix version, but
+    // no dependencyManagement pin exists — on Spring DM projects only the DM pin is effective.
+    const build = [
+      SPRING_DM_BUILD,
+      "",
+      "// auto-bumper:begin managed constraints (auto-generated, do not edit)",
+      "dependencies {",
+      "    constraints {",
+      "        implementation('net.minidev:json-smart:2.6.1') { because 'SNYK-JAVA-NETMINIDEV-21715438' }",
+      "    }",
+      "}",
+      "// auto-bumper:end",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      }], [], null, undefined, [{ name: "net.minidev:json-smart", version: "2.6.0" }]);
+      expect(result.constrained).toContain("net.minidev:json-smart");
+      expect(result.appliedTargets?.["net.minidev:json-smart"]).toBe("2.6.1");
+      const content = readGradle(filePath);
+      expect(content).toContain("dependency 'net.minidev:json-smart:2.6.1'");
+      expect(countOccurrences(content, "implementation('net.minidev:json-smart")).toBe(1);
+    });
+  });
+
+  it("re-bumps an already-pinned transitive dependency through the managed blocks without misclassifying it as direct", () => {
+    // State after a first run: constraint + force + DM pin all at 9.11, no direct declaration.
+    const build = [
+      SPRING_DM_BUILD,
+      "",
+      "// auto-bumper:begin managed constraints (auto-generated, do not edit)",
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.ow2.asm:asm:9.11') { because 'SNYK-JAVA-ORGOW2ASM-21715452' }",
+      "    }",
+      "}",
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'org.ow2.asm:asm:9.11'",
+      "    }",
+      "}",
+      "dependencyManagement {",
+      "    dependencies {",
+      "        // SNYK-JAVA-ORGOW2ASM-21715452",
+      "        dependency 'org.ow2.asm:asm:9.11'",
+      "    }",
+      "}",
+      "// auto-bumper:end",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.ow2.asm:asm",
+        targetVersion: "9.11.1",
+        because: ["SNYK-JAVA-ORGOW2ASM-21715452"],
+        installedVersion: "9.11",
+      }], [], null, undefined, [{ name: "org.ow2.asm:asm", version: "9.11" }]);
+      expect(result.direct).not.toContain("org.ow2.asm:asm");
+      expect(result.constrained).toContain("org.ow2.asm:asm");
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, "implementation('org.ow2.asm:asm:9.11.1')")).toBe(1);
+      expect(countOccurrences(content, "force 'org.ow2.asm:asm:9.11.1'")).toBe(1);
+      expect(countOccurrences(content, "dependency 'org.ow2.asm:asm:9.11.1'")).toBe(1);
+      expect(content).not.toContain("'org.ow2.asm:asm:9.11'");
+      expect(countOccurrences(content, "// SNYK-JAVA-ORGOW2ASM-21715452")).toBe(1);
     });
   });
 });
