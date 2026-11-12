@@ -2,7 +2,7 @@
 
 All notable changes to `@elephantseed/auto-bumper`.
 
-## [Unreleased]
+## [1.0.0] - 2026-11-12
 
 ### Added
 - `fix` (Gradle projects on Spring Boot's `io.spring.dependency-management` plugin): vulnerability pins are now written as `dependencyManagement { dependencies { dependency 'g:a:v' } }` entries in the managed block — the only mechanism that beats the component-metadata rule, which outranks both managed constraints and `resolutionStrategy.force`, so force/constraint pins were silently ignored on Spring projects (the classpath stayed at the vulnerable version). With the plugin present, every non-direct planned bump becomes a DM pin; existing DM pins are merged on re-runs (higher wins) and advisory comments are preserved
