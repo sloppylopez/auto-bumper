@@ -219,7 +219,7 @@ describe("platform policy", () => {
     });
   });
 
-  it("keeps same-minor family fixes on the pin path and leaves the platform untouched", () => {
+  it("bumps the Quarkus platform for a same-minor fix instead of pinning one extension", () => {
     withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
       const result = applyBumps(filePath, [{
         packageName: "io.quarkus:quarkus-rest",
@@ -227,9 +227,13 @@ describe("platform policy", () => {
         because: ["GHSA-test"],
         installedVersion: "3.28.5",
       }]);
-      expect(result.constrained).toContain("io.quarkus:quarkus-rest");
       const props = readGradle(propsPath);
-      expect(props).toContain("quarkusPlatformVersion=3.28.5");
+      expect(props).toContain("quarkusPlatformVersion=3.28.9");
+      expect(props).toContain("quarkusPluginVersion=3.28.9");
+      expect(readGradle(filePath)).not.toContain("quarkus-rest");
+      expect(result.constrained).not.toContain("io.quarkus:quarkus-rest");
+      expect(result.forced).not.toContain("io.quarkus:quarkus-rest");
+      expect(result.appliedTargets?.["io.quarkus:quarkus-rest"]).toBe("3.28.9");
     });
   });
 
@@ -316,6 +320,81 @@ describe("platform policy", () => {
       },
     );
   });
+
+  it("rewrites the Spring Boot plugin version for an undeclared starter fix", () => {
+    withTempGradle(
+      "plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}\n",
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.springframework.boot:spring-boot-starter-web",
+          targetVersion: "3.4.1",
+          because: ["GHSA-test"],
+          installedVersion: "3.2.5",
+        }]);
+        const content = readGradle(filePath);
+        expect(content).toContain("id 'org.springframework.boot' version '3.4.1'");
+        expect(content).not.toContain("spring-boot-starter-web");
+        expect(content).not.toContain("dependencyManagement {");
+        expect(result.constrained).not.toContain("org.springframework.boot:spring-boot-starter-web");
+        expect(result.forced).not.toContain("org.springframework.boot:spring-boot-starter-web");
+        expect(result.appliedTargets?.["org.springframework.boot:spring-boot-starter-web"]).toBe("3.4.1");
+      },
+    );
+  });
+
+  it("rewrites a Kotlin Spring Boot plugin version", () => {
+    withTempGradle(
+      'plugins {\n    id("org.springframework.boot") version "3.2.5"\n}\n',
+      filePath => {
+        applyBumps(filePath, [{
+          packageName: "org.springframework.boot:spring-boot-starter-web",
+          targetVersion: "3.3.6",
+          because: ["GHSA-test"],
+          installedVersion: "3.2.5",
+        }]);
+        expect(readGradle(filePath)).toContain('id("org.springframework.boot") version "3.3.6"');
+      },
+    );
+  });
+
+  it("rewrites springBootVersion when the plugin version is a property", () => {
+    const build = "plugins {\n    id 'org.springframework.boot' version '${springBootVersion}'\n}\n";
+    withTempGradleAndProperties(build, "springBootVersion=3.2.5", (filePath, propsPath) => {
+      applyBumps(filePath, [{
+        packageName: "org.springframework.boot:spring-boot-starter-web",
+        targetVersion: "3.3.6",
+        because: ["GHSA-test"],
+        installedVersion: "3.2.5",
+      }]);
+      expect(readGradle(filePath)).toContain("version '${springBootVersion}'");
+      expect(readGradle(propsPath)).toContain("springBootVersion=3.3.6");
+    });
+  });
+
+  it("bumps spring-boot-dependencies and the plugin together for a same-minor starter fix", () => {
+    const build = [
+      "plugins {",
+      "    id 'org.springframework.boot' version '3.2.5'",
+      "}",
+      "dependencies {",
+      '    implementation platform("org.springframework.boot:spring-boot-dependencies:3.2.5")',
+      "}",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.springframework.boot:spring-boot-starter-web",
+        targetVersion: "3.2.6",
+        because: ["GHSA-test"],
+        installedVersion: "3.2.5",
+      }]);
+      const content = readGradle(filePath);
+      expect(content).toContain("spring-boot-dependencies:3.2.6");
+      expect(content).toContain("version '3.2.6'");
+      expect(content).not.toContain("spring-boot-starter-web");
+      expect(result.warnings.some(w => w.includes("stay on the platform line"))).toBe(true);
+    });
+  });
+
 });
 
 describe("applyRenames", () => {

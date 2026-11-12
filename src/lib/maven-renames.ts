@@ -2,7 +2,7 @@
  * Detect Maven coordinate renames from OSV advisory data and known group migrations.
  */
 import type { AdvisoryEntry, Finding, PackageRef } from "./types.ts";
-import { compareMavenVersion } from "./matcher.ts";
+import { compareMavenVersion, extractedEventSequences } from "./matcher.ts";
 
 export interface MavenRenameOption {
   fromPackage: string;
@@ -467,11 +467,12 @@ function fixedVersionsForAffected(affected: AdvisoryEntry["affected"][number]): 
   for (const r of affected.ranges || []) {
     const range = r as {
       events?: Array<{ fixed?: string }>;
-      database_specific?: { extracted_events?: Array<{ fixed?: string }> };
+      database_specific?: { extracted_events?: unknown[] };
     };
-    const events = range.database_specific?.extracted_events?.length
-      ? range.database_specific.extracted_events
-      : range.events || [];
+    // Extracted version events take precedence over raw git hashes; each item may be a flat
+    // event or a CPE wrapper whose events sit in its nested `range` array.
+    const sequences = extractedEventSequences(range);
+    const events: Array<{ fixed?: string }> = sequences.length > 0 ? sequences.flat() : range.events || [];
     for (const ev of events) {
       if (ev.fixed && isVersionLike(String(ev.fixed))) fixed.add(String(ev.fixed));
     }

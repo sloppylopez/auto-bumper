@@ -796,6 +796,91 @@ describe("isVersionAffected", () => {
   });
 });
 
+describe("isVersionAffected with CPE-nested extracted_events", () => {
+  const LOG4J = "org.apache.logging.log4j:log4j-api";
+  const pkg = (version: string) => [{ ecosystem: "maven", name: LOG4J, version, manifestPath: "pom.xml" }];
+
+  // Modeled on CVE-2026-49844 as delivered by the OSV Maven dump: a GIT range whose raw
+  // events are commit hashes and whose database_specific.extracted_events wrap real version
+  // windows in CPE items ({ source, cpe, range: [...] }).
+  const cpeEntry = {
+    id: "CVE-2026-49844", aliases: [], ecosystems: ["maven"], summary: "nested extracted events", severity: [{ type: "CVSS_V3_1", score: "9.0" }],
+    affected: [{
+      package: { name: LOG4J },
+      ranges: [{
+        type: "GIT",
+        events: [{ introduced: "a8b4a5a0fe05c2985e1d1e0e748bef83c47a0ce4" }],
+        database_specific: { extracted_events: [
+          { source: "cpe", cpe: "cpe:/a/apache/logging_log4j", range: [{ introduced: "2.13.1" }, { fixed: "2.25.5" }] },
+          { source: "cpe", cpe: "cpe:/a/apache/logging_log4j", range: [{ introduced: "2.26.0" }, { last_affected: "2.26.0" }] },
+          { source: "cpe", cpe: "cpe:/a/apache/logging_log4j", range: [{ introduced: "3.0.0-alpha1" }, { last_affected: "3.0.0-beta2" }] },
+        ] },
+      }],
+    }], links: [],
+  };
+
+  it("does not flag a version above every nested fixed/last_affected bound", () => {
+    expect(isVersionAffected(LOG4J, "2.26.1", "maven", cpeEntry)).toBe(false);
+    expect(matchVulnerabilities(pkg("2.26.1"), [cpeEntry])).toHaveLength(0);
+  });
+
+  it("flags versions inside any nested window", () => {
+    expect(isVersionAffected(LOG4J, "2.25.0", "maven", cpeEntry)).toBe(true);
+    expect(isVersionAffected(LOG4J, "2.26.0", "maven", cpeEntry)).toBe(true);
+  });
+
+  it("collects fixed versions from nested events so the finding is fixable", () => {
+    const findings = matchVulnerabilities(pkg("2.14.0"), [cpeEntry]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].fixedVersions).toContain("2.25.5");
+    expect(buildFixPlan(findings, [cpeEntry]).fixable[0].targetVersion).toBe("2.25.5");
+  });
+
+  it("keeps flat extracted_events items working (legacy shape)", () => {
+    const flatEntry = {
+      ...cpeEntry,
+      id: "CVE-FLAT",
+      affected: [{
+        package: { name: LOG4J },
+        ranges: [{
+          type: "GIT",
+          events: [{ introduced: "a8b4a5a0fe05c2985e1d1e0e748bef83c47a0ce4" }],
+          database_specific: { extracted_events: [
+            { introduced: "2.13.1" }, { fixed: "2.25.5" },
+          ] },
+        }],
+      }],
+    };
+    expect(isVersionAffected(LOG4J, "2.20.0", "maven", flatEntry)).toBe(true);
+    expect(isVersionAffected(LOG4J, "2.26.1", "maven", flatEntry)).toBe(false);
+  });
+
+  it("treats nested single-version point lists as points (json-patch shape)", () => {
+    const POINTS = "com.github.java-json-tools:json-patch";
+    const pointsPkg = (version: string) => [{ ecosystem: "maven", name: POINTS, version, manifestPath: "pom.xml" }];
+    const pointListEntry = {
+      id: "CVE-2026-86318", aliases: [], ecosystems: ["maven"], summary: "point list", severity: [{ type: "CVSS_V3_1", score: "5.0" }],
+      affected: [{
+        package: { name: POINTS },
+        ranges: [{
+          type: "GIT",
+          events: [{ introduced: "5922bdcee44d9e58335cdbdbcc35b3bcfe43d38a" }],
+          database_specific: { extracted_events: [
+            { source: "cpe", cpe: "cpe:/a/java-json-tools/json-patch", range: [{ introduced: "1.12" }, { last_affected: "1.12" }] },
+            { source: "cpe", cpe: "cpe:/a/java-json-tools/json-patch", range: [{ introduced: "1.13" }, { last_affected: "1.13" }] },
+          ] },
+        }],
+      }], links: [],
+    };
+    expect(isVersionAffected(POINTS, "1.13", "maven", pointListEntry)).toBe(true);
+    expect(isVersionAffected(POINTS, "1.10", "maven", pointListEntry)).toBe(false);
+    // No fixed version anywhere in the nested data → genuinely unfixable
+    const findings = matchVulnerabilities(pointsPkg("1.13"), [pointListEntry]);
+    expect(findings).toHaveLength(1);
+    expect(buildFixPlan(findings, [pointListEntry]).unfixable[0]?.targetVersion).toBeNull();
+  });
+});
+
 describe("entryAffectsPackage", () => {
   const mavenEntry = {
     id: "GHSA-m", aliases: [], ecosystems: ["maven"], summary: "", severity: [],

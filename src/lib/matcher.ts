@@ -233,19 +233,74 @@ function tryRanges(version: string, affected: { ranges?: Array<{ type?: string; 
   return { isAffected: false };
 }
 
+/** One item of OSV `database_specific.extracted_events`: either a flat event object, or a CPE-derived wrapper whose actual events live in its nested `range` array. */
+interface ExtractedEventItem {
+  introduced?: string;
+  fixed?: string;
+  last_affected?: string;
+  latest?: string;
+  deprecated?: string;
+  range?: EcoEvent[];
+}
+
+/**
+ * Normalize extracted_events into event sequences for segment matching.
+ * Flat items (legacy shape) form ONE ordered timeline — `parseEventSegments` splits it into
+ * windows at each new `introduced`. CPE-derived wrappers are independent: each one's nested
+ * `range` array is its own sequence. Empty when absent.
+ */
+export function extractedEventSequences(range: { database_specific?: { extracted_events?: unknown[] } } | undefined): EcoEvent[][] {
+  const extracted = range?.database_specific?.extracted_events;
+  if (!Array.isArray(extracted) || extracted.length === 0) return [];
+  const sequences: EcoEvent[][] = [];
+  const flatTimeline: EcoEvent[] = [];
+  for (const item of extracted) {
+    if (!item || typeof item !== "object") continue;
+    // Unchecked cast at the JSON boundary; each field is checked below.
+    const it = item as ExtractedEventItem;
+    if (Array.isArray(it.range) && it.range.length > 0) {
+      sequences.push(it.range);
+    } else if (it.introduced !== undefined || it.fixed !== undefined || it.last_affected !== undefined || it.latest !== undefined || it.deprecated !== undefined) {
+      flatTimeline.push(it);
+    }
+  }
+  if (flatTimeline.length > 0) sequences.unshift(flatTimeline);
+  return sequences;
+}
+
+/** Drop events carrying non-version values (git hashes) so the remaining sequence is usable for version matching. */
+function keepVersionEvents(seq: EcoEvent[]): EcoEvent[] {
+  return seq.filter(ev =>
+    [ev.introduced, ev.fixed, ev.last_affected, ev.latest, ev.deprecated]
+      .every(v => v === undefined || v === "" || isVersionLike(v)),
+  );
+}
+
 /** Match against ECOSYSTEM or GIT event-based ranges */
 function tryEventRange(version: string, range: { type?: string; events?: unknown[]; database_specific?: { extracted_events?: unknown[] } }, eco: string): AffectedResult {
   if (!range.events || !(range.type === "ECOSYSTEM" || range.type === "GIT")) return { isAffected: false };
-  const extracted = range.database_specific?.extracted_events;
-  let eventsToUse = (extracted && extracted.length > 0 ? extracted : range.events) as EcoEvent[];
+
+  // OSV may provide extracted version events that are more accurate than git hashes.
+  // Each sub-range (a flat item, or a CPE wrapper's nested `range` array) is an independent
+  // window; the version is affected when any one of them matches.
+  const sequences = extractedEventSequences(range);
+  if (sequences.length > 0) {
+    for (const seq of sequences) {
+      const usable = range.type === "ECOSYSTEM" ? keepVersionEvents(seq) : seq;
+      if (usable.length === 0) continue; // no version data in this window → cannot prove impact
+      const result = matchesEcosystemEvents(version, usable, eco);
+      if (result.isAffected) return result;
+    }
+    return { isAffected: false };
+  }
+
+  let eventsToUse = (range.events as EcoEvent[]) ?? [];
   // ECOSYSTEM ranges must carry real versions. Bad Snyk/OSV data sometimes puts git hashes in
   // `fixed`/`introduced`; left in, a hash terminator corrupts the segment window and hides true
   // positives. (GIT ranges legitimately use commit hashes — untouched.)
   if (range.type === "ECOSYSTEM") {
-    eventsToUse = eventsToUse.filter(ev =>
-      [ev.introduced, ev.fixed, ev.last_affected, ev.latest, ev.deprecated]
-        .every(v => v === undefined || v === "" || isVersionLike(v)),
-    );
+    eventsToUse = keepVersionEvents(eventsToUse);
+    if (eventsToUse.length === 0) return { isAffected: false };
   }
   return matchesEcosystemEvents(version, eventsToUse, eco);
 }
@@ -901,12 +956,12 @@ function collectFromRanges(fixedSet: Set<string>, ranges: unknown[]) {
   }
 }
 
-/** Collect fixed versions from database-specific extracted_events */
+/** Collect fixed versions from database-specific extracted_events (flat or CPE-nested shapes) */
 function collectExtractedEvents(fixedSet: Set<string>, r: unknown) {
-  const extracted = (r as { database_specific?: { extracted_events?: Array<{ fixed?: string }> } }).database_specific?.extracted_events;
-  if (!Array.isArray(extracted)) return;
-  for (const ev of extracted) {
-    if (ev.fixed && isVersionLike(String(ev.fixed))) fixedSet.add(String(ev.fixed));
+  for (const seq of extractedEventSequences(r as { database_specific?: { extracted_events?: unknown[] } })) {
+    for (const ev of seq) {
+      if (ev.fixed && isVersionLike(String(ev.fixed))) fixedSet.add(String(ev.fixed));
+    }
   }
 }
 
@@ -977,7 +1032,7 @@ function collectFromDefaultFormat(fixedSet: Set<string>, defaults: Array<{ state
 /** Range shape needed for introduced/fixed event collection. */
 interface OsvRangeLike {
   events?: Array<{ introduced?: string; fixed?: string }>;
-  database_specific?: { extracted_events?: Array<{ introduced?: string; fixed?: string }> };
+  database_specific?: { extracted_events?: unknown[] };
 }
 
 /** Affected block shape needed for release-line fix collection. */
@@ -1001,7 +1056,7 @@ function collectIntroducedVersions(entry: { affected?: OsvAffectedBlockLike[] },
 /** Add introduced versions from one range's events and extracted_events lists. */
 function collectIntroducedFromRange(set: Set<string>, range: OsvRangeLike): void {
   addIntroducedEvents(set, range.events);
-  addIntroducedEvents(set, range.database_specific?.extracted_events);
+  for (const seq of extractedEventSequences(range)) addIntroducedEvents(set, seq);
 }
 
 /** Add version-like `introduced` values from an OSV event list. */

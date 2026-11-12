@@ -1180,10 +1180,11 @@ export function hasEnforcedPlatform(content: string): boolean {
 /**
  * True when the project explicitly applies the Spring dependency-management plugin, so
  * `dependencyManagement { dependencies { ... } }` pins are valid DSL and outrank BOM imports.
- * ONLY the explicit `io.spring.dependency-management` plugin counts: the Spring Boot plugin
- * (`org.springframework.boot`) does NOT provide the extension — a Boot-only build has no
- * `dependencyManagement` method, and rendering one breaks configuration evaluation. The
- * managed block we render is excluded from the probe so re-runs don't self-trigger.
+ * The Spring Boot plugin does not apply that plugin (Boot 3.5 only imports its BOM once
+ * `io.spring.dependency-management` is already applied). A Boot-only build has no
+ * `dependencyManagement` method, and rendering one breaks configuration. Force and
+ * constraint pins are the mechanism that works there. The managed block we render is
+ * excluded from the probe so re-runs don't self-trigger.
  */
 export function hasSpringDependencyManagement(content: string): boolean {
   let probe = content;
@@ -1245,6 +1246,87 @@ export function detectGradlePlatform(buildFile: string): GradlePlatform | null {
   if (!group || !artifact || !version) return null;
   const vm = /^\$\{(\w+)\}$/.exec(m[3]!);
   return { group, artifact, version, property: vm?.[1] };
+}
+
+/** `id 'org.springframework.boot' version '…'` or `id("…") version "…"`, literal or `${prop}`. */
+const BOOT_PLUGIN_VERSION_RE = /id\s*\(?\s*(['"])org\.springframework\.boot\1\s*\)?\s+version\s+(['"])([^'"]+)\2/;
+
+/** Resolved Spring Boot Gradle plugin version, when the plugins block sets one. */
+export interface SpringBootPluginVersion {
+  version: string;
+  /** gradle.properties or inline def name, when the plugins block uses `${name}`. */
+  property?: string;
+}
+
+/** Read the Spring Boot plugin version from the plugins block. Null when it is not set there. */
+export function detectSpringBootPlugin(buildFile: string): SpringBootPluginVersion | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(buildFile, "utf-8");
+  } catch {
+    return null;
+  }
+  const m = BOOT_PLUGIN_VERSION_RE.exec(content);
+  if (!m) return null;
+  const raw = m[3]!;
+  const vm = /^\$\{(\w+)\}$/.exec(raw);
+  if (!vm) return { version: raw };
+  const version = readVersionProperties(buildFile).get(vm[1]!);
+  if (!version) return null;
+  return { version, property: vm[1] };
+}
+
+function isQuarkusBom(platform: GradlePlatform): boolean {
+  return platform.artifact === "quarkus-bom"
+    && (platform.group === "io.quarkus.platform" || platform.group === "io.quarkus");
+}
+
+function isSpringBootBom(platform: GradlePlatform): boolean {
+  return platform.group === "org.springframework.boot" && platform.artifact === "spring-boot-dependencies";
+}
+
+/** Rewrite one version property in gradle.properties, else an inline assignment in the build file. */
+function rewriteVersionProperty(buildFile: string, property: string, fromVersion: string, toVersion: string): boolean {
+  const propsPath = path.join(path.dirname(buildFile), "gradle.properties");
+  if (fs.existsSync(propsPath)) {
+    const text = fs.readFileSync(propsPath, "utf-8");
+    const lineRe = new RegExp(`^([ \\t]*${escapeRegex(property)}[ \\t]*=[ \\t]*)${escapeRegex(fromVersion)}\\s*$`, "m");
+    if (lineRe.test(text)) {
+      fs.writeFileSync(propsPath, text.replace(lineRe, `$1${toVersion}`), "utf-8");
+      return true;
+    }
+  }
+  const content = fs.readFileSync(buildFile, "utf-8");
+  const inlineRe = new RegExp(
+    `^([ \\t]*(?:(?:def|final)[ \\t]+)?(?:(?:String|int|Integer)[ \\t]+)?${escapeRegex(property)}[ \\t]*=[ \\t]*["'])${escapeRegex(fromVersion)}(["'].*)$`,
+    "m",
+  );
+  if (!inlineRe.test(content)) return false;
+  fs.writeFileSync(buildFile, content.replace(inlineRe, `$1${toVersion}$2`), "utf-8");
+  return true;
+}
+
+/** Move the Spring Boot plugin version forward. Property-backed versions stay as `${prop}`. */
+export function bumpSpringBootPlugin(buildFile: string, pin: SpringBootPluginVersion, newVersion: string): boolean {
+  if (compareMavenVersion(newVersion, pin.version) <= 0) return false;
+  if (pin.property) return rewriteVersionProperty(buildFile, pin.property, pin.version, newVersion);
+  const content = fs.readFileSync(buildFile, "utf-8");
+  const m = BOOT_PLUGIN_VERSION_RE.exec(content);
+  if (!m || m[3] !== pin.version) return false;
+  const quote = m[2]!;
+  const updated = m[0].replace(
+    new RegExp(`(version\\s+${quote})${escapeRegex(m[3]!)}${quote}`),
+    `$1${newVersion}${quote}`,
+  );
+  fs.writeFileSync(buildFile, content.slice(0, m.index) + updated + content.slice(m.index + m[0].length), "utf-8");
+  return true;
+}
+
+/** When a spring-boot-dependencies bump matches the plugin version, move the plugin with it. */
+function syncSpringBootPlugin(buildFile: string, fromVersion: string, toVersion: string): void {
+  const boot = detectSpringBootPlugin(buildFile);
+  if (!boot || boot.version !== fromVersion) return;
+  bumpSpringBootPlugin(buildFile, boot, toVersion);
 }
 
 /** First two numeric components of a Maven version as [major, minor]; missing parts become "0". */
@@ -1510,6 +1592,9 @@ export function applyBumps(
   if (platform) {
     remainingBumps = routePlatformBumps(platform, filePath, content, remainingBumps, result, appliedTargets);
   }
+  remainingBumps = routeSpringBootPluginBumps(filePath, remainingBumps, result, appliedTargets);
+  // Platform and plugin rewrites land on disk. Re-read so the final write does not put the old text back.
+  content = fs.readFileSync(filePath, "utf-8");
   if (enforced) {
     remainingBumps = skipCrossMinorBomBumps(content, remainingBumps, result, platform, bomManaged, classpathPackages ?? null, alignedMemberOk);
   }
@@ -1627,7 +1712,63 @@ export function applyBumps(
 }
 
 /**
+ * Rewrite the Spring Boot plugin version for undeclared `org.springframework.boot` artifacts.
+ * A direct declaration stays in the normal path so its own version line moves too.
+ * Returns the bumps left for pins. No-op when the plugins block has no Boot version.
+ */
+function routeSpringBootPluginBumps(
+  buildFile: string,
+  bumps: BumpRequest[],
+  result: ApplyResult,
+  appliedTargets: Record<string, string>,
+): BumpRequest[] {
+  let content: string;
+  try {
+    content = fs.readFileSync(buildFile, "utf-8");
+  } catch {
+    return bumps;
+  }
+  const boot = detectSpringBootPlugin(buildFile);
+  if (!boot) return bumps;
+  const routed: BumpRequest[] = [];
+  const rest: BumpRequest[] = [];
+  for (const b of bumps) {
+    const group = b.packageName.split(":")[0] || "";
+    const take = !b.isDowngrade
+      && group === "org.springframework.boot"
+      && compareMavenVersion(b.targetVersion, boot.version) > 0;
+    if (!take) {
+      rest.push(b);
+      continue;
+    }
+    routed.push(b);
+    if (readDeclaredVersion(content, b.packageName) !== null) rest.push(b);
+  }
+  if (routed.length === 0) return bumps;
+  const target = routed.reduce(
+    (max, b) => compareMavenVersion(b.targetVersion, max) > 0 ? b.targetVersion : max,
+    boot.version,
+  );
+  if (!bumpSpringBootPlugin(buildFile, boot, target)) {
+    for (const b of routed) {
+      result.warnings.push(`${b.packageName}: could not rewrite org.springframework.boot plugin version — left for a pin`);
+    }
+    return bumps;
+  }
+  for (const b of routed) {
+    if (readDeclaredVersion(content, b.packageName) !== null) continue;
+    result.direct.push(`${b.packageName}: via org.springframework.boot plugin ${boot.version} → ${target}`);
+    appliedTargets[b.packageName] = target;
+  }
+  result.warnings.push(
+    `Bumped org.springframework.boot plugin ${boot.version} → ${target}. Expect API changes; run a full build and tests.`,
+  );
+  return rest;
+}
+
+/**
  * Route BOM-managed family candidates that cross the platform's minor line to a whole-platform bump.
+ * Quarkus and Spring Boot's own modules also route patch bumps, because those versions are the platform version.
  * Returns the bumps left for the normal pin/force path; records applied/skipped entries on result.
  */
 function routePlatformBumps(
@@ -1642,13 +1783,18 @@ function routePlatformBumps(
   const rest: BumpRequest[] = [];
   for (const b of bumps) {
     const group = b.packageName.split(":")[0] || "";
-    const crosses = !b.isDowngrade
+    const family = sameGroupFamily(group, platform.group);
+    const newer = !b.isDowngrade
       && group !== ""
-      && sameGroupFamily(group, platform.group)
       && readDeclaredVersion(content, b.packageName) === null
-      && compareMavenVersion(b.targetVersion, platform.version) > 0
-      && crossesMinorBoundary(platform.version, b.targetVersion);
-    if (crosses) routed.push(b); else rest.push(b);
+      && compareMavenVersion(b.targetVersion, platform.version) > 0;
+    // Quarkus and Boot's own modules share the platform version, including patch bumps.
+    // Other families still route only when the fix leaves the platform's minor line.
+    const bootModule = isSpringBootBom(platform) && group === "org.springframework.boot";
+    const quarkusModule = isQuarkusBom(platform) && family;
+    const crossMinorFamily = family && crossesMinorBoundary(platform.version, b.targetVersion);
+    if (newer && (bootModule || quarkusModule || crossMinorFamily)) routed.push(b);
+    else rest.push(b);
   }
   if (routed.length === 0) return bumps;
 
@@ -1673,6 +1819,7 @@ function routePlatformBumps(
     );
     return rest;
   }
+  if (isSpringBootBom(platform)) syncSpringBootPlugin(buildFile, platform.version, target);
 
   for (const b of mappable) {
     result.direct.push(`${b.packageName}: via ${platform.group}:${platform.artifact} ${platform.version} → ${target}`);
@@ -1683,8 +1830,11 @@ function routePlatformBumps(
       `${b.packageName}: fix ${b.targetVersion} does not map to a ${platform.group}:${platform.artifact} release — skipped; bump the platform/BOM manually`,
     );
   }
+  const crossed = crossesMinorBoundary(platform.version, target);
   result.warnings.push(
-    `Bumped ${platform.group}:${platform.artifact} ${platform.version} → ${target} — ${mappable.length} fix(es) cross the platform's minor line. Expect API changes; run a full build and tests.`,
+    crossed
+      ? `Bumped ${platform.group}:${platform.artifact} ${platform.version} → ${target} — ${mappable.length} fix(es) cross the platform's minor line. Expect API changes; run a full build and tests.`
+      : `Bumped ${platform.group}:${platform.artifact} ${platform.version} → ${target} — ${mappable.length} fix(es) stay on the platform line.`,
   );
 
   // Family candidates now covered by the new platform version need no pin of their own.
