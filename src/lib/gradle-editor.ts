@@ -60,6 +60,8 @@ export interface ExcludeRequest {
   packageName: string;
   /** When set, attach the exclusion only to these direct dependencies (its resolved sources); otherwise to every direct dependency. */
   attachTo?: string[];
+  /** Human-readable reason; rendered as a comment above the exclusion in the managed block (first write only). */
+  reason?: string;
 }
 
 export interface ApplyResult {
@@ -120,10 +122,11 @@ function rewriteDirect(
   //    would rewrite pin lines in place and misclassify the update as a direct edit. Pin updates go
   //    through the managed block upsert instead, so match outside that region.
   const literalRe = new RegExp(String.raw`((["'])${g}:${a}:)([^"'\s$][^"'\s]*)(\2)`, "g");
-  const managed = maskManagedRegion ? findManagedBlock(content) : null;
-  const masked = managed
-    ? content.slice(0, managed.begin) + " ".repeat(managed.end + managed.endLen - managed.begin) + content.slice(managed.end + managed.endLen)
-    : content;
+  const regions = maskManagedRegion ? findManagedBlocks(content) : [];
+  let masked = content;
+  for (const region of [...regions].sort((a, b) => b.begin - a.begin)) {
+    masked = masked.slice(0, region.begin) + " ".repeat(region.end + region.endLen - region.begin) + masked.slice(region.end + region.endLen);
+  }
   let out = "";
   let lastIdx = 0;
   literalRe.lastIndex = 0;
@@ -249,10 +252,12 @@ function finalizeCoordinateMigration(
   // Phase 2: Remove Jackson BOM if migrating to tools.jackson
   next = removeJacksonBom(next, renames, warnings);
 
-  // Phase 3: Update managed dependency block
-  const found = findManagedBlock(next);
-  if (!found) return next;
-  return updateManagedBlock(next, found, renames, kotlin);
+  // Phase 3: Update every managed dependency block (any brand), back-to-front so indices stay valid
+  let out = next;
+  for (const region of [...findManagedBlocks(next)].sort((a, b) => b.begin - a.begin)) {
+    out = updateManagedBlock(out, region, renames, kotlin);
+  }
+  return out;
 }
 
 /** Replace all occurrences of old coordinates with new ones */
@@ -459,11 +464,11 @@ export function parseUserForces(content: string): Map<string, string> {
   for (const m of content.matchAll(/^\s*(?:def|val|var|final\s+)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*["']([^"']+)["']/gm)) {
     vars.set(m[1]!, m[2]!);
   }
-  const found = findManagedBlock(content);
+  const regions = findManagedBlocks(content);
   const out = new Map<string, string>();
   const forceRe = /force(?:\s*\(\s*|\s*)["']([^"':]+:[^"':]+):([^"']+)["']/g;
   for (const m of content.matchAll(forceRe)) {
-    if (found && m.index >= found.begin && m.index < found.end + found.endLen) continue; // managed block — our own pins
+    if (regions.some(r => m.index! >= r.begin && m.index! < r.end + r.endLen)) continue; // managed block — our own pins
     const version = m[2]!.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => vars.get(name) ?? "");
     if (!version || version.includes("${")) continue;
     out.set(m[1]!, version);
@@ -483,12 +488,11 @@ export function findStaleManagedPins(
   bomManaged: ReadonlyMap<string, string>,
   protectedPins?: ReadonlySet<string>,
 ): StaleManagedPin[] {
-  const found = findManagedBlock(content);
-  if (!found) return [];
-  const block = content.slice(found.begin, found.end + found.endLen);
+  const { regions, entries, forceMap } = parseAllManagedRegions(content);
+  if (regions.length === 0) return [];
   const stale: StaleManagedPin[] = [];
   const reported = new Set<string>();
-  for (const [pkg, e] of parseExistingConstraints(block)) {
+  for (const [pkg, e] of entries) {
     if (protectedPins?.has(pkg)) continue;
     const bv = bomManaged.get(pkg);
     if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
@@ -496,7 +500,7 @@ export function findStaleManagedPins(
       reported.add(pkg);
     }
   }
-  for (const [pkg, v] of parseExistingForces(block)) {
+  for (const [pkg, v] of forceMap) {
     if (reported.has(pkg)) continue; // same pin reported once when it is both a constraint and a force
     if (protectedPins?.has(pkg)) continue;
     const bv = bomManaged.get(pkg);
@@ -527,12 +531,11 @@ export function findShadowedManagedPins(
 ): ShadowedManagedPin[] {
   const userForces = parseUserForces(content);
   if (userForces.size === 0) return [];
-  const found = findManagedBlock(content);
-  if (!found) return [];
-  const block = content.slice(found.begin, found.end + found.endLen);
+  const { regions, entries, forceMap } = parseAllManagedRegions(content);
+  if (regions.length === 0) return [];
   const out: ShadowedManagedPin[] = [];
   const reported = new Set<string>();
-  for (const [pkg, e] of parseExistingConstraints(block)) {
+  for (const [pkg, e] of entries) {
     if (touched.has(pkg) || reported.has(pkg)) continue;
     const uv = userForces.get(pkg);
     if (uv !== undefined && compareMavenVersion(uv, e.version) >= 0) {
@@ -540,7 +543,7 @@ export function findShadowedManagedPins(
       reported.add(pkg);
     }
   }
-  for (const [pkg, v] of parseExistingForces(block)) {
+  for (const [pkg, v] of forceMap) {
     if (touched.has(pkg) || reported.has(pkg)) continue;
     const uv = userForces.get(pkg);
     if (uv !== undefined && compareMavenVersion(uv, v) >= 0) {
@@ -606,8 +609,9 @@ function parseBlockFreeText(block: string): Map<string, string[]> {
   for (const raw of block.split("\n")) {
     const trimmed = raw.trim();
     if (trimmed === "") continue;
-    if (trimmed === MARKER_BEGIN || trimmed === MARKER_END) {
-      if (trimmed === MARKER_END) flush(FREE_TEXT_FOOTER);
+    if (GRADLE_MARKERS.some(m => m.begin === trimmed)) continue; // any brand's opening marker
+    if (GRADLE_MARKERS.some(m => m.end === trimmed)) {
+      flush(FREE_TEXT_FOOTER);
       continue;
     }
     if (trimmed.startsWith("//")) {
@@ -813,15 +817,97 @@ function collapseTrailingNewlines(s: string): string {
   return stripped.length === s.length ? s : `${stripped}\n`;
 }
 
-function findManagedBlock(content: string): { begin: number; end: number; endLen: number } | null {
+interface ManagedRegion {
+  begin: number;
+  end: number;
+  endLen: number;
+}
+
+/** All managed blocks present (any recognized brand), in GRADLE_MARKERS priority order. */
+function findManagedBlocks(content: string): ManagedRegion[] {
+  const regions: ManagedRegion[] = [];
   for (const { begin, end } of GRADLE_MARKERS) {
     const beginIdx = content.indexOf(begin);
     const endIdx = content.indexOf(end);
     if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
-      return { begin: beginIdx, end: endIdx, endLen: end.length };
+      regions.push({ begin: beginIdx, end: endIdx, endLen: end.length });
     }
   }
-  return null;
+  return regions;
+}
+
+/**
+ * Several managed blocks can coexist when an earlier tool brand (auto-depender, depender) left
+ * its block behind. Consolidate to the highest-priority one and drop the rest; re-running any
+ * upsert then migrates everything to the canonical markers in a single block.
+ */
+function consolidateManagedBlocks(content: string): string {
+  let base = content;
+  for (;;) {
+    const regions = findManagedBlocks(base);
+    if (regions.length <= 1) return base;
+    const victim = regions[regions.length - 1]!; // lowest brand priority
+    const before = collapseTrailingNewlines(base.slice(0, victim.begin));
+    const after = base.slice(victim.end + victim.endLen).replace(/^\n+/, "\n");
+    base = `${before}${after}`;
+  }
+}
+
+interface ManagedRegionData {
+  regions: ManagedRegion[];
+  entries: Map<string, { version: string; because: string }>;
+  excludeSet: Set<string>;
+  forceMap: Map<string, string>;
+  dmPinMap: Map<string, { version: string; because: string }>;
+  freeText: Map<string, string[]> | null;
+}
+
+/** Merged view of every managed block (brand priority decides conflicts — canonical wins). */
+function parseAllManagedRegions(content: string): ManagedRegionData {
+  const regions = findManagedBlocks(content);
+  const entries = new Map<string, { version: string; because: string }>();
+  const excludeSet = new Set<string>();
+  const forceMap = new Map<string, string>();
+  const dmPinMap = new Map<string, { version: string; because: string }>();
+  let freeText: Map<string, string[]> | null = null;
+  for (const region of regions) {
+    const block = content.slice(region.begin, region.end + region.endLen);
+    for (const [pkg, e] of parseExistingConstraints(block)) if (!entries.has(pkg)) entries.set(pkg, e);
+    for (const pkg of parseExistingExcludes(block)) excludeSet.add(pkg);
+    for (const [pkg, v] of parseExistingForces(block)) if (!forceMap.has(pkg)) forceMap.set(pkg, v);
+    for (const [pkg, v] of parseExistingDmPins(block)) if (!dmPinMap.has(pkg)) dmPinMap.set(pkg, { version: v, because: "" });
+    const ft = parseBlockFreeText(block);
+    if (ft.size > 0) {
+      for (const [key, lines] of ft) {
+        const existing = freeText?.get(key);
+        if (existing) existing.push(...lines);
+        else (freeText ??= new Map()).set(key, [...lines]);
+      }
+    }
+  }
+  return { regions, entries, excludeSet, forceMap, dmPinMap, freeText };
+}
+
+/** Advisory IDs referenced by any managed-block constraint `because` clause (merged view). */
+export function managedBecauseIds(content: string): Set<string> {
+  const ids = new Set<string>();
+  for (const e of parseAllManagedRegions(content).entries.values()) {
+    for (const id of e.because.split(",")) {
+      const t = id.trim();
+      if (t) ids.add(t);
+    }
+  }
+  return ids;
+}
+
+/** True when the region holds a constraint/force/DM pin for the package. */
+function regionHasPin(content: string, region: ManagedRegion, packageName: string): boolean {
+  const block = content.slice(region.begin, region.end + region.endLen);
+  return (
+    parseExistingConstraints(block).has(packageName) ||
+    parseExistingForces(block).has(packageName) ||
+    parseExistingDmPins(block).has(packageName)
+  );
 }
 
 /**
@@ -845,7 +931,10 @@ function upsertManagedBlock(
   shadowedOut?: ShadowedManagedPin[],
   dmBumps?: BumpRequest[],
 ): string {
-  const found = findManagedBlock(content);
+  // Merge any legacy-brand blocks into one before upserting, so the file ends with a single block.
+  const merged = parseAllManagedRegions(content);
+  content = consolidateManagedBlocks(content);
+  const found = findManagedBlocks(content)[0] ?? null;
 
   let entries = new Map<string, { version: string; because: string }>();
   let excludeSet = new Set<string>();
@@ -858,12 +947,12 @@ function upsertManagedBlock(
 
   if (hasBlock) {
     const { begin: beginIdx, end: endIdx, endLen } = found;
-    const block = content.slice(beginIdx, endIdx + endLen);
-    entries = parseExistingConstraints(block);
-    excludeSet = parseExistingExcludes(block);
-    forceMap = parseExistingForces(block);
-    dmPinMap = new Map([...parseExistingDmPins(block)].map(([pkg, v]) => [pkg, { version: v, because: "" }]));
-    freeText = parseBlockFreeText(block);
+    // Parsed across every brand's block before consolidation — dropped blocks' pins carry over.
+    entries = merged.entries;
+    excludeSet = merged.excludeSet;
+    forceMap = merged.forceMap;
+    dmPinMap = merged.dmPinMap;
+    freeText = merged.freeText;
 
     // Drop pins the platform BOM now manages at or above — they only force an older version.
     // Protected pins (vulnerability escapes) survive: the BOM-managed version is itself affected.
@@ -956,6 +1045,11 @@ function upsertManagedBlock(
     // An excluded package no longer needs a version constraint
     entries.delete(ex.packageName);
     dmPinMap.delete(ex.packageName);
+    // A first-time reason becomes preserved free text, rendered as a comment above the exclusion.
+    if (ex.reason) {
+      const key = `exclude:${ex.packageName}`;
+      if (!freeText?.has(key)) (freeText ??= new Map()).set(key, [`// ${ex.reason}`]);
+    }
   }
 
   if (entries.size === 0 && excludeSet.size === 0 && forceMap.size === 0 && dmPinMap.size === 0) {
@@ -977,32 +1071,34 @@ function upsertManagedBlock(
  * Returns true when the file was modified.
  */
 export function removeManagedPin(filePath: string, packageName: string): boolean {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const found = findManagedBlock(content);
-  if (!found) return false;
-
-  const { begin: beginIdx, end: endIdx, endLen } = found;
-  const block = content.slice(beginIdx, endIdx + endLen);
-  const entries = parseExistingConstraints(block);
-  const excludeSet = parseExistingExcludes(block);
-  const forceMap = parseExistingForces(block);
-  const dmPinMap = new Map([...parseExistingDmPins(block)].map(([pkg, v]) => [pkg, { version: v, because: "" }]));
-  const freeText = pruneFreeText(parseBlockFreeText(block), entries, excludeSet, forceMap, dmPinMap);
-
+  let content = fs.readFileSync(filePath, "utf-8");
   let changed = false;
-  if (entries.delete(packageName)) changed = true;
-  if (forceMap.delete(packageName)) changed = true;
-  if (dmPinMap.delete(packageName)) changed = true;
-  if (!changed) return false;
+  // The pin may live in more than one block when several tool brands coexist — clear every copy.
+  for (;;) {
+    const found = findManagedBlocks(content).find(r => regionHasPin(content, r, packageName));
+    if (!found) break;
 
-  const before = collapseTrailingNewlines(content.slice(0, beginIdx));
-  const after = content.slice(endIdx + endLen).replace(/^\n+/, "");
-  if (entries.size === 0 && excludeSet.size === 0 && forceMap.size === 0 && dmPinMap.size === 0) {
-    fs.writeFileSync(filePath, `${before}${after}`);
-    return true;
+    const { begin: beginIdx, end: endIdx, endLen } = found;
+    const block = content.slice(beginIdx, endIdx + endLen);
+    const entries = parseExistingConstraints(block);
+    const excludeSet = parseExistingExcludes(block);
+    const forceMap = parseExistingForces(block);
+    const dmPinMap = new Map([...parseExistingDmPins(block)].map(([pkg, v]) => [pkg, { version: v, because: "" }]));
+    const freeText = pruneFreeText(parseBlockFreeText(block), entries, excludeSet, forceMap, dmPinMap);
+
+    if (!entries.delete(packageName) && !forceMap.delete(packageName) && !dmPinMap.delete(packageName)) break;
+    changed = true;
+
+    const before = collapseTrailingNewlines(content.slice(0, beginIdx));
+    const after = content.slice(endIdx + endLen).replace(/^\n+/, "");
+    if (entries.size === 0 && excludeSet.size === 0 && forceMap.size === 0 && dmPinMap.size === 0) {
+      content = `${before}${after}`;
+    } else {
+      content = `${before}${renderManagedBlock(entries, excludeSet, forceMap, filePath.endsWith(".kts"), freeText, dmPinMap)}\n${after}`;
+    }
   }
-  const next = renderManagedBlock(entries, excludeSet, forceMap, filePath.endsWith(".kts"), freeText, dmPinMap);
-  fs.writeFileSync(filePath, `${before}${next}\n${after}`);
+  if (!changed) return false;
+  fs.writeFileSync(filePath, content, "utf-8");
   return true;
 }
 
@@ -1090,8 +1186,10 @@ export function hasEnforcedPlatform(content: string): boolean {
  * managed block we render is excluded from the probe so re-runs don't self-trigger.
  */
 export function hasSpringDependencyManagement(content: string): boolean {
-  const mb = findManagedBlock(content);
-  const probe = mb ? content.slice(0, mb.begin) + content.slice(mb.end + mb.endLen) : content;
+  let probe = content;
+  for (const region of [...findManagedBlocks(probe)].sort((a, b) => b.begin - a.begin)) {
+    probe = probe.slice(0, region.begin) + probe.slice(region.end + region.endLen);
+  }
   return /io\.spring\.dependency-management/.test(probe);
 }
 
@@ -1258,11 +1356,8 @@ export function readDeclaredVersion(content: string, packageName: string): strin
   const lit = new RegExp(String.raw`["']${g}:${a}:([^"'\s$][^"'\s]*)["']`).exec(content);
   if (lit?.[1]) return lit[1];
 
-  const found = findManagedBlock(content);
-  if (found) {
-    const entries = parseExistingConstraints(content.slice(found.begin, found.end + found.endLen));
-    return entries.get(packageName)?.version ?? null;
-  }
+  const { regions, entries } = parseAllManagedRegions(content);
+  if (regions.length > 0) return entries.get(packageName)?.version ?? null;
   return null;
 }
 
@@ -1287,10 +1382,7 @@ function mergePinsToEffective(
   const pins = new Map<string, BumpRequest>();
   for (const p of classifiedPins) pins.set(p.packageName, p);
 
-  const found = findManagedBlock(content);
-  const existing = found
-    ? parseExistingConstraints(content.slice(found.begin, found.end + found.endLen))
-    : new Map<string, { version: string; because: string }>();
+  const existing = parseAllManagedRegions(content).entries;
 
   for (const bump of effectiveBumps) {
     const prevPin = pins.get(bump.packageName);
@@ -1791,10 +1883,9 @@ function classifyBumps(bumps: BumpRequest[], initialContent: string): { content:
 
 /** Check if a bump should be added as a managed constraint */
 function shouldPinBump(content: string, bump: BumpRequest): boolean {
-  const found = findManagedBlock(content);
-  if (!found) return true;
-  const existing = parseExistingConstraints(content.slice(found.begin, found.end + found.endLen));
-  const prev = existing.get(bump.packageName);
+  const { regions, entries } = parseAllManagedRegions(content);
+  if (regions.length === 0) return true;
+  const prev = entries.get(bump.packageName);
   if (prev && compareMavenVersion(prev.version, bump.targetVersion) >= 0) return false;
   return true;
 }
@@ -1903,10 +1994,9 @@ function classifyRenames(
 
 /** Check if a rename should be added as a managed constraint */
 function shouldPinRename(content: string, rename: RenameRequest): boolean {
-  const found = findManagedBlock(content);
-  if (!found) return true;
-  const existing = parseExistingConstraints(content.slice(found.begin, found.end + found.endLen));
-  const prev = existing.get(rename.toPackage);
+  const { regions, entries } = parseAllManagedRegions(content);
+  if (regions.length === 0) return true;
+  const prev = entries.get(rename.toPackage);
   if (prev && compareMavenVersion(prev.version, rename.targetVersion) >= 0) return false;
   return true;
 }

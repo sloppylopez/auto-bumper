@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
+import { AUTO_DEPENDER_GRADLE_MARKER_BEGIN, AUTO_DEPENDER_GRADLE_MARKER_END, GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
 import { applyBumps, applyRenames, detectGradlePlatform, findShadowedManagedPins, findStaleManagedPins, hasEnforcedPlatform, hasSpringDependencyManagement, parseUserForces, predictAlignedChecks, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
@@ -1394,6 +1394,168 @@ describe("applyBumps Spring dependency management", () => {
       expect(countOccurrences(content, "dependency 'org.ow2.asm:asm:9.11.1'")).toBe(1);
       expect(content).not.toContain("'org.ow2.asm:asm:9.11'");
       expect(countOccurrences(content, "// SNYK-JAVA-ORGOW2ASM-21715452")).toBe(1);
+    });
+  });
+});
+
+describe("legacy managed-block brands", () => {
+  it("consolidates a pre-existing auto-depender block with the current one into a single canonical block", () => {
+    const build = [
+      "plugins { id 'java' }",
+      "",
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('ch.qos.logback:logback-classic:1.6.5') { because 'CVE-2026-104721' }",
+      "    }",
+      "}",
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'ch.qos.logback:logback-classic:1.6.5'",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }",
+      "    }",
+      "}",
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      applyBumps(filePath, [{
+        packageName: "org.objenesis:objenesis",
+        targetVersion: "3.6",
+        because: ["CVE-2026-116486"],
+      }]);
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, GRADLE_MARKER_BEGIN)).toBe(1);
+      expect(content).not.toContain(AUTO_DEPENDER_GRADLE_MARKER_BEGIN);
+      expect(content).toContain("implementation('ch.qos.logback:logback-classic:1.6.5')");
+      expect(content).toContain("implementation('org.glassfish.jaxb:jaxb-core:3.0.2')");
+      expect(content).toContain("implementation('org.objenesis:objenesis:3.6')");
+      expect(content).toContain("force 'ch.qos.logback:logback-classic:1.6.5'");
+    });
+  });
+
+  it("keeps the canonical block's version when both blocks pin the same package", () => {
+    const build = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('com.example:lib:1.0.0') { because 'CVE-OLD' }",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('com.example:lib:1.2.0') { because 'CVE-NEW' }",
+      "    }",
+      "}",
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      applyBumps(filePath, [{
+        packageName: "com.other:tool",
+        targetVersion: "2.0.0",
+        because: ["CVE-X"],
+      }]);
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, GRADLE_MARKER_BEGIN)).toBe(1);
+      expect(content).toContain("implementation('com.example:lib:1.2.0')");
+      expect(content).not.toContain(":1.0.0'");
+    });
+  });
+
+  it("extends an auto-depender-only block in place and migrates it to the canonical markers", () => {
+    const build = [
+      "plugins { id 'java' }",
+      "",
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.postgresql:postgresql:42.7.14') { because 'CVE-DB' }",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      applyBumps(filePath, [{
+        packageName: "org.objenesis:objenesis",
+        targetVersion: "3.6",
+        because: ["CVE-2026-116486"],
+      }]);
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, GRADLE_MARKER_BEGIN)).toBe(1);
+      expect(content).not.toContain(AUTO_DEPENDER_GRADLE_MARKER_BEGIN);
+      expect(content).toContain("implementation('org.postgresql:postgresql:42.7.14')");
+      expect(content).toContain("implementation('org.objenesis:objenesis:3.6')");
+    });
+  });
+
+  it("parseUserForces skips forces inside an auto-depender block", () => {
+    const content = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'ch.qos.logback:logback-classic:1.6.5'",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'org.postgresql:postgresql:42.7.9'",
+      "    }",
+      "}",
+    ].join("\n");
+    const forces = parseUserForces(content);
+    expect(forces.get("org.postgresql:postgresql")).toBe("42.7.9");
+    expect(forces.has("ch.qos.logback:logback-classic")).toBe(false);
+  });
+
+  it("findStaleManagedPins reports stale pins inside an auto-depender block", () => {
+    const content = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('ch.qos.logback:logback-classic:1.3.0') { because 'CVE-OLD' }",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+    ].join("\n");
+    const stale = findStaleManagedPins(content, new Map([["ch.qos.logback:logback-classic", "1.6.5"]]));
+    expect(stale).toEqual([{ packageName: "ch.qos.logback:logback-classic", version: "1.3.0", bomVersion: "1.6.5" }]);
+  });
+
+  it("removeManagedPin clears a package from every managed block", () => {
+    const build = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.ow2.asm:asm:9.10') { because 'CVE-A' }",
+      "        implementation('com.example:keep:2.0.0')",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.ow2.asm:asm:9.11') { because 'CVE-B' }",
+      "    }",
+      "}",
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      expect(removeManagedPin(filePath, "org.ow2.asm:asm")).toBe(true);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("org.ow2.asm:asm");
+      expect(content).toContain("implementation('com.example:keep:2.0.0')");
     });
   });
 });

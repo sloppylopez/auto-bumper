@@ -54,13 +54,13 @@ function findDepBlocks(content: string): DepBlock[] {
   const blocks: DepBlock[] = [];
   const dmStart = content.indexOf("<dependencyManagement>");
   const dmEnd = dmStart >= 0 ? content.indexOf("</dependencyManagement>", dmStart) : -1;
-  const markerBegin = content.indexOf(MARKER_BEGIN);
-  const markerEnd = markerBegin >= 0 ? content.indexOf(MARKER_END, markerBegin) : -1;
+  const regions = findManagedBlocks(content);
 
   const re = /<dependency>[\s\S]*?<\/dependency>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(content)) !== null) {
     const block = m[0];
+    const idx = m.index; // hoisted: the closure below cannot see the loop's narrowing of m
     const groupMatch = /<groupId>([^<]+)<\/groupId>/.exec(block);
     const artifactMatch = /<artifactId>([^<]+)<\/artifactId>/.exec(block);
     if (!groupMatch || !artifactMatch) continue;
@@ -69,10 +69,10 @@ function findDepBlocks(content: string): DepBlock[] {
       group: groupMatch[1].trim(),
       artifact: artifactMatch[1].trim(),
       version: versionMatch ? versionMatch[1].trim() : null,
-      start: m.index,
-      end: m.index + block.length,
-      managed: dmStart >= 0 && dmEnd > dmStart && m.index > dmStart && m.index < dmEnd,
-      inMarker: markerBegin >= 0 && markerEnd > markerBegin && m.index >= markerBegin && m.index <= markerEnd,
+      start: idx,
+      end: idx + block.length,
+      managed: dmStart >= 0 && dmEnd > dmStart && idx > dmStart && idx < dmEnd,
+      inMarker: regions.some(r => idx >= r.begin && idx <= r.end + r.endLen),
     });
   }
   return blocks;
@@ -269,19 +269,62 @@ function renderManagedBlock(entries: Map<string, string>, freeText: Map<string, 
   return lines.join("\n");
 }
 
-function findManagedBlock(content: string): { begin: number; end: number; endLen: number } | null {
+interface ManagedRegion {
+  begin: number;
+  end: number;
+  endLen: number;
+}
+
+/** All managed blocks present (any recognized brand), in POM_MARKERS priority order. */
+function findManagedBlocks(content: string): ManagedRegion[] {
+  const regions: ManagedRegion[] = [];
   for (const { begin, end } of POM_MARKERS) {
     const beginIdx = content.indexOf(begin);
     const endIdx = content.indexOf(end);
     if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
-      return { begin: beginIdx, end: endIdx, endLen: end.length };
+      regions.push({ begin: beginIdx, end: endIdx, endLen: end.length });
     }
   }
-  return null;
+  return regions;
+}
+
+/** Consolidate several managed blocks (different tool brands) into the highest-priority one. */
+function consolidateManagedBlocks(content: string): string {
+  let base = content;
+  for (;;) {
+    const regions = findManagedBlocks(base);
+    if (regions.length <= 1) return base;
+    const victim = regions[regions.length - 1]!; // lowest brand priority
+    const before = collapseTrailingNewlines(base.slice(0, victim.begin), 1);
+    const after = base.slice(victim.end + victim.endLen).replace(/^\n+/, "\n");
+    base = `${before}${after}`;
+  }
+}
+
+/** Merged pins/comments of every managed block (brand priority decides conflicts — canonical wins). */
+function parseAllManagedPins(content: string): { entries: Map<string, string>; freeText: Map<string, string[]> | null } {
+  const entries = new Map<string, string>();
+  let freeText: Map<string, string[]> | null = null;
+  for (const region of findManagedBlocks(content)) {
+    const existing = content.slice(region.begin, region.end + region.endLen);
+    for (const [pkg, v] of parseExistingPins(existing)) if (!entries.has(pkg)) entries.set(pkg, v);
+    const ft = parsePomBlockFreeText(existing);
+    if (ft.size > 0) {
+      for (const [key, lines] of ft) {
+        const prev = freeText?.get(key);
+        if (prev) prev.push(...lines);
+        else (freeText ??= new Map()).set(key, [...lines]);
+      }
+    }
+  }
+  return { entries, freeText };
 }
 
 function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandled: string[] = []): string {
-  const found = findManagedBlock(content);
+  // Merge any legacy-brand blocks into one before upserting, so the file ends with a single block.
+  const merged = parseAllManagedPins(content);
+  content = consolidateManagedBlocks(content);
+  const found = findManagedBlocks(content)[0] ?? null;
 
   let entries = new Map<string, string>();
   let before = content;
@@ -291,9 +334,9 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
 
   if (found) {
     const { begin: beginIdx, end: endIdx, endLen } = found;
-    const existing = content.slice(beginIdx, endIdx + endLen);
-    entries = parseExistingPins(existing);
-    freeText = parsePomBlockFreeText(existing);
+    // Parsed across every brand's block before consolidation — dropped blocks' pins carry over.
+    entries = merged.entries;
+    freeText = merged.freeText;
     before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
     after = content.slice(endIdx + endLen).replace(/^\n+/, "\n");
   }
@@ -348,24 +391,30 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
  * Returns true when the file was modified.
  */
 export function removeManagedPin(filePath: string, packageName: string): boolean {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const found = findManagedBlock(content);
-  if (!found) return false;
+  let content = fs.readFileSync(filePath, "utf-8");
+  let changed = false;
+  // The pin may live in more than one block when several tool brands coexist — clear every copy.
+  for (;;) {
+    const found = findManagedBlocks(content).find(r => parseExistingPins(content.slice(r.begin, r.end + r.endLen)).has(packageName));
+    if (!found) break;
 
-  const { begin: beginIdx, end: endIdx, endLen } = found;
-  const block = content.slice(beginIdx, endIdx + endLen);
-  const entries = parseExistingPins(block);
-  const freeText = prunePomFreeText(parsePomBlockFreeText(block), entries);
-  if (!entries.delete(packageName)) return false;
+    const { begin: beginIdx, end: endIdx, endLen } = found;
+    const block = content.slice(beginIdx, endIdx + endLen);
+    const entries = parseExistingPins(block);
+    const freeText = prunePomFreeText(parsePomBlockFreeText(block), entries);
+    if (!entries.delete(packageName)) break;
+    changed = true;
 
-  const before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
-  const after = content.slice(endIdx + endLen).replace(/^\n+/, "");
-  if (entries.size === 0) {
-    fs.writeFileSync(filePath, `${before}${after}`);
-    return true;
+    const before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
+    const after = content.slice(endIdx + endLen).replace(/^\n+/, "");
+    if (entries.size === 0) {
+      content = `${before}${after}`;
+    } else {
+      content = `${before}${renderManagedBlock(entries, freeText)}\n${after}`;
+    }
   }
-  const next = renderManagedBlock(entries, freeText);
-  fs.writeFileSync(filePath, `${before}${next}\n${after}`);
+  if (!changed) return false;
+  fs.writeFileSync(filePath, content, "utf-8");
   return true;
 }
 

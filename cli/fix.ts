@@ -16,6 +16,7 @@ import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManife
 import { buildFixPlan, familyOf, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
+import { companionExclusions } from "../src/lib/fix-bundles.ts";
 import { selectUnresolvableRollbacks } from "../src/lib/unresolvable.ts";
 import { findLatestAvailableVersion, findNextAvailableVersion, isPreReleaseOrSnapshot, listAvailableVersions, versionPublishedInRepos } from "../src/lib/repo-metadata.ts";
 import { computeProtectedPins, fetchBomManagedVersions } from "../src/lib/bom-managed.ts";
@@ -28,6 +29,7 @@ import {
   discardBackup as discardGradleBackup,
   findShadowedManagedPins,
   findStaleManagedPins,
+  managedBecauseIds,
   parseUserForces,
   predictAlignedChecks,
   removeManagedPin as removeGradleManagedPin,
@@ -1917,12 +1919,42 @@ function recordRenameOutcome(outcome: ProjectApplyOutcome, method: "direct" | "c
   });
 }
 
-/** Apply this project's share of approved bumps and record outcomes by method. */
+/**
+ * Companion classpath exclusions required by this project's fixes (fix-bundles). Triggered by the
+ * advisories of the bumps applied this run, plus self-heal: advisory IDs already present in the
+ * manifest's managed-block `because` clauses from an earlier run. Gradle only — pom.xml exclusions
+ * are per-dependency and need a dedicated path (no Maven bundle exists yet).
+ */
+function companionExcludesForProject(project: ProjectInfo, projectBumps: BumpRequest[]): Array<{ packageName: string; reason?: string }> {
+  if (project.kind !== "gradle") return [];
+  const ids = new Set<string>();
+  for (const b of projectBumps) for (const id of b.because) ids.add(id);
+  try {
+    for (const id of managedBecauseIds(fs.readFileSync(project.manifestPath, "utf8"))) ids.add(id);
+  } catch {
+    // Unreadable manifest — nothing to self-heal.
+  }
+  return companionExclusions(ids).map(ex => ({ packageName: ex.coordinate, reason: ex.reason }));
+}
+
+/** True when the managed block already carries a bundle-triggering advisory but this run would otherwise leave the project untouched (self-heal target). */
+function bundleSelfHealNeeded(project: ProjectInfo): boolean {
+  if (project.kind !== "gradle") return false;
+  try {
+    return companionExclusions(managedBecauseIds(fs.readFileSync(project.manifestPath, "utf8"))).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoopContext, outcome: ProjectApplyOutcome, bomMap: ReadonlyMap<string, string> | null = null, protectedPins?: ReadonlySet<string>, alignedMemberOk?: (packageName: string, version: string) => boolean | null): void {
   const projectBumps = bumpsForProject(project, batch);
-  const hasExcludes = isMavenLike(project) && batch.excludes.length > 0;
+  const companionExcludes = companionExcludesForProject(project, projectBumps);
+  for (const ex of companionExcludes) console.log(`  [${project.label}] fix-bundle exclusion: ${ex.packageName}`);
+  const excludes = [...batch.excludes, ...companionExcludes];
+  const hasExcludes = isMavenLike(project) && excludes.length > 0;
   if (projectBumps.length === 0 && !hasExcludes && bomMap === null) return;
-  const applyResult = applyManifestBumps(project, projectBumps, batch.excludes, bomMap, protectedPins, batch.packages, alignedMemberOk);
+  const applyResult = applyManifestBumps(project, projectBumps, excludes, bomMap, protectedPins, batch.packages, alignedMemberOk);
   for (const w of applyResult.warnings) console.log(`  [${project.label}] ${w}`);
   // Record applied bumps by method classification (direct + constrained are both written to disk)
   const recorded = new Set<string>();
@@ -1952,6 +1984,7 @@ function applyProjectBumps(project: ProjectInfo, batch: ApplyBatch, ctx: FixLoop
     if (applyResult.missed.includes(c.packageName)) outcome.excludedWritten.push(c.packageName);
   }
   if (projectBumps.length === 0 && outcome.excludedWritten.length > 0) outcome.fileChanges++;
+  if (companionExcludes.length > 0 && projectBumps.length === 0 && outcome.excludedWritten.length === 0) outcome.fileChanges++;
   if (applyResult.droppedStale?.length) outcome.fileChanges++;
 }
 
@@ -2367,7 +2400,7 @@ async function main() {
     const { approved: applySource } = await filterBySourceGate(pass.effectiveRenames, pass.effectiveRenames.length > 0);
     await reportOrConfirmApply(ctx, pass, plannedSourceMigrations, applySource);
 
-    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings, batch.packages).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps, protectedByProject));
+    const projectsToTouch = projects.filter(project => bumpsForProject(project, batch).length > 0 || renamesForProject(project, batch.renames, batch.findings, batch.packages).length > 0 || (pass.effectiveExcludes.length > 0 && isMavenLike(project)) || bomPinCleanupNeeded(project, bomMaps, protectedByProject) || bundleSelfHealNeeded(project));
     const applied = await runApplyPass(ctx, projectsToTouch, batch, applySource, bomMaps, protectedByProject);
     ctx.lastAppliedCount = applied.passFileChanges;
     if (applied.passFileChanges > 0) {

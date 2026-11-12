@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { POM_MARKER_BEGIN, POM_MARKER_END } from "../src/lib/brand.ts";
+import { AUTO_DEPENDER_POM_MARKER_BEGIN, AUTO_DEPENDER_POM_MARKER_END, POM_MARKER_BEGIN, POM_MARKER_END } from "../src/lib/brand.ts";
 import { applyBumps, removeManagedPin } from "../src/lib/pom-editor.ts";
 
 function withTempPom(content: string, run: (filePath: string) => void): void {
@@ -472,6 +472,76 @@ describe("managed block comment preservation (Maven)", () => {
       expect(after).toContain("documents why this stays pinned");
       expect(after).not.toContain("this pin is going away");
       expect(versionOf(after, "com.example", "keep-old")).toBe("1.0.0");
+    });
+  });
+});
+
+describe("legacy managed-block brands", () => {
+  function dualPom(pinsLegacy: Array<{ pkg: string; version: string }>, pinsCurrent: Array<{ pkg: string; version: string }>): string {
+    const dep = (pkg: string, version: string) => {
+      const [groupId, artifactId] = pkg.split(":");
+      return [
+        "            <dependency>",
+        `                <groupId>${groupId}</groupId>`,
+        `                <artifactId>${artifactId}</artifactId>`,
+        `                <version>${version}</version>`,
+        "            </dependency>",
+      ].join("\n");
+    };
+    return [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      "<project>",
+      "    <modelVersion>4.0.0</modelVersion>",
+      "    <groupId>com.example</groupId>",
+      "    <artifactId>app</artifactId>",
+      "    <version>0.1</version>",
+      "    <dependencyManagement>",
+      "        <dependencies>",
+      AUTO_DEPENDER_POM_MARKER_BEGIN,
+      ...pinsLegacy.map(p => dep(p.pkg, p.version)),
+      AUTO_DEPENDER_POM_MARKER_END,
+      POM_MARKER_BEGIN,
+      ...pinsCurrent.map(p => dep(p.pkg, p.version)),
+      POM_MARKER_END,
+      "        </dependencies>",
+      "    </dependencyManagement>",
+      "</project>",
+    ].join("\n");
+  }
+
+  it("consolidates a pre-existing auto-depender pin block into the canonical one", () => {
+    withTempPom(dualPom(
+      [{ pkg: "ch.qos.logback:logback-classic", version: "1.6.5" }],
+      [{ pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" }],
+    ), filePath => {
+      applyBumps(filePath, [{
+        packageName: "org.objenesis:objenesis",
+        targetVersion: "3.6",
+        because: ["CVE-2026-116486"],
+      }]);
+      const after = readPom(filePath);
+      expect(after.split(POM_MARKER_BEGIN).length - 1).toBe(1);
+      expect(after).not.toContain(AUTO_DEPENDER_POM_MARKER_BEGIN);
+      expect(versionOf(after, "ch.qos.logback", "logback-classic")).toBe("1.6.5");
+      expect(versionOf(after, "org.glassfish.jaxb", "jaxb-core")).toBe("3.0.2");
+      expect(versionOf(after, "org.objenesis", "objenesis")).toBe("3.6");
+    });
+  });
+
+  it("keeps the canonical block's version when both pom blocks pin the same package", () => {
+    withTempPom(dualPom(
+      [{ pkg: "com.example:lib", version: "1.0.0" }],
+      [{ pkg: "com.example:lib", version: "1.2.0" }],
+    ), filePath => {
+      applyBumps(filePath, [{
+        packageName: "com.other:tool",
+        targetVersion: "2.0.0",
+        because: ["CVE-X"],
+      }]);
+      const after = readPom(filePath);
+      expect(after.split(POM_MARKER_BEGIN).length - 1).toBe(1);
+      expect(versionOf(after, "com.example", "lib")).toBe("1.2.0");
+      expect(after).not.toContain("<version>1.0.0</version>");
     });
   });
 });
