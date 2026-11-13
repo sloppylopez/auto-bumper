@@ -23,6 +23,72 @@ function hasFixBoundary(range: { events?: unknown[] }): boolean {
   return false;
 }
 
+type RangeEvent = Record<string, unknown>;
+
+/** Events on the range itself, plus flat or CPE-nested extracted_events. */
+function collectRangeEvents(range: { events?: unknown[]; database_specific?: { extracted_events?: unknown[] } }): RangeEvent[] {
+  const out: RangeEvent[] = [];
+  for (const ev of range.events || []) {
+    if (ev && typeof ev === "object") out.push(ev as RangeEvent);
+  }
+  const extracted = range.database_specific?.extracted_events;
+  if (!Array.isArray(extracted)) return out;
+  for (const item of extracted) {
+    if (!item || typeof item !== "object") continue;
+    const it = item as RangeEvent;
+    if (Array.isArray(it.range)) {
+      for (const ev of it.range) {
+        if (ev && typeof ev === "object") out.push(ev as RangeEvent);
+      }
+    } else {
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+function versionField(ev: RangeEvent, key: string): string | null {
+  const value = ev[key];
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || !isVersionLike(trimmed)) return null;
+  return trimmed;
+}
+
+/**
+ * Drop ranges with no fix boundary when a sibling range for the same package already has one
+ * and this range starts inside that closed window. A Snyk or mirror record of "introduced, no
+ * fixed" must not re-flag a version the other record closed. A range that starts strictly
+ * after every sibling end is a newer open line and is kept.
+ */
+export function dropUnboundedRangesShadowedByFix<T>(ranges: readonly T[] | undefined, ecosystem: string): T[] {
+  const list = [...(ranges ?? [])];
+  const described = list.map(range => {
+    const events = collectRangeEvents(range as { events?: unknown[]; database_specific?: { extracted_events?: unknown[] } });
+    const ends: string[] = [];
+    const introduced: string[] = [];
+    for (const ev of events) {
+      for (const key of TERMINATOR_EVENTS) {
+        const end = versionField(ev, key);
+        if (end) ends.push(end);
+      }
+      const intro = versionField(ev, "introduced");
+      if (intro) introduced.push(intro);
+    }
+    return { range, ends, introduced };
+  });
+  const ends = described.flatMap(d => d.ends);
+  if (ends.length === 0) return list;
+  return described.filter(d => {
+    if (d.ends.length > 0) return true;
+    if (d.introduced.length === 0) return false;
+    const overlapsClosedWindow = d.introduced.some(intro =>
+      ends.some(end => comparePackageVersion(intro, end, ecosystem) <= 0),
+    );
+    return !overlapsClosedWindow;
+  }).map(d => d.range);
+}
+
 function affectedKey(affected: any, entryEcosystem?: string): string | null {
   const name = affected?.package?.name;
   const eco = affected?.package?.ecosystem ?? entryEcosystem;
@@ -221,7 +287,8 @@ function isCuratedListAuthoritative(id: string | undefined, affected: { versions
 
 /** Try all range-based matching with ecosystem routing */
 function tryRanges(version: string, affected: { ranges?: Array<{ type?: string; events?: unknown[]; representations?: Array<{ range?: string; type?: string }> }> }, eco: string): AffectedResult {
-  for (const r of affected.ranges || []) {
+  const ranges = dropUnboundedRangesShadowedByFix(affected.ranges, eco);
+  for (const r of ranges) {
     // ECOSYSTEM/GIT event-based ranges
     const eventResult = tryEventRange(version, r, eco);
     if (eventResult.isAffected) return eventResult;

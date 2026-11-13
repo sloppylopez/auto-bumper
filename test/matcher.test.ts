@@ -881,6 +881,43 @@ describe("isVersionAffected with CPE-nested extracted_events", () => {
   });
 });
 
+describe("unbounded range next to a closed one", () => {
+  const pkg = (version: string) => [{ ecosystem: "maven", name: "org.example:lib", version, manifestPath: "pom.xml" }];
+  const entry = {
+    id: "CVE-MERGE",
+    aliases: [],
+    ecosystems: ["maven"],
+    summary: "bounded osv plus vague snyk",
+    severity: [],
+    affected: [{
+      package: { name: "org.example:lib", ecosystem: "Maven" },
+      ranges: [
+        { type: "ECOSYSTEM", events: [{ introduced: "2.0.0" }, { fixed: "2.5.0" }] },
+        { type: "ECOSYSTEM", events: [{ introduced: "0" }] },
+        { type: "ECOSYSTEM", events: [{ introduced: "3.0.0" }] },
+      ],
+    }],
+    links: [],
+  };
+
+  it("does not flag a version the closed range already fixed", () => {
+    expect(matchVulnerabilities(pkg("2.6.0"), [entry])).toHaveLength(0);
+  });
+
+  it("still flags a version inside the closed window", () => {
+    const findings = matchVulnerabilities(pkg("2.1.0"), [entry]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].introduced).toBe("2.0.0");
+    expect(findings[0].fixedVersions).toContain("2.5.0");
+  });
+
+  it("keeps a newer open line that starts after every fix", () => {
+    const findings = matchVulnerabilities(pkg("3.1.0"), [entry]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].introduced).toBe("3.0.0");
+  });
+});
+
 describe("entryAffectsPackage", () => {
   const mavenEntry = {
     id: "GHSA-m", aliases: [], ecosystems: ["maven"], summary: "", severity: [],

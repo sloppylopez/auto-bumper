@@ -2,8 +2,11 @@
  * Combine two advisory records that share an id.
  * Affected packages are unioned. Ranges for the same package are concatenated
  * so a richer record cannot drop another package or a newer fixed version.
+ * A range with no fix boundary is then dropped when it only restates a window
+ * a sibling range already closed.
  */
 import type { AdvisoryEntry } from "./types.ts";
+import { dropUnboundedRangesShadowedByFix } from "./matcher.ts";
 
 type AffectedBlock = AdvisoryEntry["affected"][number];
 
@@ -61,9 +64,10 @@ function unionAffected(a: AdvisoryEntry["affected"], b: AdvisoryEntry["affected"
       continue;
     }
     const base = blockRichness(block) > blockRichness(prev) ? block : prev;
+    const eco = block.package?.ecosystem || prev.package?.ecosystem || "";
     byKey.set(key, {
       ...structuredClone(base),
-      ranges: unionRanges(prev.ranges, block.ranges),
+      ranges: dropUnboundedRangesShadowedByFix(unionRanges(prev.ranges, block.ranges), eco),
       versions: unionStrings(prev.versions, block.versions),
     });
   }

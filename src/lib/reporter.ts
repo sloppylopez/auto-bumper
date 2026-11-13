@@ -2,6 +2,7 @@
  * Reporter — Format vulnerability findings as markdown or JSON output.
  */
 import { PRODUCT_NAME } from "./brand.ts";
+import { comparePackageVersion } from "./matcher.ts";
 import type { Finding } from "./types.ts";
 
 interface ReportOptions {
@@ -89,8 +90,8 @@ function renderSection(sev: string, items: Finding[], opts: Required<ReportOptio
   const emoji = SEVERITY_EMOJI[sev] ?? "⚪";
   const label = `${sev.charAt(0).toUpperCase()}${sev.slice(1).toLowerCase()}`;
   let output = `### ${emoji} ${label} (${items.length})\n\n`;
-  output += "| Package | Version | Fixed | Aliases | Summary |\n";
-  output += "|---------|---------|-------|---------|----------|\n";
+  output += "| Package | Installed | Window | Aliases | Summary |\n";
+  output += "|---------|-----------|--------|---------|----------|\n";
 
   const displayItems = items.slice(0, opts.maxPerGroup);
   for (const f of displayItems) {
@@ -106,16 +107,18 @@ function renderSection(sev: string, items: Finding[], opts: Required<ReportOptio
 
 /** Render a single finding as a table row */
 function renderFindingRow(f: Finding): string {
-  const fixed = formatFixedVersions(f.fixedVersions);
   const aliases = f.aliases.slice(0, 2).join(", ").slice(0, 30);
   const summary = f.summary.length > 40 ? f.summary.slice(0, 40) + "…" : f.summary;
-  return `| \`${f.packageName}\` | ${f.installedVersion} | ${fixed} | ${aliases} | ${summary} |\n`;
+  return `| \`${f.packageName}\` | ${f.installedVersion} | ${formatWindow(f)} | ${aliases} | ${summary} |\n`;
 }
 
-/** Format fixed versions list, truncating to first 3 entries */
-function formatFixedVersions(versions: string[]): string {
-  if (!versions.length) return "—";
-  return versions.slice(0, 3).join(", ").slice(0, 20);
+/** Introduced through a fix above the installed version, or last-affected when nothing newer is fixed. */
+function formatWindow(f: Finding): string {
+  const start = f.introduced ?? "any";
+  const ahead = f.fixedVersions.filter(v => comparePackageVersion(v, f.installedVersion, f.ecosystem) > 0);
+  if (ahead.length > 0) return `${start} → ${ahead.slice(0, 3).join(", ")}`;
+  if (f.lastAffected) return `${start} → ${f.lastAffected} last`;
+  return `${start} → no fix`;
 }
 
 /** Generate JSON output from findings */
