@@ -223,6 +223,8 @@ Example dry-run output (Jackson is one real migration; others work the same way)
 ```
 # Auto-Bumper Gradle Fix Report
 
+Warnings 2 · Planned 1
+
 ## Planned renames (1)
 
 | From | To | Version | Advisories |
