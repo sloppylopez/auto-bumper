@@ -7,7 +7,7 @@ const RESET = "\u001b[0m";
 
 const STATUS_LABEL =
   "Unfixable|Remaining|Rolled back|Skipped major|Skipped renames|Warnings|Applied|Planned|Families";
-const STATUS_PART = new RegExp(`^(?:${STATUS_LABEL}) \\d+$`);
+const STATUS_PART = new RegExp(String.raw`^(?:${STATUS_LABEL}) \d+$`);
 
 const STATUS_CODE: Record<string, string> = {
   Unfixable: "31",
