@@ -847,7 +847,7 @@ export function parsePomXml(filePath: string): ParseResult {
  * Linear scan; a value may not contain `<` (same shape constraint as the legacy
  * backtracking regex), and malformed pairs resume scanning right after their open tag.
  */
-function parsePomProperties(content: string): Record<string, string> {
+export function parsePomProperties(content: string): Record<string, string> {
   const properties: Record<string, string> = {};
   const openIdx = content.indexOf("<properties>");
   if (openIdx < 0) return properties;

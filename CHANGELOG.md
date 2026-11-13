@@ -2,6 +2,12 @@
 
 All notable changes to `@elephantseed/auto-bumper`.
 
+## [Unreleased]
+
+### Fixed
+- `fix --apply` (Maven) no longer rolls back downgrades on an environmental compile-check failure: when the pom's required Java release (compiler plugin `<release>`, else `maven.compiler.release`, else `java.version`) is newer than the JDK in `JAVA_HOME`/PATH, the post-downgrade compile check cannot succeed for reasons unrelated to the downgrade — e.g. a pom targeting Java 25 built with JDK 21 fails with "release version 25 not supported". The check is now skipped for that project, the downgrades are kept, and they are reported as `Unverified downgrades` (counted toward a non-zero exit under strict mode) with advice to re-run under the project's JDK
+- Compile-check failure details no longer show only the last three lines of build output — for Maven that was always the generic `[Help 1]` footer, hiding the real error. The reported detail now leads with the `Failed to execute goal` / `FAILURE:` headline and its concrete error lines, with the footer noise dropped
+
 ## [1.0.0] - 2026-11-12
 
 ### Added

@@ -12,7 +12,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
-import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchLaunch } from "../src/lib/parse-lockfile.ts";
+import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomProperties, parsePomXmlDirect, windowsBatchLaunch } from "../src/lib/parse-lockfile.ts";
 import { buildFixPlan, familyOf, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
@@ -1120,6 +1120,8 @@ interface FixLoopContext {
   allSkippedRenames: FixCandidate[];
   allSkippedUnresolvable: AppliedBump[];
   allRolledBackDowngrades: AppliedBump[];
+  /** Downgrades applied but not compile-checked (environment cannot build the project); kept, reported, and counted as incomplete under strict exit. */
+  unverifiedDowngrades: number;
   sessionUnresolvable: Set<string>;
   approvedExcludeCoords: Set<string>;
   excludeFailedCoords: Set<string>;
@@ -1240,7 +1242,7 @@ function reportCleanExit(ctx: FixLoopContext): never {
   // Successfully excluded packages are reported in the Applied section — do not re-list them as unfixable.
   const unfixableShown = ctx.lastUnfixable.filter(u => !ctx.approvedExcludeCoords.has(u.packageName));
   if (outputFormat === "json") {
-    console.log(JSON.stringify({ status: "clean", applied: ctx.allApplied, skippedMajors: ctx.allSkippedMajors, skippedUnresolvable: ctx.allSkippedUnresolvable, rolledBackDowngrades: ctx.allRolledBackDowngrades }, null, 2));
+    console.log(JSON.stringify({ status: "clean", applied: ctx.allApplied, skippedMajors: ctx.allSkippedMajors, skippedUnresolvable: ctx.allSkippedUnresolvable, rolledBackDowngrades: ctx.allRolledBackDowngrades, unverifiedDowngrades: ctx.unverifiedDowngrades }, null, 2));
   } else if (ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) {
     console.log(planMarkdown({ fixable: [], unfixable: [], renames: [], downgrades: [] }, { applied: ctx.allApplied, unfixableRemaining: unfixableShown, labels: ctx.labels, skippedMajors: ctx.allSkippedMajors, skippedRenames: ctx.allSkippedRenames, healthWarnings: ctx.lastHealthWarnings, familyMigrations: ctx.lastFamilyMigrations, sourceMigrations: null, skippedSourceMigrations: false, skippedUnresolvable: ctx.allSkippedUnresolvable }));
     if (ctx.allSkippedUnresolvable.length > 0) console.log(`Remaining issues: ${ctx.allSkippedUnresolvable.length} fix(es) rolled back — target version not resolvable from project repositories.`);
@@ -1251,9 +1253,10 @@ function reportCleanExit(ctx: FixLoopContext): never {
   } else {
     console.log("No vulnerabilities found.");
   }
+  if (ctx.unverifiedDowngrades > 0) console.log(`Unverified downgrades: ${ctx.unverifiedDowngrades} — compile check skipped because this environment cannot build the project; re-run with the project's JDK to verify.`);
   for (const p of ctx.projects) discardManifestBackup(p);
   discardSourceMigrationBackups(ctx.allSourceChanged);
-  process.exit((ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) && strictExit ? 1 : 0);
+  process.exit((ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0 || ctx.unverifiedDowngrades > 0) && strictExit ? 1 : 0);
 }
 
 /** Plan + gate decisions for one pass. */
@@ -2228,7 +2231,22 @@ function javaCompileCommand(project: ProjectInfo): { bin: string; args: string[]
   return mvn ? { bin: mvn.executable, args: ["-q", "-DskipTests", "test-compile"], label: "mvn -q -DskipTests test-compile" } : null;
 }
 
-/** Run a compile check synchronously; returns the tail of the output on failure. */
+/**
+ * Distill a failed build log into the lines that explain why it failed. Maven's generic
+ * "[Help 1]" footer is dropped; when present the "Failed to execute goal" / "FAILURE:" headline
+ * leads, followed by the concrete error lines that carry with it.
+ */
+export function extractBuildFailureDetail(text: string): string {
+  const noise = /^(?:\[ERROR\]\s*)?(?:For more information about the errors|To see the full stack trace|Re-run Maven using the -X switch|\[Help \d+\])/i;
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l !== "" && !noise.test(l));
+  if (lines.length === 0) return "";
+  const head = lines.findIndex(l => /Failed to execute goal|FAILURE: Build failed/i.test(l));
+  if (head !== -1) return lines.slice(head, head + 6).join(" ");
+  const errors = lines.filter(l => /error|fail/i.test(l));
+  return (errors.length > 0 ? errors : lines.slice(-3)).slice(0, 6).join(" ");
+}
+
+/** Run a compile check synchronously; on failure returns the error lines from the build log. */
 function runCompileCheck(command: { bin: string; args: string[] }, cwd: string): { ok: boolean; detail: string } {
   const base = { encoding: "utf-8" as const, timeout: 900_000, cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, shell: false as const };
   let result;
@@ -2248,8 +2266,68 @@ function runCompileCheck(command: { bin: string; args: string[] }, cwd: string):
   }
   if (result.status === 0 && !result.error) return { ok: true, detail: "" };
   const text = `${result.stderr || ""}\n${result.stdout || ""}`.trim();
-  const tail = text.split(/\r?\n/).filter(Boolean).slice(-3).join(" ");
-  return { ok: false, detail: (tail || result.error?.message || `exit ${result.status}`).slice(0, 400) };
+  const detail = extractBuildFailureDetail(text);
+  return { ok: false, detail: (detail || result.error?.message || `exit ${result.status}`).slice(0, 800) };
+}
+
+/** Parse a `java -version` banner (e.g. `openjdk version "21.0.5"`, `java version "1.8.0_392"`) into a major version. */
+export function parseJavaMajorVersion(banner: string): number | null {
+  const m = /version "(\d+)(?:\.(\d+))?/.exec(banner);
+  if (!m) return null;
+  return m[1] === "1" && m[2] ? Number(m[2]) : Number(m[1]);
+}
+
+/** Major version of the JDK a compile check would run on (JAVA_HOME, else PATH's java); null when undeterminable. */
+function detectJavaMajorVersion(): number | null {
+  let bin = "java";
+  const home = process.env.JAVA_HOME;
+  if (home) {
+    const candidate = path.join(home, "bin", process.platform === "win32" ? "java.exe" : "java");
+    if (fs.existsSync(candidate)) bin = candidate;
+  }
+  try {
+    const r = childProcess.spawnSync(bin, ["-version"], { encoding: "utf-8", timeout: 30_000, windowsHide: true });
+    return parseJavaMajorVersion(`${r.stderr || ""}\n${r.stdout || ""}`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Java release a Maven build compiles against: the compiler plugin's <release> when set,
+ * else the maven.compiler.release property, else java.version. Null when the pom declares none.
+ */
+export function mavenRequiredJavaRelease(pomPath: string): number | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(pomPath, "utf-8");
+  } catch {
+    return null;
+  }
+  const properties = parsePomProperties(content);
+  const resolve = (value: string): string => value.replace(/\$\{([^}]+)\}/g, (_, name) => properties[name] ?? _);
+  const candidates: string[] = [];
+  // Compiler plugin <release>: shorthand <maven-compiler-plugin>…</maven-compiler-plugin>, else the full <plugin> block.
+  let block = /<maven-compiler-plugin>([\s\S]*?)<\/maven-compiler-plugin>/.exec(content)?.[1];
+  if (block === undefined) {
+    const idx = content.indexOf("maven-compiler-plugin");
+    if (idx !== -1) {
+      const end = content.indexOf("</plugin>", idx);
+      if (end !== -1) block = content.slice(idx, end);
+    }
+  }
+  const pluginRelease = block ? /<release>\s*([^<\s][^<]*?)\s*<\/release>/.exec(block) : undefined;
+  if (pluginRelease) candidates.push(resolve(pluginRelease[1]));
+  for (const key of ["maven.compiler.release", "java.version"]) {
+    const value = properties[key];
+    if (value) candidates.push(resolve(value));
+  }
+  for (const candidate of candidates) {
+    const m = /^(\d+)(?:\.(\d+))?$/.exec(candidate.trim());
+    if (!m) continue;
+    return m[1] === "1" && m[2] ? Number(m[2]) : Number(m[1]);
+  }
+  return null;
 }
 
 /**
@@ -2271,6 +2349,22 @@ function verifyDowngradeBuilds(ctx: FixLoopContext, projectsToTouch: ProjectInfo
     if (!command) {
       console.log(`  ! ${project.label}: no build tool found — skipping compile check for ${downgrades.length} downgrade(s)`);
       continue;
+    }
+    // Preflight: when this environment's JDK cannot build the project at all (older than the
+    // release the pom targets), a failed compile check would be environmental noise — keep the
+    // downgrade(s) unverified instead of rolling them back on a false positive.
+    if (project.kind === "maven") {
+      const required = mavenRequiredJavaRelease(project.manifestPath);
+      if (required !== null) {
+        const have = detectJavaMajorVersion();
+        if (have !== null && have < required) {
+          const msg = `${project.label}: ${downgrades.length} downgrade(s) NOT compile-checked — pom targets Java ${required} but this environment provides Java ${have}; set JAVA_HOME to JDK ${required}+ and re-run to verify`;
+          console.log(`  ! ${msg}`);
+          ctx.lastHealthWarnings.push(msg);
+          ctx.unverifiedDowngrades += downgrades.length;
+          continue;
+        }
+      }
     }
     console.log(`  Compiling ${project.label} after downgrade (${command.label})...`);
     const result = runCompileCheck(command, path.dirname(project.manifestPath));
@@ -2310,7 +2404,7 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
     console.error("Lockfile was not updated after apply. The lock may still pin the vulnerable version.");
     process.exit(1);
   }
-  if (finalFindings.length === 0 && ctx.allSkippedUnresolvable.length === 0 && ctx.allRolledBackDowngrades.length === 0) {
+  if (finalFindings.length === 0 && ctx.allSkippedUnresolvable.length === 0 && ctx.allRolledBackDowngrades.length === 0 && ctx.unverifiedDowngrades === 0) {
     if (ctx.incompleteScan) {
       console.error("Scan incomplete: dependency tree or advisory data was not fully loaded. Not reporting a clean result.");
       process.exit(2);
@@ -2321,8 +2415,9 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   if (finalFindings.length > 0) console.log(`Remaining vulnerabilities: ${finalFindings.length}`);
   if (ctx.allSkippedUnresolvable.length > 0) console.log(`Rolled back fixes: ${ctx.allSkippedUnresolvable.length} — target version not resolvable from project repositories.`);
   if (ctx.allRolledBackDowngrades.length > 0) console.log(`Rolled back downgrades: ${ctx.allRolledBackDowngrades.length} — build failed after downgrade; original versions kept.`);
+  if (ctx.unverifiedDowngrades > 0) console.log(`Unverified downgrades: ${ctx.unverifiedDowngrades} — compile check skipped because this environment cannot build the project; re-run with the project's JDK to verify.`);
   if (reportApplied.length > 0) console.log("Bumps were applied. Re-run scan to verify, or use --exclude=group:artifact for unfixable OSV noise.");
-  process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0) && strictExit ? 1 : 0);
+  process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0 || ctx.unverifiedDowngrades > 0) && strictExit ? 1 : 0);
 }
 
 async function main() {
@@ -2354,6 +2449,7 @@ async function main() {
     lastUnfixable: [],
     lastFamilyMigrations: [],
     allRolledBackDowngrades: [],
+    unverifiedDowngrades: 0,
     lastHealthWarnings: [],
     iteration: 0,
     prevFindingSig: null,
