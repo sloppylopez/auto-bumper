@@ -74,6 +74,11 @@ describe("parseGhsaRange", () => {
     expect(parseGhsaRange(">= 4.2.0.Final, <= 4.2.17.Final")).toEqual({ gte: "4.2.0.Final", lte: "4.2.17.Final" });
   });
 
+  it("preserves strict upper bounds", () => {
+    expect(parseGhsaRange("< 2.0.0")).toEqual({ lt: "2.0.0" });
+    expect(parseGhsaRange(">= 1.0.0, < 2.0.0")).toEqual({ gte: "1.0.0", lt: "2.0.0" });
+  });
+
   it("parses open-ended ranges", () => {
     expect(parseGhsaRange(">= 1.0")).toEqual({ gte: "1.0" });
     expect(parseGhsaRange("<= 2.0")).toEqual({ lte: "2.0" });
@@ -109,6 +114,20 @@ describe("ghsaToOsv", () => {
     });
     expect(rec?.affected[0].versions).toEqual(["1.2.3"]);
     expect(rec?.affected[0].ranges).toEqual([]);
+  });
+
+  it("converts strict upper bounds into exclusive fixed events", () => {
+    const rec = ghsaToOsv({
+      ...nettyAdvisory,
+      vulnerabilities: [{
+        package: nettyAdvisory.vulnerabilities![0].package,
+        vulnerable_version_range: ">= 1.0.0, < 2.0.0",
+        first_patched_version: "2.0.0",
+      }],
+    });
+    expect(rec?.affected[0].ranges).toEqual([
+      { type: "ECOSYSTEM", events: [{ introduced: "1.0.0" }, { fixed: "2.0.0" }] },
+    ]);
   });
 
   it("skips maven patched versions at or below the inclusive upper bound", () => {
@@ -341,6 +360,17 @@ describe("loadRepoAdvisories", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("marks a missing offline cache as incomplete", async () => {
+    clearGhsaCache();
+    let incomplete = false;
+    const recs = await loadRepoAdvisories({
+      offline: true,
+      onIncomplete: () => { incomplete = true; },
+    });
+    expect(recs).toEqual([]);
+    expect(incomplete).toBe(true);
+  });
+
   it("sends GITHUB_TOKEN when set", async () => {
     clearGhsaCache();
     process.env.GITHUB_TOKEN = "test-token";
@@ -379,9 +409,14 @@ describe("loadRepoAdvisories", () => {
     fs.utimesSync(gz, old, old);
     fetchMock.mockImplementation(async () => new Response(JSON.stringify([]), { status: 200 }));
     const warnings: string[] = [];
-    const recs = await loadRepoAdvisories({ onWarning: (msg) => warnings.push(msg) });
+    let incomplete = false;
+    const recs = await loadRepoAdvisories({
+      onWarning: (msg) => warnings.push(msg),
+      onIncomplete: () => { incomplete = true; },
+    });
     expect(recs[0]?.id).toBe("GHSA-q9pg-8h3j-8hvm");
     expect(warnings[0]).toContain("empty list");
+    expect(incomplete).toBe(true);
     expect(readGhsaSince()).toBeNull();
   });
 
@@ -402,9 +437,14 @@ describe("loadRepoAdvisories", () => {
       return new Response(JSON.stringify([nettyAdvisory]), { status: 200, headers: { link } });
     });
     const warnings: string[] = [];
-    const partialRecs = await loadRepoAdvisories({ onWarning: (msg) => warnings.push(msg) });
+    let incomplete = false;
+    const partialRecs = await loadRepoAdvisories({
+      onWarning: (msg) => warnings.push(msg),
+      onIncomplete: () => { incomplete = true; },
+    });
     expect(partialRecs.map(r => r.id)).toEqual(["GHSA-q9pg-8h3j-8hvm"]);
     expect(warnings[0]).toContain("partial cache");
+    expect(incomplete).toBe(true);
     expect(fs.existsSync(path.join(dbDir, "repo-advisories.json.gz"))).toBe(true);
     expect(readGhsaSince()).toBeNull();
 

@@ -32,7 +32,7 @@ export interface Finding {
   fixedVersions: string[];
   /** Inclusive last affected version when the advisory has no `fixed` event. */
   lastAffected?: string;
-  /** Exclusive lower bound of the matching affected window (OSV `introduced` event); versions strictly below it are not affected by this advisory. Event-based ranges only — undefined when the range carries no such bound. */
+  /** Inclusive lower bound of the matching affected window (OSV `introduced` event); versions below it are not affected by this advisory. Event-based ranges only — undefined when the range carries no such bound. */
   introduced?: string;
   /** Severity level */
   severity: "LOW" | "MODERATE" | "HIGH" | "CRITICAL" | "UNKNOWN";

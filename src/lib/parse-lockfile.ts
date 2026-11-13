@@ -350,6 +350,7 @@ function appendNestedManifests(
   allPackages: PackageRef[],
   warnings: string[],
   allUnresolved: string[] | null,
+  treeFlags: { incompleteTree: boolean },
 ): boolean {
   let found = false;
   for (const manifest of listNestedManifests(root)) {
@@ -357,11 +358,12 @@ function appendNestedManifests(
     const java = manifest.kind === "maven" || manifest.kind === "gradle";
     if (java) {
       if (result.packages.length === 0 && result.warnings.length === 0) continue;
+      noteIncompleteTree(result, `nested ${manifest.kind} manifest uses direct dependencies only`);
     } else if (result.packages.length === 0) {
       continue;
     }
     found = true;
-    mergeParseResult(result, allPackages, warnings, allUnresolved);
+    mergeParseResult(result, allPackages, warnings, allUnresolved, treeFlags);
   }
   return found;
 }
@@ -392,7 +394,7 @@ export function parseLockfile(dirPath: string): ParseResult {
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
-  if (appendNestedManifests(resolvedDir, allPackages, warnings, null)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, null, treeFlags)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -958,9 +960,8 @@ function findUp(dir: string, fileName: string): string | null {
  */
 export function windowsBatchArgs(executable: string, args: string[]): string[] {
   const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
-  // cmd.exe cannot resolve a quoted bare .cmd/.bat name through PATH (it fails silently);
-  // only quote the executable when the path actually contains whitespace.
-  const exe = /\s/.test(executable) ? quote(executable) : executable;
+  // Keep simple bare names unquoted for PATH lookup; quote wrapper paths even without spaces.
+  const exe = /^[A-Za-z0-9._-]+$/.test(executable) ? executable : quote(executable);
   const command = `"${[exe, ...args.map(quote)].join(" ")}"`;
   return ["/d", "/s", "/c", command];
 }
@@ -1049,7 +1050,17 @@ export function dedupeResolvedPackages(packages: PackageRef[]): PackageRef[] {
   const unique = new Map<string, PackageRef>();
   for (const pkg of packages) {
     const key = `${pkg.name.toLowerCase()}@${pkg.version}`;
-    if (!unique.has(key)) unique.set(key, pkg);
+    const existing = unique.get(key);
+    if (!existing) {
+      unique.set(key, pkg);
+      continue;
+    }
+    if (pkg.requiredBy?.length) {
+      const requiredBy = existing.requiredBy ?? (existing.requiredBy = []);
+      for (const parent of pkg.requiredBy) {
+        if (!requiredBy.includes(parent)) requiredBy.push(parent);
+      }
+    }
   }
   return [...unique.values()];
 }
@@ -1196,6 +1207,7 @@ function matchesCoordShape(token: string): boolean {
 export function parseMavenTree(output: string, filePath: string): ParseResult {
   const pkgs: PackageRef[] = [];
   const seen = new Set<string>();
+  const byKey = new Map<string, PackageRef>();
   // Monotonic stack of (prefix length, coordinate) — the top entry with a shorter prefix than the
   // current line is its parent. Prefix length grows strictly with depth in dependency:tree output,
   // so raw lengths compare correctly without assuming an exact cell width.
@@ -1209,7 +1221,8 @@ export function parseMavenTree(output: string, filePath: string): ParseResult {
       const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
       const trimmed = line.slice(prefixLen).trim();
       if (!trimmed) continue;
-      if (/omitted for duplicate|omitted for conflict/i.test(trimmed)) continue;
+      if (/omitted for conflict/i.test(trimmed)) continue;
+      const duplicate = /omitted for duplicate/i.test(trimmed);
       const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
       if (!match) continue;
 
@@ -1222,7 +1235,15 @@ export function parseMavenTree(output: string, filePath: string): ParseResult {
     const parentName = parentStack.length > 0 ? parentStack[parentStack.length - 1].name : null;
 
     const key = `${group.toLowerCase()}:${artifact.toLowerCase()}@${version}`;
-    if (seen.has(key)) continue;
+    const existing = byKey.get(key);
+    if (duplicate || seen.has(key)) {
+      if (existing && parentName) {
+        const requiredBy = existing.requiredBy ?? (existing.requiredBy = []);
+        if (!requiredBy.includes(parentName)) requiredBy.push(parentName);
+      }
+      parentStack.push({ prefixLen, name: `${group}:${artifact}` });
+      continue;
+    }
     seen.add(key);
     const pkg: PackageRef = {
       ecosystem: "maven",
@@ -1232,6 +1253,7 @@ export function parseMavenTree(output: string, filePath: string): ParseResult {
     };
     if (parentName) pkg.requiredBy = [parentName];
     pkgs.push(pkg);
+    byKey.set(key, pkg);
     parentStack.push({ prefixLen, name: `${group}:${artifact}` });
   }
 
@@ -1576,7 +1598,7 @@ export async function parseLockfileAsync(
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
-  if (appendNestedManifests(resolvedDir, allPackages, warnings, allUnresolved)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, allUnresolved, treeFlags)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(

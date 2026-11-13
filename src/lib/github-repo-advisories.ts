@@ -88,14 +88,15 @@ export function mergeGhsaAdvisories(
   return [...byId.values()];
 }
 
-/** Parse a GHSA vulnerable_version_range: ">= A, <= B" | "<= B" | ">= A" | "= X" | "X". */
-export function parseGhsaRange(rangeStr: string | null | undefined): { exact?: string; gte?: string; lte?: string } | null {
+/** Parse a GHSA vulnerable_version_range, including strict upper bounds such as "< B". */
+export function parseGhsaRange(rangeStr: string | null | undefined): { exact?: string; gte?: string; lte?: string; lt?: string } | null {
   if (!rangeStr || typeof rangeStr !== "string") return null;
   let gte: string | undefined;
   let lte: string | undefined;
+  let lt: string | undefined;
   let exact: string | undefined;
   for (const part of rangeStr.split(",").map(s => s.trim()).filter(Boolean)) {
-    const opMatch = /^(>=|<=|=)/.exec(part);
+    const opMatch = /^(>=|<=|<|=)/.exec(part);
     let op: string;
     let val: string;
     if (opMatch) {
@@ -108,10 +109,17 @@ export function parseGhsaRange(rangeStr: string | null | undefined): { exact?: s
     if (!val) continue;
     if (op === ">=") gte = val;
     else if (op === "<=") lte = val;
+    else if (op === "<") lt = val;
     else exact = val;
   }
   if (exact !== undefined) return { exact };
-  if (gte !== undefined || lte !== undefined) return { gte, lte };
+  if (gte !== undefined || lte !== undefined || lt !== undefined) {
+    return {
+      ...(gte !== undefined ? { gte } : {}),
+      ...(lte !== undefined ? { lte } : {}),
+      ...(lt !== undefined ? { lt } : {}),
+    };
+  }
   return null;
 }
 
@@ -176,7 +184,10 @@ function buildAffectedEntry(v: GhsaVulnerability, ecosystems: Set<string>) {
   } else if (r) {
     const events: Array<Record<string, string>> = [{ introduced: r.gte || "0" }];
     if (r.lte !== undefined) events.push({ last_affected: r.lte });
-    const fixed = firstPatchedVersion(patchedVersions(v), eco === "maven" ? r.lte : undefined);
+    if (r.lt !== undefined) events.push({ fixed: r.lt });
+    const fixed = r.lt === undefined
+      ? firstPatchedVersion(patchedVersions(v), eco === "maven" ? r.lte : undefined)
+      : null;
     if (fixed) events.push({ fixed });
     entry.ranges.push({ type: "ECOSYSTEM", events });
   }
@@ -255,6 +266,8 @@ export interface RepoAdvisoriesOptions {
   offline?: boolean;
   /** Non-fatal notes (stale cache, missing offline cache). */
   onWarning?: (msg: string) => void;
+  /** Called when cache/source coverage is incomplete. */
+  onIncomplete?: () => void;
 }
 
 function githubHeaders(withAuth: boolean = true): Record<string, string> {
@@ -354,11 +367,12 @@ async function fetchGhsaPages(
  * run completes the sync instead of starting over.
  */
 export async function loadRepoAdvisories(opts: RepoAdvisoriesOptions = {}): Promise<AdvisoryEntry[]> {
-  const { forceRefresh = false, setText, offline = false, onWarning } = opts;
+  const { forceRefresh = false, setText, offline = false, onWarning, onIncomplete } = opts;
   const cached = readCacheFile(GHSA_REPO_CACHE);
   if (offline) {
     if (cached === null) {
       onWarning?.("GitHub Maven advisories cache missing; reviewed GHSAs were not matched. Run a scan online once.");
+      onIncomplete?.();
       return [];
     }
     return cached;
@@ -390,6 +404,7 @@ export async function loadRepoAdvisories(opts: RepoAdvisoriesOptions = {}): Prom
     if (!since && active.records.length === 0) {
       if (cached !== null && cached.length > 0) {
         onWarning?.("GitHub Maven advisories returned an empty list; using cached copy");
+        if (readGhsaSince() === null) onIncomplete?.();
         return cached;
       }
       onWarning?.("GitHub Maven advisories returned an empty list");
@@ -408,10 +423,12 @@ export async function loadRepoAdvisories(opts: RepoAdvisoriesOptions = {}): Prom
       // Keep the pages that arrived; no cursor is written, so the next run re-syncs from scratch.
       writeCacheFile(GHSA_REPO_CACHE, partial);
       onWarning?.(`GitHub Maven advisories sync failed after ${partial.length} entries (${msg}); kept a partial cache — re-run to complete the sync`);
+      onIncomplete?.();
       return partial;
     }
     if (cached !== null) {
       onWarning?.(`GitHub Maven advisories unavailable (${msg}); using cached copy`);
+      if (readGhsaSince() === null) onIncomplete?.();
       return cached;
     }
     throw new Error(`GitHub Maven advisories unavailable (${msg}) and no cache exists`);

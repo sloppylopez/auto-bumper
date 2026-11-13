@@ -195,6 +195,18 @@ describe("scan cache auto-refresh", () => {
     expect(result.findings.map(f => f.id)).toContain("GHSA-repo-offline");
   });
 
+  it("marks an offline Maven scan incomplete when the GitHub cache is missing", async () => {
+    const proj = writeProj("4.2.17.Final");
+    writeGz("Maven", [], 60_000);
+    for (const ext of [".json.gz", ".json"]) {
+      fs.rmSync(path.join(dbDir(), `repo-advisories${ext}`), { force: true });
+    }
+    fs.rmSync(path.join(dbDir(), "repo-advisories.since"), { force: true });
+    const result = await scanWithoutMvn(proj, { quiet: true, offline: true });
+    expect(result.incomplete).toBe(true);
+    expect(result.warnings.some(w => w.includes("GitHub Maven advisories cache missing"))).toBe(true);
+  });
+
   it("drops excluded packages before reporting", async () => {
     const proj = writeProj("4.2.17.Final");
     writeGz("Maven", [advisory("GHSA-excluded", "io.netty:netty-codec-http3")], 60_000);

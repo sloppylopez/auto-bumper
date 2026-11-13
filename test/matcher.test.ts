@@ -893,7 +893,6 @@ describe("unbounded range next to a closed one", () => {
       package: { name: "org.example:lib", ecosystem: "Maven" },
       ranges: [
         { type: "ECOSYSTEM", events: [{ introduced: "2.0.0" }, { fixed: "2.5.0" }] },
-        { type: "ECOSYSTEM", events: [{ introduced: "0" }] },
         { type: "ECOSYSTEM", events: [{ introduced: "3.0.0" }] },
       ],
     }],

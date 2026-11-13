@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { parseMavenTree } from "../src/lib/parse-lockfile.ts";
 
 describe("parseMavenTree", () => {
-  it("retains parent edges and skips omitted-for-duplicate lines", () => {
+  it("retains parent edges from omitted-for-duplicate lines", () => {
     const tree = [
       "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ sample-app ---",
       "[INFO] com.example:sample-app:jar:0.0.1-SNAPSHOT",
@@ -10,7 +10,8 @@ describe("parseMavenTree", () => {
       "[INFO] |  \\- org.b:b:jar:2.0.0:compile",
       "[INFO] |     \\- org.d:d:jar:1.0.0:compile",
       "[INFO] \\- org.c:c:jar:3.0.0:compile",
-      "[INFO]    \\- org.b:b:jar:2.0.0:compile (omitted for duplicate)",
+      "[INFO]    +- org.b:b:jar:2.0.0:compile (omitted for duplicate)",
+      "[INFO]    \\- org.b:b:jar:1.0.0:compile (omitted for conflict)",
     ].join("\n");
     const result = parseMavenTree(tree, "pom.xml");
     expect(result.packages.map(p => p.name)).toEqual([
@@ -24,7 +25,8 @@ describe("parseMavenTree", () => {
     expect(result.packages.find(p => p.name === "com.example:sample-app")?.requiredBy).toBeUndefined();
     expect(result.packages.find(p => p.name === "org.a:a")?.requiredBy).toEqual(["com.example:sample-app"]);
     expect(result.packages.find(p => p.name === "org.c:c")?.requiredBy).toEqual(["com.example:sample-app"]);
-    expect(result.packages.find(p => p.name === "org.b:b")?.requiredBy).toEqual(["org.a:a"]);
+    expect(result.packages.find(p => p.name === "org.b:b")?.requiredBy).toEqual(["org.a:a", "org.c:c"]);
+    expect(result.packages.filter(p => p.name === "org.b:b").map(p => p.version)).toEqual(["2.0.0"]);
     expect(result.packages.find(p => p.name === "org.d:d")?.requiredBy).toEqual(["org.b:b"]);
   });
 

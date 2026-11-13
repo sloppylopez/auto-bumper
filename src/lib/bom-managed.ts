@@ -23,7 +23,8 @@ import type { AdvisoryEntry } from "./types.ts";
  */
 export function parseBomManagedVersions(pomXml: string): Map<string, string> {
   const out = new Map<string, string>();
-  const props = parsePomProperties(pomXml);
+  const unconditionalPom = pomXml.replace(/<profiles\b[^>]*>[\s\S]*?<\/profiles>/g, "");
+  const props = parsePomProperties(unconditionalPom);
 
   /** Resolve ${property} references (up to 3 nested levels). Null when unresolvable. */
   const resolveRef = (value: string): string | null => {
@@ -35,10 +36,10 @@ export function parseBomManagedVersions(pomXml: string): Map<string, string> {
       if (next === undefined) return null;
       v = next.trim();
     }
-    return v;
+    return /\$\{[^}]+\}/.test(v) ? null : v;
   };
 
-  for (const dm of pomXml.matchAll(/<dependencyManagement>[\s\S]*?<\/dependencyManagement>/g)) {
+  for (const dm of unconditionalPom.matchAll(/<dependencyManagement>[\s\S]*?<\/dependencyManagement>/g)) {
     const section = dm[0]!;
     for (const dep of section.matchAll(/<dependency>([\s\S]*?)<\/dependency>/g)) {
       const body = dep[1]!;

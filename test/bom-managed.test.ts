@@ -77,6 +77,39 @@ describe("parseBomManagedVersions", () => {
     expect(parseBomManagedVersions(pom).size).toBe(0);
   });
 
+  it("skips inactive profile dependency management and profile-only properties", () => {
+    const pom = [
+      "<project>",
+      "  <profiles>",
+      "    <profile>",
+      "      <properties><profile.version>9.9.9</profile.version></properties>",
+      "      <dependencyManagement>",
+      "        <dependencies>",
+      depEntry("org.example", "profile-only-lib", "${profile.version}"),
+      "        </dependencies>",
+      "      </dependencyManagement>",
+      "    </profile>",
+      "  </profiles>",
+      "</project>",
+    ].join("\n");
+    expect(parseBomManagedVersions(pom).size).toBe(0);
+  });
+
+  it("skips cyclic properties that remain unresolved after the resolution limit", () => {
+    const pom = [
+      "<project>",
+      "  <properties>",
+      "    <a>${b}</a>",
+      "    <b>${a}</b>",
+      "  </properties>",
+      "  <dependencyManagement><dependencies>",
+      depEntry("org.example", "cyclic-prop-lib", "${a}"),
+      "  </dependencies></dependencyManagement>",
+      "</project>",
+    ].join("\n");
+    expect(parseBomManagedVersions(pom).size).toBe(0);
+  });
+
   it("keeps the first declaration when a coordinate appears in multiple sections", () => {
     const pom = [
       "<project>",

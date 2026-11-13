@@ -544,4 +544,21 @@ describe("legacy managed-block brands", () => {
       expect(after).not.toContain("<version>1.0.0</version>");
     });
   });
+
+  it("consolidates duplicate canonical blocks when removing a legacy pin", () => {
+    withTempPom(dualPom(
+      [
+        { pkg: "com.example:remove-me", version: "1.0.0" },
+        { pkg: "com.example:legacy-keep", version: "2.0.0" },
+      ],
+      [{ pkg: "com.example:current-keep", version: "3.0.0" }],
+    ), filePath => {
+      expect(removeManagedPin(filePath, "com.example:remove-me")).toBe(true);
+      const after = readPom(filePath);
+      expect(after.split(POM_MARKER_BEGIN).length - 1).toBe(1);
+      expect(after).not.toContain(AUTO_DEPENDER_POM_MARKER_BEGIN);
+      expect(versionOf(after, "com.example", "legacy-keep")).toBe("2.0.0");
+      expect(versionOf(after, "com.example", "current-keep")).toBe("3.0.0");
+    });
+  });
 });

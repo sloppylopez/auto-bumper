@@ -28,6 +28,20 @@ export interface LockRefreshResult {
 export interface LockRefreshOptions {
   /** Crates to pass to `cargo update -p`. Empty skips Cargo so the whole lock is not rewritten. */
   cargoPackages?: string[];
+  /** Detected Poetry version; version 2 no longer supports --no-update. */
+  poetryVersion?: string;
+}
+
+function detectPoetryVersion(dir: string): string | undefined {
+  const result = childProcess.spawnSync(binName("poetry"), ["--version"], {
+    cwd: dir,
+    encoding: "utf-8",
+    timeout: 5_000,
+    windowsHide: true,
+    shell: false,
+  });
+  if (result.error || result.status !== 0) return undefined;
+  return /\b(\d+)\.\d+(?:\.\d+)?\b/.exec(`${result.stdout || ""} ${result.stderr || ""}`)?.[1];
 }
 
 function binName(name: string): string {
@@ -99,10 +113,12 @@ export function lockRefreshCommands(dir: string, opts: LockRefreshOptions = {}):
     }
   }
   if (has("poetry.lock")) {
+    const poetry2 = Number.parseInt(opts.poetryVersion || "", 10) >= 2;
+    const args = poetry2 ? ["lock"] : ["lock", "--no-update"];
     commands.push({
       bin: binName("poetry"),
-      args: ["lock", "--no-update"],
-      label: "poetry lock --no-update",
+      args,
+      label: `poetry ${args.join(" ")}`,
     });
   }
   return commands;
@@ -140,7 +156,10 @@ function failureDetail(result: childProcess.SpawnSyncReturns<string>): string {
 
 /** Run every lock refresh for dir. Empty when the project has no lockfile. */
 export function refreshProjectLocks(dir: string, timeoutMs = 300_000, opts: LockRefreshOptions = {}): LockRefreshResult[] {
-  return lockRefreshCommands(dir, opts).map(command => {
+  const resolvedOpts = opts.poetryVersion || !fs.existsSync(path.join(dir, "poetry.lock"))
+    ? opts
+    : { ...opts, poetryVersion: detectPoetryVersion(dir) };
+  return lockRefreshCommands(dir, resolvedOpts).map(command => {
     const result = spawnCaptured(command.bin, command.args, { cwd: dir, timeout: timeoutMs });
     const warn = command.warn;
     if (result.status === 0 && !result.error) return { label: command.label, ok: true, detail: "", ...(warn ? { warn } : {}) };

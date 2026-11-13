@@ -23,70 +23,19 @@ function hasFixBoundary(range: { events?: unknown[] }): boolean {
   return false;
 }
 
-type RangeEvent = Record<string, unknown>;
-
-/** Events on the range itself, plus flat or CPE-nested extracted_events. */
-function collectRangeEvents(range: { events?: unknown[]; database_specific?: { extracted_events?: unknown[] } }): RangeEvent[] {
-  const out: RangeEvent[] = [];
-  for (const ev of range.events || []) {
-    if (ev && typeof ev === "object") out.push(ev as RangeEvent);
-  }
-  const extracted = range.database_specific?.extracted_events;
-  if (!Array.isArray(extracted)) return out;
-  for (const item of extracted) {
-    if (!item || typeof item !== "object") continue;
-    const it = item as RangeEvent;
-    if (Array.isArray(it.range)) {
-      for (const ev of it.range) {
-        if (ev && typeof ev === "object") out.push(ev as RangeEvent);
-      }
-    } else {
-      out.push(it);
-    }
-  }
-  return out;
-}
-
-function versionField(ev: RangeEvent, key: string): string | null {
-  const value = ev[key];
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (!trimmed || !isVersionLike(trimmed)) return null;
-  return trimmed;
-}
-
 /**
- * Drop ranges with no fix boundary when a sibling range for the same package already has one
- * and this range starts inside that closed window. A Snyk or mirror record of "introduced, no
- * fixed" must not re-flag a version the other record closed. A range that starts strictly
- * after every sibling end is a newer open line and is kept.
+ * Remove only byte-for-byte duplicate range records. Different range representations or
+ * event windows cannot be safely collapsed without proving their complete bounds.
  */
-export function dropUnboundedRangesShadowedByFix<T>(ranges: readonly T[] | undefined, ecosystem: string): T[] {
+export function dropUnboundedRangesShadowedByFix<T>(ranges: readonly T[] | undefined, _ecosystem: string): T[] {
   const list = [...(ranges ?? [])];
-  const described = list.map(range => {
-    const events = collectRangeEvents(range as { events?: unknown[]; database_specific?: { extracted_events?: unknown[] } });
-    const ends: string[] = [];
-    const introduced: string[] = [];
-    for (const ev of events) {
-      for (const key of TERMINATOR_EVENTS) {
-        const end = versionField(ev, key);
-        if (end) ends.push(end);
-      }
-      const intro = versionField(ev, "introduced");
-      if (intro) introduced.push(intro);
-    }
-    return { range, ends, introduced };
+  const seen = new Set<string>();
+  return list.filter(range => {
+    const key = JSON.stringify(range);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
-  const ends = described.flatMap(d => d.ends);
-  if (ends.length === 0) return list;
-  return described.filter(d => {
-    if (d.ends.length > 0) return true;
-    if (d.introduced.length === 0) return false;
-    const overlapsClosedWindow = d.introduced.some(intro =>
-      ends.some(end => comparePackageVersion(intro, end, ecosystem) <= 0),
-    );
-    return !overlapsClosedWindow;
-  }).map(d => d.range);
 }
 
 function affectedKey(affected: any, entryEcosystem?: string): string | null {
@@ -188,7 +137,7 @@ interface AffectedResult {
   range?: string;
   /** Inclusive end of the matching window. Not a fixed version. */
   lastAffected?: string;
-  /** Exclusive lower bound of the matching window (event-based ranges only). */
+  /** Inclusive lower bound of the matching window (event-based ranges only). */
   introduced?: string;
 }
 
@@ -709,7 +658,7 @@ interface AffectedEventResult {
   isAffected: boolean;
   range?: string;
   lastAffected?: string;
-  /** Exclusive lower bound of the matching segment. */
+  /** Inclusive lower bound of the matching segment. */
   introduced?: string;
 }
 

@@ -290,13 +290,14 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   // Phase 3: Reviewed GitHub Maven advisories (global list, incremental after the first pull)
   let repoAdvisories: AdvisoryEntry[] = [];
   let advisoryIncomplete = false;
-  if (!supplementalDisabled()) {
+  if (!supplementalDisabled() && packages.some(pkg => pkg.ecosystem.toLowerCase() === "maven")) {
     try {
       setText(opts.offline ? "Loading cached GitHub Maven advisories..." : "Loading GitHub Maven advisories...");
       repoAdvisories = await loadRepoAdvisories({
         setText,
         offline: opts.offline,
         onWarning: (msg) => warnings.push(msg),
+        onIncomplete: () => { advisoryIncomplete = true; },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

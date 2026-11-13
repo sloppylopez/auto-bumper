@@ -36,7 +36,7 @@ export interface FixCandidate {
   lastAffected?: string;
   /** True when this fix moves to an OLDER release (downgrade out of the affected window). */
   isDowngrade?: boolean;
-  /** Exclusive lower bound of the vulnerable window across all findings for this package (minimum introduced); undefined when safety cannot be proven. */
+  /** Inclusive lower bound of the vulnerable window across all findings for this package (minimum introduced); undefined when safety cannot be proven. */
   introduced?: string;
   /** Computed downgrade target while the candidate is still unfixable (proposal only, not applied). */
   downgradeTarget?: string;

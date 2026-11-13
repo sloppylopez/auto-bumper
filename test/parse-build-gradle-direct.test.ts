@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseBuildGradle, parseBuildGradleDirect } from "../src/lib/parse-lockfile.ts";
+import { parseBuildGradle, parseBuildGradleDirect, parseLockfile, parseLockfileAsync } from "../src/lib/parse-lockfile.ts";
 
 describe("parseBuildGradleDirect (quoted coordinate idioms)", () => {
   let dir: string;
@@ -156,5 +156,31 @@ describe("parseBuildGradle without gradlew", () => {
     expect(result.incompleteTree).toBe(true);
     expect(result.warnings.some((w) => w.includes("gradlew was not found"))).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("nested Java manifests", () => {
+  it("marks direct-only nested Maven scans incomplete in sync and async parsing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-nested-java-"));
+    const nested = path.join(root, "module");
+    fs.mkdirSync(nested);
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "root", version: "1.0.0" }));
+    fs.writeFileSync(path.join(nested, "pom.xml"), [
+      "<project><modelVersion>4.0.0</modelVersion>",
+      "<dependencies><dependency>",
+      "<groupId>org.example</groupId><artifactId>nested-lib</artifactId><version>1.0.0</version>",
+      "</dependency></dependencies></project>",
+    ].join(""));
+    try {
+      const sync = parseLockfile(root);
+      const asyncResult = await parseLockfileAsync(root);
+      for (const result of [sync, asyncResult]) {
+        expect(result.incompleteTree).toBe(true);
+        expect(result.packages.some(pkg => pkg.name === "org.example:nested-lib")).toBe(true);
+        expect(result.warnings.some(warning => warning.includes("nested maven manifest"))).toBe(true);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

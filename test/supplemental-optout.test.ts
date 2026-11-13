@@ -83,6 +83,15 @@ function writeProject(dir: string, localAdvisoryId: string | null): void {
   }
 }
 
+function writeNpmProject(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "fixture",
+    version: "1.0.0",
+    dependencies: { "synthetic-package": "1.0.0" },
+  }));
+}
+
 function ghSaOnlyFetch(hits: string[]) {
   // api.github.com answers with one GHSA; everything else (GCS etag probe, OSV API) → 404.
   return mock(async (url: string | URL) => {
@@ -188,6 +197,7 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL unset", () => {
       // incremental refresh uses, so "repo advisories are loaded and matched" holds without any network.
       const dbDir = getOsvDbDir();
       fs.mkdirSync(dbDir, { recursive: true });
+      fs.writeFileSync(path.join(dbDir, "Maven.json.gz"), zlib.gzipSync(JSON.stringify([])));
       const entry = {
         id: "GHSA-q9pg-8h3j-8hvm",
         aliases: ["CVE-2026-100000"],
@@ -203,10 +213,30 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL unset", () => {
       // loadRepoAdvisories attempts a re-sync.
       fs.writeFileSync(path.join(dbDir, "repo-advisories.since"), "2026-01-01T00:00:00Z");
 
-      const result = await runAutoBumperScan(proj, { quiet: true });
+      const result = await runAutoBumperScan(proj, { quiet: true, offline: true });
       expect(result.findings.some((f) => f.id === "GHSA-q9pg-8h3j-8hvm")).toBe(true);
       // No degraded-advisory warning for a source we intentionally kept.
       expect(result.warnings.some((w) => w.includes("GitHub Maven advisories"))).toBe(false);
+    });
+  }, 20000);
+
+  it("does not load Maven-only repository advisories for an npm-only scan", async () => {
+    await withEnv(undefined, async () => {
+      const proj = path.join(tmpRoot, "proj-npm-only");
+      writeNpmProject(proj);
+      const dbDir = getOsvDbDir();
+      fs.rmSync(path.join(dbDir, "repo-advisories.json.gz"), { force: true });
+      fs.rmSync(path.join(dbDir, "repo-advisories.json"), { force: true });
+      fs.rmSync(path.join(dbDir, "repo-advisories.since"), { force: true });
+
+      const hits: string[] = [];
+      globalThis.fetch = ghSaOnlyFetch(hits);
+      try {
+        await runAutoBumperScan(proj, { quiet: true });
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+      expect(hits.some(url => url.includes("api.github.com/advisories"))).toBe(false);
     });
   }, 20000);
 });

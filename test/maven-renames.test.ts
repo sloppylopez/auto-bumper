@@ -117,8 +117,8 @@ describe("consumerVariantsForFamily", () => {
 describe("topLevelAncestors", () => {
   it("reports a direct dependency as its own top-level source", () => {
     const pkgs = [
-      { name: "com.ey.emailapi:email-api" }, // project artifact (tree root line)
-      { name: "org.wiremock:wiremock", requiredBy: ["com.ey.emailapi:email-api"] },
+      { name: "com.example:consumer-project" }, // project artifact (tree root line)
+      { name: "org.wiremock:wiremock", requiredBy: ["com.example:consumer-project"] },
       { name: "org.eclipse.jetty:jetty-server", requiredBy: ["org.wiremock:wiremock"] },
     ];
     expect([...topLevelAncestors("org.eclipse.jetty:jetty-server", pkgs)]).toEqual(["org.wiremock:wiremock"]);
@@ -138,15 +138,15 @@ describe("topLevelAncestors", () => {
 
   it("treats a coordinate whose only parent is the absent project artifact as top-level", () => {
     const pkgs = [
-      { name: "g:a", requiredBy: ["com.ey.emailapi:email-api"] },
+      { name: "g:a", requiredBy: ["com.example:consumer-project"] },
     ];
     expect([...topLevelAncestors("g:a", pkgs)]).toEqual(["g:a"]);
   });
 
   it("treats a parent that is itself a root-line entry (project artifact) as the boundary", () => {
     const pkgs = [
-      { name: "g:a", requiredBy: ["com.ey.emailapi:email-api"] },
-      { name: "com.ey.emailapi:email-api" }, // present, never required by anything
+      { name: "g:a", requiredBy: ["com.example:consumer-project"] },
+      { name: "com.example:consumer-project" }, // present, never required by anything
     ];
     expect([...topLevelAncestors("g:a", pkgs)]).toEqual(["g:a"]);
   });

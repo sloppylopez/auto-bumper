@@ -357,6 +357,11 @@ describe("pickNextVersion", () => {
     expect(pickNextVersion(["2.0.0-SNAPSHOT", "2.0.1"], "1.9")).toBe("2.0.1");
   });
 
+  it("excludes prereleases and Java build qualifiers from candidates", () => {
+    expect(pickNextVersion(["2.0.0-b02", "2.0.0-RC1"], "1.9.0")).toBeNull();
+    expect(pickNextVersion(["2.0.0-b02", "2.0.1"], "1.9.0")).toBe("2.0.1");
+  });
+
   it("returns null when nothing is above the minimum or the list is empty", () => {
     expect(pickNextVersion(["1.0.0", "2.0.0"], "2.0.0")).toBeNull();
     expect(pickNextVersion([], "1.0.0")).toBeNull();

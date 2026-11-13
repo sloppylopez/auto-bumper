@@ -358,6 +358,15 @@ describe("dependency discovery", () => {
     expect(pkgs.map(p => p.version).sort()).toEqual(["1.0.0", "2.0.0"]);
   });
 
+  it("unions parent edges when configurations resolve the same package version", () => {
+    const pkgs = dedupeResolvedPackages([
+      { ecosystem: "maven", name: "org.foo:bar", version: "1.0.0", manifestPath: "build.gradle", requiredBy: ["org.a:a"] },
+      { ecosystem: "maven", name: "org.foo:bar", version: "1.0.0", manifestPath: "build.gradle", requiredBy: ["org.b:b"] },
+    ]);
+    expect(pkgs).toHaveLength(1);
+    expect(pkgs[0]?.requiredBy).toEqual(["org.a:a", "org.b:b"]);
+  });
+
   it("reads package.json when no lockfile exists", () => {
     const dir = tempDir();
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
@@ -421,6 +430,11 @@ describe("security guards", () => {
     const line = windowsBatchArgs("mvn.cmd", ["--version"]);
     expect(line.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
     expect(line[3]).toBe('"mvn.cmd "--version""');
+  });
+
+  it("quotes wrapper paths with cmd metacharacters even without whitespace", () => {
+    const line = windowsBatchArgs(String.raw`C:\work&whoami\gradlew.bat`, ["dependencies"]);
+    expect(line[3]).toBe(String.raw`""C:\work&whoami\gradlew.bat" "dependencies""`);
   });
 
   it("rejects a zip entry that climbs out of the extract dir", () => {

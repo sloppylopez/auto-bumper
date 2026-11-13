@@ -56,7 +56,7 @@ export function versionInMetadata(xml: string, version: string): boolean | null 
 
 /** Smallest non-SNAPSHOT version strictly greater than `minVersion`, or null. Pure — unit-testable. */
 export function pickNextVersion(versions: string[], minVersion: string): string | null {
-  const above = versions.filter(v => !/\.?snapshot$/i.test(v) && compareMavenVersion(v, minVersion) > 0);
+  const above = versions.filter(v => !isPreReleaseOrSnapshot(v) && compareMavenVersion(v, minVersion) > 0);
   if (above.length === 0) return null;
   above.sort(compareMavenVersion);
   return above[0]!;

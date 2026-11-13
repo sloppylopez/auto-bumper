@@ -279,10 +279,14 @@ interface ManagedRegion {
 function findManagedBlocks(content: string): ManagedRegion[] {
   const regions: ManagedRegion[] = [];
   for (const { begin, end } of POM_MARKERS) {
-    const beginIdx = content.indexOf(begin);
-    const endIdx = content.indexOf(end);
-    if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
+    let from = 0;
+    for (;;) {
+      const beginIdx = content.indexOf(begin, from);
+      if (beginIdx === -1) break;
+      const endIdx = content.indexOf(end, beginIdx + begin.length);
+      if (endIdx === -1) break;
       regions.push({ begin: beginIdx, end: endIdx, endLen: end.length });
+      from = endIdx + end.length;
     }
   }
   return regions;
@@ -392,28 +396,17 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
  */
 export function removeManagedPin(filePath: string, packageName: string): boolean {
   let content = fs.readFileSync(filePath, "utf-8");
-  let changed = false;
-  // The pin may live in more than one block when several tool brands coexist — clear every copy.
-  for (;;) {
-    const found = findManagedBlocks(content).find(r => parseExistingPins(content.slice(r.begin, r.end + r.endLen)).has(packageName));
-    if (!found) break;
-
-    const { begin: beginIdx, end: endIdx, endLen } = found;
-    const block = content.slice(beginIdx, endIdx + endLen);
-    const entries = parseExistingPins(block);
-    const freeText = prunePomFreeText(parsePomBlockFreeText(block), entries);
-    if (!entries.delete(packageName)) break;
-    changed = true;
-
-    const before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
-    const after = content.slice(endIdx + endLen).replace(/^\n+/, "");
-    if (entries.size === 0) {
-      content = `${before}${after}`;
-    } else {
-      content = `${before}${renderManagedBlock(entries, freeText)}\n${after}`;
-    }
+  const merged = parseAllManagedPins(content);
+  if (!merged.entries.delete(packageName)) return false;
+  content = consolidateManagedBlocks(content);
+  const found = findManagedBlocks(content)[0];
+  if (found) {
+    const before = collapseTrailingNewlines(content.slice(0, found.begin), 1);
+    const after = content.slice(found.end + found.endLen).replace(/^\n+/, "");
+    content = merged.entries.size > 0
+      ? `${before}${renderManagedBlock(merged.entries, prunePomFreeText(merged.freeText, merged.entries))}\n${after}`
+      : `${before}${after}`;
   }
-  if (!changed) return false;
   fs.writeFileSync(filePath, content, "utf-8");
   return true;
 }

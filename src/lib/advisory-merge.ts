@@ -1,33 +1,10 @@
 /**
  * Combine two advisory records that share an id.
- * Affected packages are unioned. Ranges for the same package are concatenated
- * so a richer record cannot drop another package or a newer fixed version.
- * A range with no fix boundary is then dropped when it only restates a window
- * a sibling range already closed.
+ * Affected blocks are retained separately because their version lists and ranges
+ * can have different matching authority.
  */
 import type { AdvisoryEntry } from "./types.ts";
 import { dropUnboundedRangesShadowedByFix } from "./matcher.ts";
-
-type AffectedBlock = AdvisoryEntry["affected"][number];
-
-function packageKey(block: AffectedBlock): string {
-  const name = block.package?.name ?? "";
-  const eco = block.package?.ecosystem ?? "";
-  return `${eco.toLowerCase()}\u0000${name.toLowerCase()}`;
-}
-
-function blockRichness(block: AffectedBlock): number {
-  let score = (block.versions?.length || 0) * 2 + (block.ranges?.length || 0) * 3;
-  for (const r of block.ranges || []) {
-    const range = r as {
-      events?: unknown[];
-      database_specific?: { extracted_events?: unknown[] };
-    };
-    score += range.events?.length || 0;
-    score += (range.database_specific?.extracted_events?.length || 0) * 2;
-  }
-  return score;
-}
 
 function unionStrings(a: string[] | undefined, b: string[] | undefined): string[] {
   const seen = new Set<string>();
@@ -40,38 +17,20 @@ function unionStrings(a: string[] | undefined, b: string[] | undefined): string[
   return out;
 }
 
-function unionRanges(a: unknown[] | undefined, b: unknown[] | undefined): unknown[] {
+function unionAffected(a: AdvisoryEntry["affected"], b: AdvisoryEntry["affected"]): AdvisoryEntry["affected"] {
   const seen = new Set<string>();
-  const out: unknown[] = [];
-  for (const range of [...(a ?? []), ...(b ?? [])]) {
-    const key = JSON.stringify(range);
+  const out: AdvisoryEntry["affected"] = [];
+  for (const block of [...(a ?? []), ...(b ?? [])]) {
+    const copy = structuredClone(block);
+    if (copy.ranges) {
+      copy.ranges = dropUnboundedRangesShadowedByFix(copy.ranges, copy.package?.ecosystem ?? "");
+    }
+    const key = JSON.stringify(copy);
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(range);
+    out.push(copy);
   }
   return out;
-}
-
-function unionAffected(a: AdvisoryEntry["affected"], b: AdvisoryEntry["affected"]): AdvisoryEntry["affected"] {
-  const order: string[] = [];
-  const byKey = new Map<string, AffectedBlock>();
-  for (const block of [...(a ?? []), ...(b ?? [])]) {
-    const key = packageKey(block);
-    const prev = byKey.get(key);
-    if (!prev) {
-      byKey.set(key, structuredClone(block));
-      order.push(key);
-      continue;
-    }
-    const base = blockRichness(block) > blockRichness(prev) ? block : prev;
-    const eco = block.package?.ecosystem || prev.package?.ecosystem || "";
-    byKey.set(key, {
-      ...structuredClone(base),
-      ranges: dropUnboundedRangesShadowedByFix(unionRanges(prev.ranges, block.ranges), eco),
-      versions: unionStrings(prev.versions, block.versions),
-    });
-  }
-  return order.map((key) => byKey.get(key)!);
 }
 
 /** Union aliases, links, ecosystems, severity, and affected packages. The id stays. */

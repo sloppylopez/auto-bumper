@@ -44,6 +44,14 @@ describe("lockfile refresh commands", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it("uses the Poetry 2 lock command while retaining the Poetry 1 option", () => {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "poetry.lock"), "");
+    expect(lockRefreshCommands(dir, { poetryVersion: "2.0.0" }).map(c => c.label)).toEqual(["poetry lock"]);
+    expect(lockRefreshCommands(dir, { poetryVersion: "1.8.5" }).map(c => c.label)).toEqual(["poetry lock --no-update"]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it("does not run cargo update when no crate was bumped", () => {
     const dir = tempDir();
     fs.writeFileSync(path.join(dir, "Cargo.lock"), "");
