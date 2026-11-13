@@ -469,5 +469,141 @@
         "url": "https://github.com/eclipse-ee4j/jaxb-ri/pull/2013"
       }
     ]
+  },
+  {
+    "id": "CVE-2026-89044",
+    "aliases": [
+      "CVE-2026-89044"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "HTTP request smuggling via insufficient Transfer-Encoding validation in netty-codec-http: Netty 4.1.133.Final through 4.1.137.Final and 4.2.13.Final through 4.2.17.Final (fixed in 4.1.138.Final on the 4.1 line, 4.2.18.Final on the 4.2 line; parity entry: mirrors SNYK-JAVA-IONETTY-19778369, absent from the OSV Maven dump).",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "5.0"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "io.netty:netty-codec-http",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "4.1.133.Final"
+              },
+              {
+                "fixed": "4.1.138.Final"
+              },
+              {
+                "introduced": "4.2.13.Final"
+              },
+              {
+                "fixed": "4.2.18.Final"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-89044"
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-93879",
+    "aliases": [
+      "CVE-2026-93879",
+      "SNYK-JAVA-ORGHIBERNATEVALIDATOR-20877468"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "Expression Language Injection in org.hibernate.validator:hibernate-validator: ParameterTermResolver.resolveExpression converts message parameter values with toString/Arrays.toString without escaping, so the result is re-evaluated by the Expression Language pass of AbstractMessageInterpolator. An attacker can exhaust server resources by submitting a collection whose duplicate elements render as an EL fragment bound into the UniqueElementsValidator duplicates message parameter.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "6.9"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "org.hibernate.validator:hibernate-validator",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "9.2.0.Beta1"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://snyk.io/vuln/SNYK-JAVA-ORGHIBERNATEVALIDATOR-20877468"
+      },
+      {
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-93879"
+      }
+    ]
+  },
+  {
+    "id": "SNYK-JAVA-JAKARTAVALIDATION-20936881",
+    "aliases": [
+      "SNYK-JAVA-JAKARTAVALIDATION-20936881"
+    ],
+    "ecosystems": [
+      "Maven"
+    ],
+    "summary": "Improper Validation of Specified Type of Input in jakarta.validation:jakarta.validation-api: ProviderSpecificBootstrapImpl.run passes a caller-influenced action to the single-argument form of AccessController.doPrivileged, dropping the calling thread's restricted ProtectionDomain from the access control stack. Code running in a restricted domain can execute an arbitrary class's no-arg constructor under the library's broader permissions by passing any Class object to Validation.byProvider through a raw or unchecked cast, since the generic bound is erased before NewProviderInstance.run reaches clazz.newInstance.",
+    "severity": [
+      {
+        "type": "CVSS_V3_1",
+        "score": "2.0"
+      }
+    ],
+    "affected": [
+      {
+        "package": {
+          "name": "jakarta.validation:jakarta.validation-api",
+          "ecosystem": "Maven"
+        },
+        "ranges": [
+          {
+            "type": "ECOSYSTEM",
+            "events": [
+              {
+                "introduced": "2.0.1"
+              },
+              {
+                "fixed": "4.0.0-M1"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "links": [
+      {
+        "url": "https://snyk.io/vuln/SNYK-JAVA-JAKARTAVALIDATION-20936881"
+      }
+    ]
   }
 ]

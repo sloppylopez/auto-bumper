@@ -3,7 +3,7 @@
  * Supports semver (npm, crates.io), PEP 440 (PyPI), and Maven versioning (Java).
  * Handles range matching, deduplication, severity extraction.
  */
-import type { PackageRef, Finding } from "./types.ts";
+import type { PackageRef, Finding, AdvisoryEntry } from "./types.ts";
 import { SeverityOrder, sortBySeverity } from "./types.ts";
 
 /** Summary prefix GitHub attaches to advisories marked as duplicates of another advisory. */
@@ -21,6 +21,21 @@ function hasFixBoundary(range: { events?: unknown[] }): boolean {
     if (ev && typeof ev === "object" && TERMINATOR_EVENTS.some(k => k in (ev as Record<string, unknown>))) return true;
   }
   return false;
+}
+
+/**
+ * Remove only byte-for-byte duplicate range records. Different range representations or
+ * event windows cannot be safely collapsed without proving their complete bounds.
+ */
+export function dropUnboundedRangesShadowedByFix<T>(ranges: readonly T[] | undefined, _ecosystem: string): T[] {
+  const list = [...(ranges ?? [])];
+  const seen = new Set<string>();
+  return list.filter(range => {
+    const key = JSON.stringify(range);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function affectedKey(affected: any, entryEcosystem?: string): string | null {
@@ -80,7 +95,7 @@ export function matchVulnerabilities(packages: PackageRef[], osvData: any[]): Fi
       // Determine severity from CVSS scores
       const severity = extractSeverity(entry);
 
-      // Collect fixed versions from the matching affected block only
+      // Collect fixed versions from every affected block of this package (cross-line union)
       const fixedVersions = collectFixedVersions(entry, pkg.name, pkg.ecosystem);
 
       // Build finding
@@ -93,6 +108,7 @@ export function matchVulnerabilities(packages: PackageRef[], osvData: any[]): Fi
         vulnerableRange: result.range || `=${pkg.version}`,
         fixedVersions,
         lastAffected: result.lastAffected,
+        introduced: result.introduced,
         severity,
         summary: entry.summary || `${pkg.name}@${pkg.version} has a known vulnerability`,
         references: extractReferences(entry),
@@ -121,6 +137,22 @@ interface AffectedResult {
   range?: string;
   /** Inclusive end of the matching window. Not a fixed version. */
   lastAffected?: string;
+  /** Inclusive lower bound of the matching window (event-based ranges only). */
+  introduced?: string;
+}
+
+/** Exact-list match, merged with the same block's window bounds when they carry them. Null when not an exact match. */
+function mergeExactWithRanges(cleanVersion: string, affected: any, eco: string): AffectedResult | null {
+  const exactResult = tryExactVersion(cleanVersion, affected);
+  if (!exactResult.isAffected) return null;
+  // The flat list decides matching; the same block's ranges still carry the window
+  // bounds the downgrade planner needs. Dropping them loses the introduced bound and
+  // no safe downgrade can ever be proposed for this finding.
+  const rangeResult = tryRanges(cleanVersion, affected, eco);
+  if (rangeResult.isAffected && (rangeResult.introduced || rangeResult.lastAffected)) {
+    return { ...exactResult, introduced: rangeResult.introduced, lastAffected: rangeResult.lastAffected };
+  }
+  return exactResult;
 }
 
 /** Check if a specific version falls within the affected range of an OSV entry */
@@ -135,8 +167,8 @@ function checkAffected(packageName: string, version: string, ecosystem: string, 
     if (!isSamePackage(pkgNameNorm, affected, eco)) continue;
 
     // Try exact version list — an explicit vendor statement, never excluded
-    const exactResult = tryExactVersion(cleanVersion, affected);
-    if (exactResult.isAffected) return exactResult;
+    const exactMatch = mergeExactWithRanges(cleanVersion, affected, eco);
+    if (exactMatch) return exactMatch;
 
     // GHSA-curated advisories state affected versions explicitly; their auto-derived
     // ECOSYSTEM ranges are coarse bounds that over-cover backported lines (e.g. fixed
@@ -156,6 +188,34 @@ function checkAffected(packageName: string, version: string, ecosystem: string, 
   if (isPatchedByParallelLineFix(cleanVersion, entry, packageName, eco)) return { isAffected: false };
 
   return rangeMatch;
+}
+
+/**
+ * True when `version` falls inside any affected block of `entry` for `packageName` —
+ * exact version lists, event windows and representation ranges, with the same
+ * curated-list and parallel-line rules the scan uses. Fix planning reuses this so a
+ * proposed target is only accepted when the next scan would not flag it again.
+ */
+export function isVersionAffected(packageName: string, version: string, ecosystem: string, entry: AdvisoryEntry): boolean {
+  return checkAffected(packageName, version, ecosystem, entry).isAffected;
+}
+
+/** True when `version` of the package is affected by any entry in `advisories`. */
+export function isVersionAffectedByAdvisories(
+  packageName: string,
+  version: string,
+  ecosystem: string,
+  advisories: readonly AdvisoryEntry[],
+): boolean {
+  return matchVulnerabilities([{ ecosystem, name: packageName, version, manifestPath: "" }], [...advisories]).length > 0;
+}
+
+/** True when the entry carries at least one affected block for `packageName` in this ecosystem (any window or version list). */
+export function entryAffectsPackage(entry: AdvisoryEntry, packageName: string, ecosystem: string): boolean {
+  const eco = ecosystem.toLowerCase();
+  if (!entry.ecosystems.some(e => e.toLowerCase() === eco)) return false;
+  const pkgNameNorm = eco === "pypi" ? normalizePyPIName(packageName) : packageName.toLowerCase();
+  return entry.affected.some(a => isSamePackage(pkgNameNorm, a, eco));
 }
 
 /** Check if an affected block refers to the same package */
@@ -181,7 +241,8 @@ function isCuratedListAuthoritative(id: string | undefined, affected: { versions
 
 /** Try all range-based matching with ecosystem routing */
 function tryRanges(version: string, affected: { ranges?: Array<{ type?: string; events?: unknown[]; representations?: Array<{ range?: string; type?: string }> }> }, eco: string): AffectedResult {
-  for (const r of affected.ranges || []) {
+  const ranges = dropUnboundedRangesShadowedByFix(affected.ranges, eco);
+  for (const r of ranges) {
     // ECOSYSTEM/GIT event-based ranges
     const eventResult = tryEventRange(version, r, eco);
     if (eventResult.isAffected) return eventResult;
@@ -193,12 +254,81 @@ function tryRanges(version: string, affected: { ranges?: Array<{ type?: string; 
   return { isAffected: false };
 }
 
+/** One item of OSV `database_specific.extracted_events`: either a flat event object, or a CPE-derived wrapper whose actual events live in its nested `range` array. */
+interface ExtractedEventItem {
+  introduced?: string;
+  fixed?: string;
+  last_affected?: string;
+  latest?: string;
+  deprecated?: string;
+  range?: EcoEvent[];
+}
+
+/**
+ * Normalize extracted_events into event sequences for segment matching.
+ * Flat items (legacy shape) form ONE ordered timeline — `parseEventSegments` splits it into
+ * windows at each new `introduced`. CPE-derived wrappers are independent: each one's nested
+ * `range` array is its own sequence. Empty when absent.
+ */
+export function extractedEventSequences(range: { database_specific?: { extracted_events?: unknown[] } } | undefined): EcoEvent[][] {
+  const extracted = range?.database_specific?.extracted_events;
+  if (!Array.isArray(extracted) || extracted.length === 0) return [];
+  const sequences: EcoEvent[][] = [];
+  const flatTimeline: EcoEvent[] = [];
+  for (const item of extracted) {
+    if (!item || typeof item !== "object") continue;
+    // Unchecked cast at the JSON boundary; each field is checked below.
+    const it = item as ExtractedEventItem;
+    if (Array.isArray(it.range) && it.range.length > 0) {
+      sequences.push(it.range);
+    } else if (it.introduced !== undefined || it.fixed !== undefined || it.last_affected !== undefined || it.latest !== undefined || it.deprecated !== undefined) {
+      flatTimeline.push(it);
+    }
+  }
+  if (flatTimeline.length > 0) sequences.unshift(flatTimeline);
+  return sequences;
+}
+
+/** Drop events carrying non-version values (git hashes) so the remaining sequence is usable for version matching. */
+function keepVersionEvents(seq: EcoEvent[]): EcoEvent[] {
+  return seq.filter(ev =>
+    [ev.introduced, ev.fixed, ev.last_affected, ev.latest, ev.deprecated]
+      .every(v => v === undefined || v === "" || isVersionLike(v)),
+  );
+}
+
+/** Try each extracted_events sequence as an independent window; first match wins. */
+function tryExtractedSequences(version: string, sequences: EcoEvent[][], useVersionEvents: boolean, eco: string): AffectedResult {
+  for (const seq of sequences) {
+    const usable = useVersionEvents ? keepVersionEvents(seq) : seq;
+    if (usable.length === 0) continue; // no version data in this window → cannot prove impact
+    const result = matchesEcosystemEvents(version, usable, eco);
+    if (result.isAffected) return result;
+  }
+  return { isAffected: false };
+}
+
 /** Match against ECOSYSTEM or GIT event-based ranges */
 function tryEventRange(version: string, range: { type?: string; events?: unknown[]; database_specific?: { extracted_events?: unknown[] } }, eco: string): AffectedResult {
   if (!range.events || !(range.type === "ECOSYSTEM" || range.type === "GIT")) return { isAffected: false };
-  const extracted = range.database_specific?.extracted_events;
-  const eventsToUse = extracted && extracted.length > 0 ? extracted : range.events;
-  return matchesEcosystemEvents(version, eventsToUse as EcoEvent[], eco);
+
+  // OSV may provide extracted version events that are more accurate than git hashes.
+  // Each sub-range (a flat item, or a CPE wrapper's nested `range` array) is an independent
+  // window; the version is affected when any one of them matches.
+  const sequences = extractedEventSequences(range);
+  if (sequences.length > 0) {
+    return tryExtractedSequences(version, sequences, range.type === "ECOSYSTEM", eco);
+  }
+
+  let eventsToUse = (range.events as EcoEvent[]) ?? [];
+  // ECOSYSTEM ranges must carry real versions. Bad Snyk/OSV data sometimes puts git hashes in
+  // `fixed`/`introduced`; left in, a hash terminator corrupts the segment window and hides true
+  // positives. (GIT ranges legitimately use commit hashes — untouched.)
+  if (range.type === "ECOSYSTEM") {
+    eventsToUse = keepVersionEvents(eventsToUse);
+    if (eventsToUse.length === 0) return { isAffected: false };
+  }
+  return matchesEcosystemEvents(version, eventsToUse, eco);
 }
 
 /** Match against representation-level ranges (semver, pep440, maven) */
@@ -538,6 +668,8 @@ interface AffectedEventResult {
   isAffected: boolean;
   range?: string;
   lastAffected?: string;
+  /** Inclusive lower bound of the matching segment. */
+  introduced?: string;
 }
 
 /** Compare versions for ECOSYSTEM event ranges (and fix planning). */
@@ -550,19 +682,21 @@ export function comparePackageVersion(a: string, b: string, ecosystem: string): 
 
 interface EventSegment {
   introduced: string;
+  /** True when the introduced version itself is not affected (`>`). */
+  introducedExclusive: boolean;
   fixed: string | null;
   last_affected: string | null;
 }
 
 function parseEventSegments(
-  events: Array<{ introduced?: string; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
+  events: Array<{ introduced?: string; introduced_exclusive?: boolean; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
 ): EventSegment[] {
   const segments: EventSegment[] = [];
-  let current: EventSegment = { introduced: "0", fixed: null, last_affected: null };
+  let current: EventSegment = { introduced: "0", introducedExclusive: false, fixed: null, last_affected: null };
 
   const pushCurrent = () => {
     segments.push(current);
-    current = { introduced: "0", fixed: null, last_affected: null };
+    current = { introduced: "0", introducedExclusive: false, fixed: null, last_affected: null };
   };
 
   for (const ev of events) {
@@ -571,6 +705,7 @@ function parseEventSegments(
         pushCurrent();
       }
       current.introduced = ev.introduced || "0";
+      current.introducedExclusive = ev.introduced_exclusive === true;
       current.fixed = null;
       current.last_affected = null;
     }
@@ -594,19 +729,20 @@ function parseEventSegments(
 
 function versionInEventSegment(version: string, segment: EventSegment, ecosystem: string): boolean {
   const cmp = (a: string, b: string) => comparePackageVersion(a, b, ecosystem);
-  if (cmp(version, segment.introduced) < 0) return false;
+  const intro = cmp(version, segment.introduced);
+  if (segment.introducedExclusive ? intro <= 0 : intro < 0) return false;
   if (segment.fixed !== null && cmp(version, segment.fixed) >= 0) return false;
   if (segment.last_affected !== null && cmp(version, segment.last_affected) > 0) return false;
   return true;
 }
 
 /** OSV ECOSYSTEM/GIT range event */
-type EcoEvent = { introduced?: string; fixed?: string; deprecated?: string; latest?: string; last_affected?: string };
+type EcoEvent = { introduced?: string; introduced_exclusive?: boolean; fixed?: string; deprecated?: string; latest?: string; last_affected?: string };
 
 /** Match against OSV event ranges (supports multiple introduced/fixed segments). */
 function matchesEcosystemEvents(
   version: string,
-  events: Array<{ introduced?: string; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
+  events: Array<{ introduced?: string; introduced_exclusive?: boolean; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
   ecosystem: string,
 ): AffectedEventResult {
   const segments = parseEventSegments(events);
@@ -614,7 +750,7 @@ function matchesEcosystemEvents(
     if (!versionInEventSegment(version, segment, ecosystem)) continue;
     const range = buildSegmentRange(segment);
     const lastAffected = segment.last_affected ?? undefined;
-    return { isAffected: true, range, lastAffected };
+    return { isAffected: true, range, lastAffected, introduced: segment.introduced };
   }
   return { isAffected: false };
 }
@@ -814,7 +950,9 @@ function extractSeverity(entry: any): Finding["severity"] {
 function isVersionLike(value: string): boolean {
   const v = value.trim();
   if (!/^\d/.test(v)) return false;
-  if (/^[\da-f]{8,}$/i.test(v)) return false;
+  // Git hashes are hex and real ones contain letters. An all-digit 8+ char "hash" is a
+  // date-style version (org.json's 20150729 / 20260719) — it must be kept.
+  if (/^[\da-f]{8,}$/i.test(v) && /[a-f]/i.test(v)) return false;
   return true;
 }
 
@@ -848,12 +986,12 @@ function collectFromRanges(fixedSet: Set<string>, ranges: unknown[]) {
   }
 }
 
-/** Collect fixed versions from database-specific extracted_events */
+/** Collect fixed versions from database-specific extracted_events (flat or CPE-nested shapes) */
 function collectExtractedEvents(fixedSet: Set<string>, r: unknown) {
-  const extracted = (r as { database_specific?: { extracted_events?: Array<{ fixed?: string }> } }).database_specific?.extracted_events;
-  if (!Array.isArray(extracted)) return;
-  for (const ev of extracted) {
-    if (ev.fixed && isVersionLike(String(ev.fixed))) fixedSet.add(String(ev.fixed));
+  for (const seq of extractedEventSequences(r as { database_specific?: { extracted_events?: unknown[] } })) {
+    for (const ev of seq) {
+      if (ev.fixed && isVersionLike(String(ev.fixed))) fixedSet.add(String(ev.fixed));
+    }
   }
 }
 
@@ -924,7 +1062,7 @@ function collectFromDefaultFormat(fixedSet: Set<string>, defaults: Array<{ state
 /** Range shape needed for introduced/fixed event collection. */
 interface OsvRangeLike {
   events?: Array<{ introduced?: string; fixed?: string }>;
-  database_specific?: { extracted_events?: Array<{ introduced?: string; fixed?: string }> };
+  database_specific?: { extracted_events?: unknown[] };
 }
 
 /** Affected block shape needed for release-line fix collection. */
@@ -948,7 +1086,7 @@ function collectIntroducedVersions(entry: { affected?: OsvAffectedBlockLike[] },
 /** Add introduced versions from one range's events and extracted_events lists. */
 function collectIntroducedFromRange(set: Set<string>, range: OsvRangeLike): void {
   addIntroducedEvents(set, range.events);
-  addIntroducedEvents(set, range.database_specific?.extracted_events);
+  for (const seq of extractedEventSequences(range)) addIntroducedEvents(set, seq);
 }
 
 /** Add version-like `introduced` values from an OSV event list. */

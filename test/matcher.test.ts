@@ -6,6 +6,8 @@ import {
   matchVulnerabilities,
   normalizePyPIName,
   dropShadowedDuplicates,
+  isVersionAffected,
+  entryAffectsPackage,
 } from "../src/lib/matcher.ts";
 import { buildFixPlan } from "../src/lib/fixer.ts";
 
@@ -163,6 +165,37 @@ describe("matchVulnerabilities", () => {
     }
   });
 
+  it("keeps introduced bound from ranges when the exact version list also matches", () => {
+    const packages = [{
+      ecosystem: "maven",
+      name: "com.github.java-json-tools:jackson-coreutils",
+      version: "2.0",
+      manifestPath: "build.gradle",
+    }];
+    const osvData = [{
+      id: "CVE-TEST-coreutils",
+      aliases: [],
+      ecosystems: ["Maven"],
+      affected: [{
+        package: { name: "com.github.java-json-tools:jackson-coreutils", ecosystem: "Maven" },
+        versions: ["2.0", "v2.0"],
+        ranges: [{
+          type: "GIT",
+          repo: "https://github.com/java-json-tools/jackson-coreutils",
+          events: [{ introduced: "4575e2b026" }, { last_affected: "4575e2b026" }],
+          database_specific: {
+            extracted_events: [{ introduced: "2.0" }, { last_affected: "2.0" }],
+          },
+        }],
+      }],
+      summary: "Test vulnerability",
+    }];
+    const results = matchVulnerabilities(packages, osvData);
+    expect(results).toHaveLength(1);
+    expect(results[0].introduced).toBe("2.0");
+    expect(results[0].lastAffected).toBe("2.0");
+  });
+
   it("does not flag version above fixed ECOSYSTEM range", () => {
     const packages = [{
       ecosystem: "maven",
@@ -294,6 +327,36 @@ describe("matchVulnerabilities", () => {
     expect(findings[0].fixedVersions).toContain("3.1.4");
   });
 
+  it("keeps all-digit date-style fixed versions (org.json) but still drops real hex hashes", () => {
+    const packages = [{
+      ecosystem: "maven",
+      name: "org.json:json",
+      version: "20240303",
+      manifestPath: "build.gradle",
+    }];
+    const osvData = [{
+      id: "SNYK-JAVA-ORGJSON-1234567",
+      aliases: ["CVE-2026-1234"],
+      ecosystems: ["Maven"],
+      affected: [{
+        package: { name: "org.json:json", ecosystem: "Maven" },
+        ranges: [{
+          type: "ECOSYSTEM",
+          events: [
+            { introduced: "0" },
+            { fixed: "20260719" },
+            // A genuine git hash (hex with letters) must still be rejected as a version.
+            { fixed: "a1b2c3d4e5f6" },
+          ],
+        }],
+      }],
+    }];
+    const findings = matchVulnerabilities(packages, osvData);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].fixedVersions).toContain("20260719");
+    expect(findings[0].fixedVersions).not.toContain("a1b2c3d4e5f6");
+  });
+
   it("collects fixed versions only from matching affected package", () => {
     const packages = [{
       ecosystem: "maven",
@@ -419,6 +482,38 @@ describe("matchVulnerabilities", () => {
     ];
     const results = matchVulnerabilities(packages, osvData);
     expect(results).toHaveLength(1);
+  });
+});
+
+describe("finding introduced bound", () => {
+  it("carries the introduced event of an ECOSYSTEM range without a fix", () => {
+    const packages = [{ ecosystem: "maven", name: "org.glassfish.jaxb:jaxb-core", version: "4.0.5", manifestPath: "pom.xml" }];
+    const osvData = [{
+      id: "GHSA-jaxb-test",
+      aliases: ["CVE-2023-21980"],
+      ecosystems: ["Maven"],
+      affected: [{
+        package: { name: "org.glassfish.jaxb:jaxb-core", ecosystem: "Maven" },
+        ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "3.0.3" }] }],
+      }],
+    }];
+    const results = matchVulnerabilities(packages, osvData);
+    expect(results.length).toBe(1);
+    expect(results[0].introduced).toBe("3.0.3");
+    expect(results[0].fixedVersions).toEqual([]);
+  });
+
+  it("leaves introduced undefined for exact-version (rep) advisories", () => {
+    const packages = [{ ecosystem: "maven", name: "org.example:lib", version: "1.2.3", manifestPath: "pom.xml" }];
+    const osvData = [{
+      id: "GHSA-rep-test",
+      aliases: [],
+      ecosystems: ["Maven"],
+      affected: [{ package: { name: "org.example:lib", ecosystem: "Maven" }, versions: ["1.2.3"], ranges: [] }],
+    }];
+    const results = matchVulnerabilities(packages, osvData);
+    expect(results.length).toBe(1);
+    expect(results[0].introduced).toBeUndefined();
   });
 });
 
@@ -674,5 +769,169 @@ describe("curated GHSA version lists override coarse ranges", () => {
   it("keeps range union behavior for non-curated (CVE-keyed) entries", () => {
     const cveEntry = { ...curatedEntry, id: "CVE-2024-6763", aliases: ["GHSA-qh8g-58pp-2wxh"] };
     expect(matchVulnerabilities(pkg("11.0.29"), [cveEntry])).toHaveLength(1);
+  });
+});
+
+describe("isVersionAffected", () => {
+  const pointEntry = {
+    id: "GHSA-point", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{ package: { name: "com.github.java-json-tools:json-patch" }, versions: ["1.13"] }], links: [],
+  };
+  const windowEntry = {
+    id: "GHSA-window", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{
+      package: { name: "com.github.java-json-tools:json-patch" },
+      ranges: [{ type: "ECOSYSTEM", events: [{ introduced: "0" }, { last_affected: "1.12" }] }],
+    }], links: [],
+  };
+
+  it("flags exact listed versions and not the holes between them (json-patch point windows)", () => {
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.13", "maven", pointEntry)).toBe(true);
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.10", "maven", pointEntry)).toBe(false);
+  });
+
+  it("flags versions inside bounded event windows and not beyond the bound", () => {
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.5", "maven", windowEntry)).toBe(true);
+    expect(isVersionAffected("com.github.java-json-tools:json-patch", "1.13", "maven", windowEntry)).toBe(false);
+  });
+});
+
+describe("isVersionAffected with CPE-nested extracted_events", () => {
+  const LOG4J = "org.apache.logging.log4j:log4j-api";
+  const pkg = (version: string) => [{ ecosystem: "maven", name: LOG4J, version, manifestPath: "pom.xml" }];
+
+  // Modeled on CVE-2026-49844 as delivered by the OSV Maven dump: a GIT range whose raw
+  // events are commit hashes and whose database_specific.extracted_events wrap real version
+  // windows in CPE items ({ source, cpe, range: [...] }).
+  const cpeEntry = {
+    id: "CVE-2026-49844", aliases: [], ecosystems: ["maven"], summary: "nested extracted events", severity: [{ type: "CVSS_V3_1", score: "9.0" }],
+    affected: [{
+      package: { name: LOG4J },
+      ranges: [{
+        type: "GIT",
+        events: [{ introduced: "a8b4a5a0fe05c2985e1d1e0e748bef83c47a0ce4" }],
+        database_specific: { extracted_events: [
+          { source: "cpe", cpe: "cpe:/a/apache/logging_log4j", range: [{ introduced: "2.13.1" }, { fixed: "2.25.5" }] },
+          { source: "cpe", cpe: "cpe:/a/apache/logging_log4j", range: [{ introduced: "2.26.0" }, { last_affected: "2.26.0" }] },
+          { source: "cpe", cpe: "cpe:/a/apache/logging_log4j", range: [{ introduced: "3.0.0-alpha1" }, { last_affected: "3.0.0-beta2" }] },
+        ] },
+      }],
+    }], links: [],
+  };
+
+  it("does not flag a version above every nested fixed/last_affected bound", () => {
+    expect(isVersionAffected(LOG4J, "2.26.1", "maven", cpeEntry)).toBe(false);
+    expect(matchVulnerabilities(pkg("2.26.1"), [cpeEntry])).toHaveLength(0);
+  });
+
+  it("flags versions inside any nested window", () => {
+    expect(isVersionAffected(LOG4J, "2.25.0", "maven", cpeEntry)).toBe(true);
+    expect(isVersionAffected(LOG4J, "2.26.0", "maven", cpeEntry)).toBe(true);
+  });
+
+  it("collects fixed versions from nested events so the finding is fixable", () => {
+    const findings = matchVulnerabilities(pkg("2.14.0"), [cpeEntry]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].fixedVersions).toContain("2.25.5");
+    expect(buildFixPlan(findings, [cpeEntry]).fixable[0].targetVersion).toBe("2.25.5");
+  });
+
+  it("keeps flat extracted_events items working (legacy shape)", () => {
+    const flatEntry = {
+      ...cpeEntry,
+      id: "CVE-FLAT",
+      affected: [{
+        package: { name: LOG4J },
+        ranges: [{
+          type: "GIT",
+          events: [{ introduced: "a8b4a5a0fe05c2985e1d1e0e748bef83c47a0ce4" }],
+          database_specific: { extracted_events: [
+            { introduced: "2.13.1" }, { fixed: "2.25.5" },
+          ] },
+        }],
+      }],
+    };
+    expect(isVersionAffected(LOG4J, "2.20.0", "maven", flatEntry)).toBe(true);
+    expect(isVersionAffected(LOG4J, "2.26.1", "maven", flatEntry)).toBe(false);
+  });
+
+  it("treats nested single-version point lists as points (json-patch shape)", () => {
+    const POINTS = "com.github.java-json-tools:json-patch";
+    const pointsPkg = (version: string) => [{ ecosystem: "maven", name: POINTS, version, manifestPath: "pom.xml" }];
+    const pointListEntry = {
+      id: "CVE-2026-86318", aliases: [], ecosystems: ["maven"], summary: "point list", severity: [{ type: "CVSS_V3_1", score: "5.0" }],
+      affected: [{
+        package: { name: POINTS },
+        ranges: [{
+          type: "GIT",
+          events: [{ introduced: "5922bdcee44d9e58335cdbdbcc35b3bcfe43d38a" }],
+          database_specific: { extracted_events: [
+            { source: "cpe", cpe: "cpe:/a/java-json-tools/json-patch", range: [{ introduced: "1.12" }, { last_affected: "1.12" }] },
+            { source: "cpe", cpe: "cpe:/a/java-json-tools/json-patch", range: [{ introduced: "1.13" }, { last_affected: "1.13" }] },
+          ] },
+        }],
+      }], links: [],
+    };
+    expect(isVersionAffected(POINTS, "1.13", "maven", pointListEntry)).toBe(true);
+    expect(isVersionAffected(POINTS, "1.10", "maven", pointListEntry)).toBe(false);
+    // No fixed version anywhere in the nested data → genuinely unfixable
+    const findings = matchVulnerabilities(pointsPkg("1.13"), [pointListEntry]);
+    expect(findings).toHaveLength(1);
+    expect(buildFixPlan(findings, [pointListEntry]).unfixable[0]?.targetVersion).toBeNull();
+  });
+});
+
+describe("unbounded range next to a closed one", () => {
+  const pkg = (version: string) => [{ ecosystem: "maven", name: "org.example:lib", version, manifestPath: "pom.xml" }];
+  const entry = {
+    id: "CVE-MERGE",
+    aliases: [],
+    ecosystems: ["maven"],
+    summary: "bounded osv plus vague snyk",
+    severity: [],
+    affected: [{
+      package: { name: "org.example:lib", ecosystem: "Maven" },
+      ranges: [
+        { type: "ECOSYSTEM", events: [{ introduced: "2.0.0" }, { fixed: "2.5.0" }] },
+        { type: "ECOSYSTEM", events: [{ introduced: "3.0.0" }] },
+      ],
+    }],
+    links: [],
+  };
+
+  it("does not flag a version the closed range already fixed", () => {
+    expect(matchVulnerabilities(pkg("2.6.0"), [entry])).toHaveLength(0);
+  });
+
+  it("still flags a version inside the closed window", () => {
+    const findings = matchVulnerabilities(pkg("2.1.0"), [entry]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].introduced).toBe("2.0.0");
+    expect(findings[0].fixedVersions).toContain("2.5.0");
+  });
+
+  it("keeps a newer open line that starts after every fix", () => {
+    const findings = matchVulnerabilities(pkg("3.1.0"), [entry]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].introduced).toBe("3.0.0");
+  });
+});
+
+describe("entryAffectsPackage", () => {
+  const mavenEntry = {
+    id: "GHSA-m", aliases: [], ecosystems: ["maven"], summary: "", severity: [],
+    affected: [{ package: { name: "org.example:lib" } }], links: [],
+  };
+  const pypiEntry = {
+    id: "GHSA-p", aliases: [], ecosystems: ["pypi"], summary: "", severity: [],
+    affected: [{ package: { name: "requests" } }], links: [],
+  };
+
+  it("is false when the entry's ecosystem does not match", () => {
+    expect(entryAffectsPackage(pypiEntry, "org.example:lib", "maven")).toBe(false);
+  });
+
+  it("matches maven package names case-insensitively", () => {
+    expect(entryAffectsPackage(mavenEntry, "ORG.EXAMPLE:LIB", "maven")).toBe(true);
   });
 });

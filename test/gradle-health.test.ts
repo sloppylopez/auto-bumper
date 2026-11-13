@@ -17,6 +17,43 @@ describe("analyzeMavenPackages", () => {
     const warnings = analyzeMavenPackages(packages);
     expect(warnings.some(w => w.includes("Mixed Maven coordinates"))).toBe(true);
   });
+
+  it("stays silent when a migration renames within the same group", () => {
+    const packages: PackageRef[] = [
+      { ecosystem: "maven", name: "org.eclipse.jetty.http2:http2-server", version: "11.0.26", manifestPath: "build.gradle" },
+      { ecosystem: "maven", name: "org.eclipse.jetty.http2:jetty-http2-server", version: "12.0.39", manifestPath: "build.gradle" },
+    ];
+    const warnings = analyzeMavenPackages(packages);
+    expect(warnings.some(w => w.includes("Mixed Maven coordinates"))).toBe(false);
+  });
+
+  it("warns when a relocated family resolves at different majors", () => {
+    const packages: PackageRef[] = [
+      { ecosystem: "maven", name: "org.glassfish.jaxb:jaxb-core", version: "3.0.2", manifestPath: "build.gradle" },
+      { ecosystem: "maven", name: "com.sun.xml.bind:jaxb-core", version: "4.0.9", manifestPath: "build.gradle" },
+    ];
+    const warnings = analyzeMavenPackages(packages);
+    const hit = warnings.find(w => w.includes("Mixed-major relocated family"));
+    expect(hit).toBeDefined();
+    expect(hit).toContain("org.glassfish.jaxb:jaxb-core@3.0.2");
+    expect(hit).toContain("com.sun.xml.bind:jaxb-core@4.0.9");
+  });
+
+  it("stays silent for unrelated artifacts that merely share a name", () => {
+    const packages: PackageRef[] = [
+      { ecosystem: "maven", name: "com.jayway.jsonpath:json-path", version: "2.10.0", manifestPath: "build.gradle" },
+      { ecosystem: "maven", name: "io.rest-assured:json-path", version: "5.5.5", manifestPath: "build.gradle" },
+    ];
+    expect(analyzeMavenPackages(packages)).toEqual([]);
+  });
+
+  it("stays silent when a relocated family shares the same major", () => {
+    const packages: PackageRef[] = [
+      { ecosystem: "maven", name: "org.glassfish.jaxb:jaxb-core", version: "4.0.2", manifestPath: "build.gradle" },
+      { ecosystem: "maven", name: "com.sun.xml.bind:jaxb-core", version: "4.0.9", manifestPath: "build.gradle" },
+    ];
+    expect(analyzeMavenPackages(packages)).toEqual([]);
+  });
 });
 
 describe("analyzeBuildGradleContent", () => {

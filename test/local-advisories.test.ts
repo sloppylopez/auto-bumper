@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadLocalAdvisories, getLocalAdvisoriesDir } from "../src/lib/local-advisories.ts";
+import { loadLocalAdvisories, loadLocalAdvisoriesForTarget, getLocalAdvisoriesDir } from "../src/lib/local-advisories.ts";
 import { matchVulnerabilities } from "../src/lib/matcher.ts";
 import type { PackageRef } from "../src/lib/types.ts";
 
@@ -40,6 +40,26 @@ describe("loadLocalAdvisories", () => {
     fs.writeFileSync(path.join(dir, "good.json"), JSON.stringify([{ id: "CVE-9", ecosystems: ["Maven"] }]));
 
     expect(loadLocalAdvisories(dir).map((e) => e.id)).toEqual(["CVE-9"]);
+  });
+
+  it("loads project local-advisories and lets the same id override the package copy", () => {
+    const target = tempDir();
+    const dir = path.join(target, "local-advisories");
+    fs.mkdirSync(dir);
+    const packaged = loadLocalAdvisories(getLocalAdvisoriesDir());
+    const sample = packaged[0];
+    expect(sample?.id).toBeTruthy();
+    fs.writeFileSync(
+      path.join(dir, "extra.json"),
+      JSON.stringify([
+        { id: sample!.id, summary: "project override", ecosystems: ["Maven"] },
+        { id: "CVE-PROJECT-ONLY", ecosystems: ["Maven"] },
+      ]),
+    );
+    const loaded = loadLocalAdvisoriesForTarget(target);
+    expect(loaded.find((e) => e.id === sample!.id)?.summary).toBe("project override");
+    expect(loaded.some((e) => e.id === "CVE-PROJECT-ONLY")).toBe(true);
+    fs.rmSync(target, { recursive: true, force: true });
   });
 });
 
@@ -99,6 +119,30 @@ describe("vendored OSV-orphan Maven advisories (data contract)", () => {
     expect(vulnerable[0].fixedVersions).toEqual([]);
 
     const clean = matchVulnerabilities([pkg("org.glassfish.jaxb:jaxb-core", "3.0.2")], advisories);
+    expect(clean).toHaveLength(0);
+  });
+
+  it("flags hibernate-validator below 9.2.0.Beta1 with the fix and leaves 9.2.0.Beta1 clean", () => {
+    const advisories = loadLocalAdvisories(getLocalAdvisoriesDir());
+
+    const vulnerable = matchVulnerabilities([pkg("org.hibernate.validator:hibernate-validator", "9.1.5.Final")], advisories);
+    expect(vulnerable).toHaveLength(1);
+    expect(vulnerable[0].id).toBe("CVE-2026-93879");
+    expect(vulnerable[0].fixedVersions[0]).toBe("9.2.0.Beta1");
+
+    const clean = matchVulnerabilities([pkg("org.hibernate.validator:hibernate-validator", "9.2.0.Beta1")], advisories);
+    expect(clean).toHaveLength(0);
+  });
+
+  it("flags jakarta.validation-api in [2.0.1,4.0.0-M1) with the fix and leaves 4.0.0-M1 clean", () => {
+    const advisories = loadLocalAdvisories(getLocalAdvisoriesDir());
+
+    const vulnerable = matchVulnerabilities([pkg("jakarta.validation:jakarta.validation-api", "3.0.2")], advisories);
+    expect(vulnerable).toHaveLength(1);
+    expect(vulnerable[0].id).toBe("SNYK-JAVA-JAKARTAVALIDATION-20936881");
+    expect(vulnerable[0].fixedVersions[0]).toBe("4.0.0-M1");
+
+    const clean = matchVulnerabilities([pkg("jakarta.validation:jakarta.validation-api", "4.0.0-M1")], advisories);
     expect(clean).toHaveLength(0);
   });
 });

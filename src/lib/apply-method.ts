@@ -7,6 +7,10 @@ export interface BumpApplyResult {
   /** Packages NOT applied (excluded, or no applicable version entry found). */
   missed: string[];
   warnings: string[];
+  /** Version actually written per package, when it differs from the requested target. */
+  appliedTargets?: Record<string, string>;
+  /** Managed pins dropped as stale against the platform BOM ("pkg@oldVersion"). */
+  droppedStale?: string[];
 }
 
 /** How a single bump request was applied to the manifest. */
@@ -14,7 +18,7 @@ export type BumpApplyMethod = "direct" | "constrained" | "missed" | "unknown";
 
 /** Raw shapes returned by the per-ecosystem editors (see *-editor.ts ApplyResult). */
 type RawBumpApplyResult =
-  | { direct: string[]; constrained?: string[]; excluded?: string[]; forced?: string[]; warnings: string[] }
+  | { direct: string[]; constrained?: string[]; excluded?: string[]; forced?: string[]; warnings: string[]; appliedTargets?: Record<string, string>; droppedStale?: string[] }
   | { bumped: string[]; missed: string[]; warnings: string[] };
 
 /**
@@ -33,6 +37,8 @@ export function normalizeBumpApplyResult(result: RawBumpApplyResult): BumpApplyR
       constrained: [...(result.constrained ?? [])],
       missed: [...(result.excluded ?? [])],
       warnings: result.warnings,
+      ...(result.appliedTargets ? { appliedTargets: result.appliedTargets } : {}),
+      ...(result.droppedStale ? { droppedStale: result.droppedStale } : {}),
     };
   }
   return {

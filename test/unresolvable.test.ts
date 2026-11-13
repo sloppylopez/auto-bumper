@@ -6,7 +6,7 @@ import { removeManagedPin as removeGradleManagedPin, restoreDeclaredVersion } fr
 import { removeManagedPin as removeMavenManagedPin } from "../src/lib/pom-editor.ts";
 import { selectUnresolvableRollbacks, type RollbackRecord } from "../src/lib/unresolvable.ts";
 import type { PackageRef } from "../src/lib/types.ts";
-import { extractRepoUrls, hostAcceptsEnvCredentials, pickNextVersion, repoRequestInit, versionInMetadata } from "../src/lib/repo-metadata.ts";
+import { extractRepoUrls, hostAcceptsEnvCredentials, pickNextVersion, pickPreviousVersion, repoRequestInit, versionInMetadata } from "../src/lib/repo-metadata.ts";
 
 function pkg(name: string): PackageRef {
   return { ecosystem: "maven", name, version: "1.0.0", manifestPath: "/tmp/build.gradle" };
@@ -357,9 +357,39 @@ describe("pickNextVersion", () => {
     expect(pickNextVersion(["2.0.0-SNAPSHOT", "2.0.1"], "1.9")).toBe("2.0.1");
   });
 
+  it("excludes prereleases and Java build qualifiers from candidates", () => {
+    expect(pickNextVersion(["2.0.0-b02", "2.0.0-RC1"], "1.9.0")).toBeNull();
+    expect(pickNextVersion(["2.0.0-b02", "2.0.1"], "1.9.0")).toBe("2.0.1");
+  });
+
   it("returns null when nothing is above the minimum or the list is empty", () => {
     expect(pickNextVersion(["1.0.0", "2.0.0"], "2.0.0")).toBeNull();
     expect(pickNextVersion([], "1.0.0")).toBeNull();
+  });
+});
+
+describe("pickPreviousVersion", () => {
+  it("picks the newest version strictly below the boundary", () => {
+    expect(pickPreviousVersion(["1.0.0", "3.0.2", "3.0.3", "4.0.5"], "3.0.3")).toBe("3.0.2");
+  });
+
+  it("excludes SNAPSHOT and prerelease versions from candidates", () => {
+    expect(pickPreviousVersion(["2.0.0-SNAPSHOT"], "1.9")).toBeNull();
+    expect(pickPreviousVersion(["2.0.0-M4", "2.0.1"], "3.0.0")).toBe("2.0.1");
+  });
+
+  it("returns null when nothing is below the boundary or the list is empty", () => {
+    expect(pickPreviousVersion(["3.0.3", "4.0.5"], "3.0.3")).toBeNull();
+    expect(pickPreviousVersion([], "1.0.0")).toBeNull();
+  });
+
+  it("excludes Java build qualifiers (-bNN) from candidates", () => {
+    expect(pickPreviousVersion(["2.2.10-b140310.1920"], "3.0.0")).toBeNull();
+    expect(pickPreviousVersion(["3.0.1", "3.0.2-b01", "4.0.0-M4"], "4.0.0-M4")).toBe("3.0.1");
+  });
+
+  it("accepts GA versions carrying a final/release word", () => {
+    expect(pickPreviousVersion(["1.0.0.Final", "2.0.0-RELEASE", "3.0.0"], "3.0.0")).toBe("2.0.0-RELEASE");
   });
 });
 

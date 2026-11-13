@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +15,7 @@ import {
   matchesSemverRange,
   matchVulnerabilities,
 } from "../src/lib/matcher.ts";
-import { dedupeResolvedPackages, listNestedJavaManifests, listNestedManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { dedupeResolvedPackages, listNestedJavaManifests, listNestedManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs, windowsBatchEnv, windowsBatchLaunch, windowsBatchScript } from "../src/lib/parse-lockfile.ts";
 import { assertNoZipSlip, zipEntryNames } from "../src/lib/osv-export.ts";
 import { extractNextLink } from "../src/lib/github-repo-advisories.ts";
 import { isInsideDir } from "../src/path.ts";
@@ -358,6 +359,15 @@ describe("dependency discovery", () => {
     expect(pkgs.map(p => p.version).sort()).toEqual(["1.0.0", "2.0.0"]);
   });
 
+  it("unions parent edges when configurations resolve the same package version", () => {
+    const pkgs = dedupeResolvedPackages([
+      { ecosystem: "maven", name: "org.foo:bar", version: "1.0.0", manifestPath: "build.gradle", requiredBy: ["org.a:a"] },
+      { ecosystem: "maven", name: "org.foo:bar", version: "1.0.0", manifestPath: "build.gradle", requiredBy: ["org.b:b"] },
+    ]);
+    expect(pkgs).toHaveLength(1);
+    expect(pkgs[0]?.requiredBy).toEqual(["org.a:a", "org.b:b"]);
+  });
+
   it("reads package.json when no lockfile exists", () => {
     const dir = tempDir();
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
@@ -411,10 +421,64 @@ describe("gradle catalog and kotlin pin", () => {
 });
 
 describe("security guards", () => {
-  it("quotes a batch path so cmd cannot split on &", () => {
-    const line = windowsBatchArgs(String.raw`C:\ok & calc\gradlew.bat`, ["dependencies", "--quiet"]);
-    expect(line.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
-    expect(line[3]).toBe(String.raw`""C:\ok & calc\gradlew.bat" "dependencies" "--quiet""`);
+  it("keeps the cmd line free of the executable path", () => {
+    const executable = String.raw`C:\ok & calc\gradlew.bat`;
+    const line = windowsBatchArgs(executable, ["dependencies", "--quiet"]);
+    expect(line).toEqual(["/d", "/v:on", "/s", "/c", "\"\"!AUTO_BUMPER_BATCH_LAUNCHER!\"\""]);
+    expect(line.join(" ")).not.toContain(executable);
+    const script = windowsBatchScript(executable, ["dependencies", "--quiet"]);
+    expect(script).toContain("setlocal DisableDelayedExpansion");
+    expect(script).toContain("\"%EXE%\" \"%A0%\" \"%A1%\"");
+    expect(windowsBatchEnv(executable, ["dependencies", "--quiet"]).AUTO_BUMPER_BATCH_EXECUTABLE).toBe(executable);
+  });
+
+  it("leaves a bare batch name unquoted so cmd resolves it through PATH", () => {
+    const script = windowsBatchScript("mvn.cmd", ["--version"]);
+    expect(script).toContain("\r\n%EXE% \"%A0%\"");
+    expect(script).not.toContain("\"%EXE%\"");
+  });
+
+  it("quotes wrapper paths with cmd metacharacters even without whitespace", () => {
+    const script = windowsBatchScript(String.raw`C:\work&whoami\gradlew.bat`, ["dependencies"]);
+    expect(script).toContain("\"%EXE%\" \"%A0%\"");
+  });
+
+  it("drops batch arg slots past the current command", () => {
+    const launch = windowsBatchLaunch("mvn.cmd", ["--version"], {
+      AUTO_BUMPER_BATCH_ARG_0: "stale",
+      AUTO_BUMPER_BATCH_ARG_4: "stale",
+    });
+    try {
+      expect(launch.env.AUTO_BUMPER_BATCH_ARG_0).toBe("--version");
+      expect(launch.env.AUTO_BUMPER_BATCH_ARG_4).toBeUndefined();
+      expect(typeof launch.env.AUTO_BUMPER_BATCH_LAUNCHER).toBe("string");
+      expect(launch.windowsVerbatimArguments).toBe(true);
+    } finally {
+      launch.cleanup();
+    }
+  });
+
+  it("runs a batch file with delayed expansion off", () => {
+    if (process.platform !== "win32") return;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-echo-"));
+    const tricky = path.join(dir, "ok & calc");
+    fs.mkdirSync(tricky);
+    const bat = path.join(tricky, "echo.bat");
+    fs.writeFileSync(bat, "@echo off\r\necho ready!set\r\necho ARG=\"%~1\"\r\n");
+    const launch = windowsBatchLaunch(bat, ["a%OS%b & c!d"]);
+    try {
+      const result = childProcess.spawnSync(launch.file, launch.args, {
+        encoding: "utf8",
+        env: launch.env,
+        windowsVerbatimArguments: true,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ready!set");
+      expect(result.stdout).toContain("ARG=\"a%OS%b & c!d\"");
+    } finally {
+      launch.cleanup();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("rejects a zip entry that climbs out of the extract dir", () => {

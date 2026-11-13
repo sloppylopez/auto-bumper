@@ -164,4 +164,43 @@ export function discardJavaImportBackups(filePaths: string[]): void {
   }
 }
 
+const javaFileCache = new Map<string, string[]>();
+
+/** Java source files under projectRoot (memoized per root+globs). */
+function javaFilesFor(projectRoot: string, globs: string[]): string[] {
+  const key = path.resolve(projectRoot) + "\0" + globs.join("\0");
+  let files = javaFileCache.get(key);
+  if (!files) {
+    files = discoverJavaFiles(projectRoot, globs);
+    javaFileCache.set(key, files);
+  }
+  return files;
+}
+
+const REGEX_SPECIALS = /[.*+?^${}()|[\]\\]/g;
+
+function escapeRegExp(s: string): string {
+  return s.replace(REGEX_SPECIALS, String.raw`\$&`);
+}
+
+/**
+ * Java source files that import packages starting with packagePrefix (e.g. "jakarta.validation").
+ * Used to refuse dependency-graph exclusions that would break compilation. Returns at most 5 paths.
+ */
+export function findJavaImportUsages(projectRoot: string, packagePrefix: string, globs: string[] = DEFAULT_JAVA_GLOBS): string[] {
+  const prefix = packagePrefix.trim();
+  if (!prefix) return [];
+  const re = new RegExp(String.raw`import\s+(?:static\s+)?${escapeRegExp(prefix)}(?=\.)`);
+  const hits: string[] = [];
+  for (const file of javaFilesFor(projectRoot, globs)) {
+    let content: string;
+    try { content = fs.readFileSync(file, "utf8"); } catch { continue; }
+    if (re.test(content)) {
+      hits.push(file);
+      if (hits.length >= 5) break;
+    }
+  }
+  return hits;
+}
+
 export { DEFAULT_JAVA_GLOBS };

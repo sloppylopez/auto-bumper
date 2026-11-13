@@ -22,6 +22,7 @@ export function mixedMigrationClusters(packages: PackageRef[]): Set<string> {
   const mixed = new Set<string>();
   for (const key of migrationsByCluster().keys()) {
     const [fromGroup, toGroup] = key.split("|");
+    if (fromGroup === toGroup) continue; // intra-group rename — no group-level mixing possible
     if (groups.has(fromGroup) && groups.has(toGroup)) mixed.add(key);
   }
   return mixed;

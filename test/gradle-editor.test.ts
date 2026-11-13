@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
-import { applyBumps, applyRenames, hasEnforcedPlatform, readDeclaredVersion } from "../src/lib/gradle-editor.ts";
+import { AUTO_DEPENDER_GRADLE_MARKER_BEGIN, AUTO_DEPENDER_GRADLE_MARKER_END, GRADLE_MARKER_BEGIN, GRADLE_MARKER_END } from "../src/lib/brand.ts";
+import { applyBumps, applyRenames, detectGradlePlatform, findShadowedManagedPins, findStaleManagedPins, hasEnforcedPlatform, hasSpringDependencyManagement, parseUserForces, predictAlignedChecks, readDeclaredVersion, removeManagedPin } from "../src/lib/gradle-editor.ts";
 
 function withTempGradle(content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
@@ -90,6 +90,311 @@ dependencies {
       expect(afterSecond).toContain("com.example:transitive-lib:2.0.0");
     });
   });
+
+  it("applies an approved downgrade below the declared version and overrides stale higher pins", () => {
+    withTempGradle(
+      `def jaxb_version = "4.0.9"
+
+dependencies {
+    implementation platform("org.springframework.boot:spring-boot-dependencies:3.5.0")
+}
+
+configurations.all {
+    resolutionStrategy {
+        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"
+        force "org.glassfish.jaxb:jaxb-runtime:\${jaxb_version}"
+    }
+}`,
+      filePath => {
+        // A previous run rewrote the shared variable — the user's own force already enforces 4.1.0,
+        // so a managed pin at that same version is redundant and must be skipped, not duplicated.
+        const first = applyBumps(filePath, [{
+          packageName: "org.glassfish.jaxb:jaxb-core",
+          targetVersion: "4.1.0",
+          because: ["CVE-OLD"],
+        }]);
+        expect(first.direct).toContain("org.glassfish.jaxb:jaxb-core");
+        expect(readGradle(filePath)).not.toContain(GRADLE_MARKER_BEGIN);
+        expect(first.warnings.some(w => w.includes("skipped managed pin"))).toBe(true);
+
+        const result = applyBumps(filePath, [{
+          packageName: "org.glassfish.jaxb:jaxb-core",
+          targetVersion: "3.0.2",
+          because: ["CVE-2026-92877"],
+          isDowngrade: true,
+        }]);
+        expect(result.constrained).toContain("org.glassfish.jaxb:jaxb-core");
+        // A pin that conflicts with the user's own force is written (approved downgrade) but called out.
+        expect(result.warnings.some(w => w.includes("overrides the project's own force"))).toBe(true);
+        const content = readGradle(filePath);
+        // The downgrade must not be raised back to the declared 4.0.9 nor masked by the stale pin.
+        expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+        expect(content).not.toContain("org.glassfish.jaxb:jaxb-core:4.1.0");
+        // Shared-variable siblings are not dragged down with the downgrade.
+        expect(content).not.toContain("org.glassfish.jaxb:jaxb-runtime:3.0.2");
+      },
+    );
+  });
+});
+
+const QUARKUS_BUILD = [
+  "plugins { id 'io.quarkus' }",
+  "",
+  "dependencies {",
+  '    enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")',
+  "}",
+].join("\n");
+
+const QUARKUS_PROPS = [
+  "quarkusPluginId=io.quarkus",
+  "quarkusPluginVersion=3.28.5",
+  "quarkusPlatformGroupId=io.quarkus.platform",
+  "quarkusPlatformArtifactId=quarkus-bom",
+  "quarkusPlatformVersion=3.28.5",
+].join("\n");
+
+function withTempGradleAndProperties(build: string, props: string | null, run: (filePath: string, propsPath: string) => void): void {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-gradle-"));
+  const filePath = path.join(dir, "build.gradle");
+  const propsPath = path.join(dir, "gradle.properties");
+  fs.writeFileSync(filePath, build, "utf-8");
+  if (props !== null) fs.writeFileSync(propsPath, props, "utf-8");
+  try {
+    run(filePath, propsPath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("platform policy", () => {
+  it("detects a property-based Quarkus platform coordinate", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      expect(detectGradlePlatform(filePath)).toEqual({
+        group: "io.quarkus.platform",
+        artifact: "quarkus-bom",
+        version: "3.28.5",
+        property: "quarkusPlatformVersion",
+      });
+      expect(fs.existsSync(propsPath)).toBe(true);
+    });
+  });
+
+  it("detects an inline literal platform coordinate and returns null when unresolvable", () => {
+    withTempGradle(
+      'dependencies {\n    implementation platform("org.springframework.boot:spring-boot-dependencies:3.2.5")\n}',
+      filePath => {
+        expect(detectGradlePlatform(filePath)).toEqual({
+          group: "org.springframework.boot",
+          artifact: "spring-boot-dependencies",
+          version: "3.2.5",
+        });
+      },
+    );
+    withTempGradle('dependencies {\n    implementation platform("com.example:bom:${unknownVar}")\n}', filePath => {
+      expect(detectGradlePlatform(filePath)).toBeNull();
+    });
+    withTempGradle("plugins { id 'java' }\n", filePath => {
+      expect(detectGradlePlatform(filePath)).toBeNull();
+    });
+  });
+
+  it("bumps the whole Quarkus platform when a BOM-managed fix crosses the minor line", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [{
+        packageName: "io.quarkus:quarkus-vertx-http",
+        targetVersion: "3.33.2.1",
+        because: ["GHSA-qcxp-gm7m-4j5v"],
+        installedVersion: "3.28.5",
+      }]);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.33.2.1");
+      // Quarkus plugin stays in sync with the platform.
+      expect(props).toContain("quarkusPluginVersion=3.33.2.1");
+      expect(result.direct.some(e => e.startsWith("io.quarkus:quarkus-vertx-http:"))).toBe(true);
+      expect(result.appliedTargets?.["io.quarkus:quarkus-vertx-http"]).toBe("3.33.2.1");
+      // No single-artifact constraint or force pin for the BOM-managed artifact.
+      const content = readGradle(filePath);
+      expect(content).not.toContain("io.quarkus:quarkus-vertx-http");
+      expect(result.warnings.some(w => w.includes("Bumped io.quarkus.platform:quarkus-bom 3.28.5 → 3.33.2.1"))).toBe(true);
+    });
+  });
+
+  it("bumps the Quarkus platform for a same-minor fix instead of pinning one extension", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [{
+        packageName: "io.quarkus:quarkus-rest",
+        targetVersion: "3.28.9",
+        because: ["GHSA-test"],
+        installedVersion: "3.28.5",
+      }]);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.28.9");
+      expect(props).toContain("quarkusPluginVersion=3.28.9");
+      expect(readGradle(filePath)).not.toContain("quarkus-rest");
+      expect(result.constrained).not.toContain("io.quarkus:quarkus-rest");
+      expect(result.forced).not.toContain("io.quarkus:quarkus-rest");
+      expect(result.appliedTargets?.["io.quarkus:quarkus-rest"]).toBe("3.28.9");
+    });
+  });
+
+  it("skips non-family cross-minor fixes under an identified platform instead of desynchronizing siblings", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [{
+        packageName: "io.netty:netty-codec-http",
+        targetVersion: "4.2.0.Final",
+        because: ["GHSA-test"],
+        installedVersion: "4.1.115.Final",
+      }]);
+      expect(result.constrained).not.toContain("io.netty:netty-codec-http");
+      expect(result.forced).not.toContain("io.netty:netty-codec-http");
+      const content = readGradle(filePath);
+      expect(content).not.toContain("io.netty:netty-codec-http");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.28.5");
+    });
+  });
+
+  it("converges multiple family fixes on the highest platform version", () => {
+    withTempGradleAndProperties(QUARKUS_BUILD, QUARKUS_PROPS, (filePath, propsPath) => {
+      const result = applyBumps(filePath, [
+        { packageName: "io.quarkus:quarkus-vertx-http", targetVersion: "3.33.2.1", because: ["GHSA-a"] },
+        { packageName: "io.quarkus:quarkus-hibernate-orm", targetVersion: "3.34.0", because: ["GHSA-b"] },
+      ]);
+      const props = readGradle(propsPath);
+      expect(props).toContain("quarkusPlatformVersion=3.34.0");
+      expect(result.direct.filter(e => e.includes("via io.quarkus.platform:quarkus-bom")).length).toBe(2);
+    });
+  });
+
+  it("skips cross-minor fixes when artifact versions do not map to platform releases", () => {
+    withTempGradle(
+      'dependencies {\n    implementation platform("org.springframework.boot:spring-boot-dependencies:3.2.5")\n}',
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.springframework:spring-web",
+          targetVersion: "6.2.0",
+          because: ["GHSA-test"],
+          installedVersion: "6.1.5",
+        }]);
+        expect(result.direct).not.toContain("org.springframework:spring-web");
+        expect(result.constrained).not.toContain("org.springframework:spring-web");
+        expect(result.forced).not.toContain("org.springframework:spring-web");
+        const content = readGradle(filePath);
+        expect(content).not.toContain("org.springframework:spring-web");
+        expect(result.warnings.some(w => w.includes("bump the platform/BOM manually"))).toBe(true);
+      },
+    );
+  });
+
+  it("skips cross-minor BOM-managed fixes when the platform version cannot be identified", () => {
+    withTempGradle(
+      "plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}\n",
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.apache.tomcat.embed:tomcat-embed-core",
+          targetVersion: "10.2.0",
+          because: ["GHSA-test"],
+          installedVersion: "10.1.20",
+        }]);
+        expect(result.constrained).not.toContain("org.apache.tomcat.embed:tomcat-embed-core");
+        expect(result.forced).not.toContain("org.apache.tomcat.embed:tomcat-embed-core");
+        const content = readGradle(filePath);
+        expect(content).not.toContain("tomcat-embed-core");
+        expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+      },
+    );
+  });
+
+  it("still force-pins same-minor BOM-managed fixes when the platform version cannot be identified", () => {
+    withTempGradle(
+      "plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}\n",
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.apache.tomcat.embed:tomcat-embed-core",
+          targetVersion: "10.1.42",
+          because: ["GHSA-test"],
+          installedVersion: "10.1.20",
+        }]);
+        expect(result.forced).toContain("org.apache.tomcat.embed:tomcat-embed-core");
+      },
+    );
+  });
+
+  it("rewrites the Spring Boot plugin version for an undeclared starter fix", () => {
+    withTempGradle(
+      "plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}\n",
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.springframework.boot:spring-boot-starter-web",
+          targetVersion: "3.4.1",
+          because: ["GHSA-test"],
+          installedVersion: "3.2.5",
+        }]);
+        const content = readGradle(filePath);
+        expect(content).toContain("id 'org.springframework.boot' version '3.4.1'");
+        expect(content).not.toContain("spring-boot-starter-web");
+        expect(content).not.toContain("dependencyManagement {");
+        expect(result.constrained).not.toContain("org.springframework.boot:spring-boot-starter-web");
+        expect(result.forced).not.toContain("org.springframework.boot:spring-boot-starter-web");
+        expect(result.appliedTargets?.["org.springframework.boot:spring-boot-starter-web"]).toBe("3.4.1");
+      },
+    );
+  });
+
+  it("rewrites a Kotlin Spring Boot plugin version", () => {
+    withTempGradle(
+      'plugins {\n    id("org.springframework.boot") version "3.2.5"\n}\n',
+      filePath => {
+        applyBumps(filePath, [{
+          packageName: "org.springframework.boot:spring-boot-starter-web",
+          targetVersion: "3.3.6",
+          because: ["GHSA-test"],
+          installedVersion: "3.2.5",
+        }]);
+        expect(readGradle(filePath)).toContain('id("org.springframework.boot") version "3.3.6"');
+      },
+    );
+  });
+
+  it("rewrites springBootVersion when the plugin version is a property", () => {
+    const build = "plugins {\n    id 'org.springframework.boot' version '${springBootVersion}'\n}\n";
+    withTempGradleAndProperties(build, "springBootVersion=3.2.5", (filePath, propsPath) => {
+      applyBumps(filePath, [{
+        packageName: "org.springframework.boot:spring-boot-starter-web",
+        targetVersion: "3.3.6",
+        because: ["GHSA-test"],
+        installedVersion: "3.2.5",
+      }]);
+      expect(readGradle(filePath)).toContain("version '${springBootVersion}'");
+      expect(readGradle(propsPath)).toContain("springBootVersion=3.3.6");
+    });
+  });
+
+  it("bumps spring-boot-dependencies and the plugin together for a same-minor starter fix", () => {
+    const build = [
+      "plugins {",
+      "    id 'org.springframework.boot' version '3.2.5'",
+      "}",
+      "dependencies {",
+      '    implementation platform("org.springframework.boot:spring-boot-dependencies:3.2.5")',
+      "}",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.springframework.boot:spring-boot-starter-web",
+        targetVersion: "3.2.6",
+        because: ["GHSA-test"],
+        installedVersion: "3.2.5",
+      }]);
+      const content = readGradle(filePath);
+      expect(content).toContain("spring-boot-dependencies:3.2.6");
+      expect(content).toContain("version '3.2.6'");
+      expect(content).not.toContain("spring-boot-starter-web");
+      expect(result.warnings.some(w => w.includes("stay on the platform line"))).toBe(true);
+    });
+  });
+
 });
 
 describe("applyRenames", () => {
@@ -294,6 +599,1042 @@ dependencies {
 
     it("returns false when no BOM present", () => {
       expect(hasEnforcedPlatform('dependencies {\n    implementation "commons-io:commons-io:2.19.0"\n}')).toBe(false);
+    });
+  });
+});
+
+describe("applyBumps BOM-aware cleanup", () => {
+  const bomMap = new Map<string, string>([
+    ["io.netty:netty-codec-http2", "4.1.139"],
+    ["io.netty:netty-handler", "4.1.139"],
+    ["io.netty:netty-resolver-dns", "4.1.139"],
+    ["com.example:fresh-lib", "2.0.0"],
+    ["org.glassfish.jaxb:jaxb-core", "4.0.8"],
+  ]);
+
+  const ENFORCED_FILE = `dependencies {
+    implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.33.4.1"))
+    implementation "org.slf4j:slf4j-api:2.0.16"
+}
+`;
+
+  function seed(filePath: string, bumps: Array<{ pkg: string; version: string }>): void {
+    applyBumps(filePath, bumps.map(b => ({ packageName: b.pkg, targetVersion: b.version, because: ["GHSA-test"] })));
+  }
+
+  it("drops stale constraint and force pins, keeps fresh ones", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+        { pkg: "io.netty:netty-handler", version: "4.1.137" },
+        { pkg: "com.example:fresh-lib", version: "3.0.0" },
+      ]);
+      expect(readGradle(filePath)).toContain(GRADLE_MARKER_BEGIN);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toEqual([
+        "io.netty:netty-codec-http2@4.1.136",
+        "io.netty:netty-handler@4.1.137",
+      ]);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("4.1.136");
+      expect(content).not.toContain("4.1.137");
+      expect(content).toContain("com.example:fresh-lib:3.0.0");
+      expect(result.warnings.some(w => w.includes("dropped stale pin io.netty:netty-codec-http2@4.1.136"))).toBe(true);
+    });
+  });
+
+  it("is a byte-identical no-op when no pin is stale", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "com.example:fresh-lib", version: "3.0.0" }]);
+      const before = readGradle(filePath);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toBeUndefined();
+      expect(readGradle(filePath)).toBe(before);
+    });
+  });
+
+  it("removes the managed block entirely when every pin is stale", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+        { pkg: "io.netty:netty-resolver-dns", version: "4.1.135" },
+      ]);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toHaveLength(2);
+      const content = readGradle(filePath);
+      expect(content).not.toContain(GRADLE_MARKER_BEGIN);
+      expect(content).not.toContain(GRADLE_MARKER_END);
+    });
+  });
+
+  it("skips new pins at or below the BOM-managed version", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const before = readGradle(filePath);
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.138", because: ["GHSA-x"] },
+      ], [], bomMap);
+      expect(result.warnings.some(w => w.includes("pin would force a downgrade"))).toBe(true);
+      expect(readGradle(filePath)).toBe(before);
+    });
+  });
+
+  it("keeps new pins above the BOM-managed version", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.140", because: ["GHSA-y"] },
+      ], [], bomMap);
+      expect(result.warnings.some(w => w.includes("skipped"))).toBe(false);
+      expect(readGradle(filePath)).toContain("io.netty:netty-handler:4.1.140");
+    });
+  });
+
+  it("keeps explicit downgrades below the BOM-managed version", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.130", because: ["GHSA-z"], isDowngrade: true },
+      ], [], bomMap);
+      expect(result.warnings.some(w => w.includes("skipped"))).toBe(false);
+      expect(readGradle(filePath)).toContain("io.netty:netty-handler:4.1.130");
+    });
+  });
+
+  it("pins cross-minor fixes whose family has no same-line siblings", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const guavaBom = new Map<string, string>([
+        ["com.google.guava:guava", "33.5.0-jre"],
+        ["com.google.guava:failureaccess", "1.0.2"],
+        ["com.google.guava:listenablefuture", "9999.0-empty-to-avoid-conflict-with-guava"],
+      ]);
+      const result = applyBumps(filePath, [
+        { packageName: "com.google.guava:guava", targetVersion: "33.7.2-jre", because: ["CVE-2026-102554"], installedVersion: "33.5.0-jre" },
+      ], [], guavaBom);
+      expect(result.constrained).toContain("com.google.guava:guava");
+      expect(result.forced).toContain("com.google.guava:guava");
+      expect(readGradle(filePath)).toContain("com.google.guava:guava:33.7.2-jre");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("still skips cross-minor fixes when a same-line sibling is BOM-managed", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      const nettyBom = new Map<string, string>([
+        ["io.netty:netty-codec-http", "4.1.135.Final"],
+        ["io.netty:netty-codec", "4.1.136.Final"],
+        ["io.netty:netty-handler", "4.1.137.Final"],
+      ]);
+      const result = applyBumps(filePath, [
+        { packageName: "io.netty:netty-codec-http", targetVersion: "4.2.0.Final", because: ["GHSA-test"], installedVersion: "4.1.135.Final" },
+      ], [], nettyBom);
+      expect(result.constrained).not.toContain("io.netty:netty-codec-http");
+      expect(result.forced).not.toContain("io.netty:netty-codec-http");
+      expect(readGradle(filePath)).not.toContain("io.netty:netty-codec-http");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(true);
+    });
+  });
+
+  it("is idempotent across repeated cleanup runs", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "io.netty:netty-codec-http2", version: "4.1.136" }]);
+      applyBumps(filePath, [], [], bomMap);
+      const afterFirst = readGradle(filePath);
+
+      const second = applyBumps(filePath, [], [], bomMap);
+      expect(second.droppedStale).toBeUndefined();
+      expect(readGradle(filePath)).toBe(afterFirst);
+    });
+  });
+
+  it("keeps a protected vulnerability-escape pin while dropping other stale pins", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" },
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+      ]);
+
+      const result = applyBumps(filePath, [], [], bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(result.droppedStale).toEqual(["io.netty:netty-codec-http2@4.1.136"]);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).not.toContain("4.1.136");
+    });
+  });
+
+  it("drops a stale pin when it is not protected", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" }]);
+
+      const result = applyBumps(filePath, [], [], bomMap);
+      expect(result.droppedStale).toEqual(["org.glassfish.jaxb:jaxb-core@3.0.2"]);
+      expect(readGradle(filePath)).not.toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+    });
+  });
+
+  it("keeps the protected pin when new bumps are applied in the same run", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [{ pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" }]);
+
+      applyBumps(filePath, [
+        { packageName: "io.netty:netty-handler", targetVersion: "4.1.140", because: ["GHSA-w"] },
+      ], [], bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).toContain("io.netty:netty-handler:4.1.140");
+    });
+  });
+
+  it("findStaleManagedPins skips protected pins", () => {
+    withTempGradle(ENFORCED_FILE, filePath => {
+      seed(filePath, [
+        { pkg: "org.glassfish.jaxb:jaxb-core", version: "3.0.2" },
+        { pkg: "io.netty:netty-codec-http2", version: "4.1.136" },
+      ]);
+
+      const stale = findStaleManagedPins(readGradle(filePath), bomMap, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(stale).toEqual([{ packageName: "io.netty:netty-codec-http2", version: "4.1.136", bomVersion: "4.1.139" }]);
+    });
+  });
+});
+describe("managed block comment preservation", () => {
+  it("keeps a human comment above a pin when the managed block is re-rendered", () => {
+    withTempGradle(
+      `plugins { id 'java' }
+
+dependencies {
+    implementation 'com.example:json-schema-validator:2.2.13'
+}
+
+${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        // Pinned below 2.3.x: json-patch 1.13 is compiled against the 2.0 API and
+        // throws NoSuchMethodError under coreutils 1.12.
+        implementation('com.networknt:json-schema-validator:2.2.13') { because 'GHSA-json' }
+    }
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        applyBumps(filePath, [{
+          packageName: "com.example:other-lib",
+          targetVersion: "1.0.1",
+          because: ["CVE-TEST"],
+        }]);
+        const content = readGradle(filePath);
+        expect(content).toContain("throws NoSuchMethodError under coreutils 1.12.");
+        // The comment must still sit directly above its pin.
+        const lines = content.split("\n");
+        const pinIdx = lines.findIndex(l => l.includes("com.networknt:json-schema-validator:2.2.13"));
+        expect(lines[pinIdx - 1].trim()).toContain("throws NoSuchMethodError under coreutils 1.12.");
+      },
+    );
+  });
+
+  it("preserves existing because clauses when the managed block is re-rendered", () => {
+    withTempGradle(
+      `plugins { id 'java' }
+
+dependencies {
+    implementation 'com.example:json-schema-validator:2.2.13'
+}
+
+${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        implementation('org.json:json:20260719') { because 'GHSA-ghc9-756g-vrcv' }
+    }
+}
+configurations.all {
+    resolutionStrategy {
+        force 'org.json:json:20260719'
+    }
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        applyBumps(filePath, [{
+          packageName: "org.glassfish.jaxb:jaxb-core",
+          targetVersion: "3.0.2",
+          because: ["CVE-2026-92877"],
+          isDowngrade: true,
+          installedVersion: "4.0.9",
+        }]);
+        const content = readGradle(filePath);
+        // The carried-over pin must keep its advisory annotation (regression: the
+        // because clause was lost on every re-render because the parser sliced from
+        // the match length instead of the match end).
+        expect(content).toContain("implementation('org.json:json:20260719') { because 'GHSA-ghc9-756g-vrcv' }");
+        expect(content).toContain("force 'org.json:json:20260719'");
+        // The new pin carries its own annotation.
+        expect(content).toContain("implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }");
+      },
+    );
+  });
+
+  it("drops the comment of a removed pin but keeps the others", () => {
+    withTempGradle(
+      `${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        // Keep old: documents why this stays pinned.
+        implementation('com.example:keep-old:1.0.0') { because 'GHSA-keep' }
+        // Drop me: this pin is going away.
+        implementation('com.example:drop-me:1.0.0') { because 'GHSA-drop' }
+    }
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        expect(removeManagedPin(filePath, "com.example:drop-me")).toBe(true);
+        const content = readGradle(filePath);
+        expect(content).toContain("documents why this stays pinned.");
+        expect(content).not.toContain("this pin is going away.");
+        expect(content).toContain("com.example:keep-old:1.0.0");
+      },
+    );
+  });
+
+  it("moves a comment with its renamed coordinate and keeps force pins", () => {
+    withTempGradle(
+      `${GRADLE_MARKER_BEGIN}
+dependencies {
+    constraints {
+        // Old group is deprecated; new group follows.
+        implementation('com.fasterxml.jackson.core:jackson-databind:2.19.0') { because 'GHSA-5jmj' }
+    }
+}
+configurations.all {
+    resolutionStrategy {
+        force 'com.fasterxml.jackson.core:jackson-databind:2.19.4'
+        force 'org.example:sibling-lib:1.2.3'
+}
+${GRADLE_MARKER_END}`,
+      filePath => {
+        applyRenames(filePath, [{
+          fromPackage: "com.fasterxml.jackson.core:jackson-databind",
+          toPackage: "tools.jackson.core:jackson-databind",
+          targetVersion: "3.1.4",
+          because: ["GHSA-5jmj-h7xm-6q6v"],
+        }]);
+        const content = readGradle(filePath);
+        expect(content).toContain("tools.jackson.core:jackson-databind:3.1.4");
+        // The comment follows the pin to its new coordinate...
+        const lines = content.split("\n");
+        const pinIdx = lines.findIndex(l => l.includes("tools.jackson.core:jackson-databind:3.1.4"));
+        expect(lines[pinIdx - 1].trim()).toContain("Old group is deprecated");
+        // The renamed package's force pin follows it, raised to the rename target...
+        expect(content).toContain("force 'tools.jackson.core:jackson-databind:3.1.4'");
+        // ...and an unrelated force pin survives the re-render (regression: renames used to drop all forces).
+        expect(content).toContain("force 'org.example:sibling-lib:1.2.3'");
+      },
+    );
+  });
+
+  it("does not report a shared-variable bump when the def already satisfies the target", () => {
+    withTempGradle(
+      `def pg_version = "42.7.14"
+
+dependencies {
+    implementation "org.postgresql:postgresql:\${pg_version}"
+}`,
+      filePath => {
+        const result = applyBumps(filePath, [{
+          packageName: "org.postgresql:postgresql",
+          targetVersion: "42.7.14",
+          because: ["CVE-TEST"],
+        }]);
+        expect(result.warnings.some(w => w.includes("shared variable"))).toBe(false);
+      },
+    );
+  });
+});
+
+describe("parseUserForces", () => {
+  it("resolves variable-referenced forces outside the managed block and ignores managed pins", () => {
+    const content = [
+      `def jaxb_version = "4.0.9"`,
+      `dependencies { implementation "com.example:app" }`,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+      `        force 'org.glassfish.jaxb:jaxb-runtime:\${jaxb_version}'`,
+      `        force "com.example:direct:1.2.3"`,
+      `        force "com.example:mystery:\${undefined_var}"`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_BEGIN,
+      `force "org.glassfish.jaxb:jaxb-core:9.9.9" // managed pin must not be read as a user force`,
+      GRADLE_MARKER_END,
+      ``,
+    ].join("\n");
+
+    const forces = parseUserForces(content);
+    expect(forces.get("org.glassfish.jaxb:jaxb-core")).toBe("4.0.9");
+    expect(forces.get("org.glassfish.jaxb:jaxb-runtime")).toBe("4.0.9");
+    expect(forces.get("com.example:direct")).toBe("1.2.3");
+    expect(forces.has("com.example:mystery")).toBe(false);
+  });
+
+  it("returns an empty map when the project has no forces", () => {
+    expect(parseUserForces(`dependencies {\n    implementation "a:b:1.0"\n}\n`).size).toBe(0);
+  });
+});
+
+describe("findShadowedManagedPins", () => {
+  const SHADOW_FILE = [
+    `def jaxb_version = "4.0.9"`,
+    ``,
+    `configurations.all {`,
+    `    resolutionStrategy {`,
+    `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+    `        force 'com.example:direct:1.2.3'`,
+    `        force 'org.low:below-user:2.3.0'`,
+    `    }`,
+    `}`,
+    ``,
+    GRADLE_MARKER_BEGIN,
+    `dependencies {`,
+    `    constraints {`,
+    `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+    `        implementation('com.example:direct:1.2.3') { because 'GHSA-test' }`,
+    `        implementation('org.low:below-user:3.0.2') { because 'GHSA-low' }`,
+    `    }`,
+    `}`,
+    `configurations.all {`,
+    `    resolutionStrategy {`,
+    `        force 'org.glassfish.jaxb:jaxb-core:3.0.2'`,
+    `        force 'org.low:below-user:3.0.2'`,
+    `    }`,
+    `}`,
+    GRADLE_MARKER_END,
+  ].join("\n");
+
+  it("reports pins the user's own force covers at or above, once per package", () => {
+    const shadowed = findShadowedManagedPins(SHADOW_FILE);
+    expect(shadowed).toEqual([
+      { packageName: "org.glassfish.jaxb:jaxb-core", version: "3.0.2", userVersion: "4.0.9" },
+      { packageName: "com.example:direct", version: "1.2.3", userVersion: "1.2.3" },
+    ]);
+  });
+
+  it("keeps pins above the user's force and skips packages rewritten this run", () => {
+    const all = findShadowedManagedPins(SHADOW_FILE);
+    expect(all.some(s => s.packageName === "org.low:below-user")).toBe(false);
+    const touched = findShadowedManagedPins(SHADOW_FILE, new Set(["org.glassfish.jaxb:jaxb-core"]));
+    expect(touched.map(s => s.packageName)).toEqual(["com.example:direct"]);
+  });
+
+  it("returns empty when there is no managed block or no user forces", () => {
+    expect(findShadowedManagedPins(`dependencies {\n    implementation "a:b:1.0"\n}\n`)).toEqual([]);
+    const noForces = SHADOW_FILE.replace(`force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`, ``)
+      .replace(`force 'com.example:direct:1.2.3'`, ``)
+      .replace(`force 'org.low:below-user:2.3.0'`, ``);
+    expect(findShadowedManagedPins(noForces)).toEqual([]);
+  });
+});
+
+describe("applyBumps stale shadow cleanup", () => {
+  it("removes a pre-existing managed pin the project's own force already covers, and keeps pins above the user force", () => {
+    const file = [
+      `def jaxb_version = "4.0.9"`,
+      ``,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+      `        force 'org.low:below-user:2.3.0'`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `        implementation('org.low:below-user:3.0.2') { because 'GHSA-low' }`,
+      `    }`,
+      `}`,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'org.glassfish.jaxb:jaxb-core:3.0.2'`,
+      `        force 'org.low:below-user:3.0.2'`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(file, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.tomcat.embed:tomcat-embed-core",
+        targetVersion: "11.0.27",
+        because: ["CVE-2026-101356"],
+      }]);
+      expect(result.warnings.some(w => w === "removed stale managed pin org.glassfish.jaxb:jaxb-core@3.0.2 — the project's own resolutionStrategy.force already pins it at 4.0.9")).toBe(true);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.apache.tomcat.embed:tomcat-embed-core:11.0.27");
+      expect(content).not.toContain("jaxb-core:3.0.2");
+      expect(content).not.toContain("'org.glassfish.jaxb:jaxb-core:3.0.2'");
+      // Pin above the user's own force survives — it enforces a newer fix version.
+      expect(content).toContain("org.low:below-user:3.0.2");
+    });
+  });
+
+  it("when the user's own force is bumped in place, the now-redundant managed pin is cleaned up", () => {
+    const file = [
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'com.example:direct:1.2.3'`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('com.example:direct:1.2.3') { because 'GHSA-test' }`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(file, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "com.example:direct",
+        targetVersion: "1.2.4",
+        because: ["GHSA-next"],
+      }]);
+      // The project's own force line is the direct declaration — bumped in place to 1.2.4.
+      expect(result.direct).toContain("com.example:direct");
+      const content = readGradle(filePath);
+      expect(content).toContain(`force 'com.example:direct:1.2.4'`);
+      // The managed pin is not rewritten in place by the direct bump (that would misclassify it as
+      // "direct"); it stays at 1.2.3, is shadowed by the user's own force (now 1.2.4), and removed.
+      expect(result.warnings.some(w => w === "removed stale managed pin com.example:direct@1.2.3 — the project's own resolutionStrategy.force already pins it at 1.2.4")).toBe(true);
+      expect(content).not.toContain("com.example:direct:1.2.3");
+    });
+  });
+
+  it("keeps a protected vulnerability-escape pin even when the project's own force covers it — the forced version is itself affected", () => {
+    const file = [
+      `def jaxb_version = "4.0.9"`,
+      ``,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force "org.glassfish.jaxb:jaxb-core:\${jaxb_version}"`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `    }`,
+      `}`,
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'org.glassfish.jaxb:jaxb-core:3.0.2'`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    const bomManaged = new Map([["org.glassfish.jaxb:jaxb-core", "4.0.9"]]);
+    withTempGradle(file, filePath => {
+      // Cleanup-only run: the pin is BOM-stale (3.0.2 <= 4.0.9) AND protected (the BOM-managed
+      // version is still vulnerable). The user's own force pins it at 4.0.9 — but that forced
+      // version is itself affected, and last resolutionStrategy.force wins: our pin (last in the
+      // file) keeps the tree clean. Dropping it would reintroduce the finding.
+      const result = applyBumps(filePath, [], [], bomManaged, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(result.warnings).toEqual([]);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).toContain(GRADLE_MARKER_BEGIN);
+    });
+  });
+
+  it("still removes a non-protected shadowed pin when the project's own force covers it", () => {
+    const file = [
+      `configurations.all {`,
+      `    resolutionStrategy {`,
+      `        force 'org.glassfish.jaxb:jaxb-core:4.0.9'`,
+      `    }`,
+      `}`,
+      ``,
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    // BOM manages 3.0.1 (below the pin) so the pin is NOT BOM-stale — only the shadow path applies.
+    const bomManaged = new Map([["org.glassfish.jaxb:jaxb-core", "3.0.1"]]);
+    withTempGradle(file, filePath => {
+      // Not protected (the forced version is clean) and shadowed by the user's own force —
+      // the explicit user decision governs and the redundant pin goes.
+      const result = applyBumps(filePath, [], [], bomManaged);
+      expect(result.warnings.some(w => w === "removed stale managed pin org.glassfish.jaxb:jaxb-core@3.0.2 — the project's own resolutionStrategy.force already pins it at 4.0.9")).toBe(true);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("jaxb-core:3.0.2");
+      // The block held only this pin — fully cleaned, so the markers go too (idempotent re-runs).
+      expect(content).not.toContain(GRADLE_MARKER_BEGIN);
+    });
+  });
+
+  it("keeps a protected vulnerability-escape pin when no user force shadows it", () => {
+    const file = [
+      GRADLE_MARKER_BEGIN,
+      `dependencies {`,
+      `    constraints {`,
+      `        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }`,
+      `    }`,
+      `}`,
+      GRADLE_MARKER_END,
+    ].join("\n");
+    const bomManaged = new Map([["org.glassfish.jaxb:jaxb-core", "4.0.9"]]);
+    withTempGradle(file, filePath => {
+      // BOM-stale but protected and not shadowed by any user force — dropping it would reintroduce
+      // the finding, so cleanup-only runs leave it alone.
+      const result = applyBumps(filePath, [], [], bomManaged, new Set(["org.glassfish.jaxb:jaxb-core"]));
+      expect(result.warnings).toEqual([]);
+      const content = readGradle(filePath);
+      expect(content).toContain("org.glassfish.jaxb:jaxb-core:3.0.2");
+      expect(content).toContain(GRADLE_MARKER_BEGIN);
+    });
+  });
+});
+
+describe("applyBumps Spring dependency management", () => {
+  const SPRING_DM_BUILD = [
+    "plugins {",
+    "    id 'java'",
+    "    id 'io.spring.dependency-management'",
+    "}",
+    "",
+    "dependencies {",
+    "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+    "}",
+  ].join("\n");
+
+  it("pins a transitive fix via dependencyManagement (which beats BOM imports and forces) and stays idempotent", () => {
+    const classpath = [{ name: "net.minidev:json-smart", version: "2.6.0" }];
+    withTempGradle(SPRING_DM_BUILD, filePath => {
+      const bump = {
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      };
+      const result = applyBumps(filePath, [bump], [], null, undefined, classpath);
+      expect(result.constrained).toContain("net.minidev:json-smart");
+      let content = readGradle(filePath);
+      expect(content).toContain("dependencyManagement {");
+      expect(content).toContain("dependency 'net.minidev:json-smart:2.6.1'");
+      expect(content).toContain("// SNYK-JAVA-NETMINIDEV-21715438");
+      expect(result.warnings.some(w => w.includes("pinned 1 package(s) via dependencyManagement"))).toBe(true);
+
+      // Re-run: the pin already exists — no duplicate entries or advisory comments.
+      applyBumps(filePath, [bump], [], null, undefined, classpath);
+      content = readGradle(filePath);
+      expect(countOccurrences(content, "dependency 'net.minidev:json-smart")).toBe(1);
+      expect(countOccurrences(content, "// SNYK-JAVA-NETMINIDEV-21715438")).toBe(1);
+      expect(content).toContain("dependency 'net.minidev:json-smart:2.6.1'");
+    });
+  });
+
+  it("aligns the whole classpath family when a cross-minor fix has same-line siblings", () => {
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-api", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+    ];
+    withTempGradle(SPRING_DM_BUILD, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.logging.log4j:log4j-api",
+        targetVersion: "2.26.1",
+        because: ["GHSA-test"],
+        installedVersion: "2.25.5",
+      }], [], null, undefined, classpath);
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-api");
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-to-slf4j");
+      const content = readGradle(filePath);
+      expect(content).toContain("dependency 'org.apache.logging.log4j:log4j-api:2.26.1'");
+      expect(content).toContain("dependency 'org.apache.logging.log4j:log4j-to-slf4j:2.26.1'");
+      expect(result.warnings.some(w => w.includes("aligned the whole family"))).toBe(true);
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("pins a cross-minor fix when the classpath shows no same-line sibling", () => {
+    const classpath = [{ name: "org.ow2.asm:asm", version: "9.7.1" }];
+    withTempGradle(SPRING_DM_BUILD, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.ow2.asm:asm",
+        targetVersion: "9.11",
+        because: ["SNYK-JAVA-ORGOW2ASM-21715452"],
+        installedVersion: "9.7.1",
+      }], [], null, undefined, classpath);
+      expect(result.constrained).toContain("org.ow2.asm:asm");
+      expect(readGradle(filePath)).toContain("dependency 'org.ow2.asm:asm:9.11'");
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("aligns the whole classpath family on non-Spring-DM projects too (managed pins + forces, no dependencyManagement block)", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "}",
+    ].join("\n");
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-api", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+    ];
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.logging.log4j:log4j-api",
+        targetVersion: "2.26.1",
+        because: ["GHSA-test"],
+        installedVersion: "2.25.5",
+      }], [], null, undefined, classpath);
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-api");
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-to-slf4j");
+      const content = readGradle(filePath);
+      // No dependencyManagement extension on this build — alignment rides on managed pins + forces.
+      expect(content).not.toContain("dependencyManagement {");
+      expect(content).toContain("org.apache.logging.log4j:log4j-to-slf4j:2.26.1");
+      expect(result.warnings.some(w => w.includes("aligned the whole family"))).toBe(true);
+      expect(result.warnings.some(w => w.includes("crosses a minor line"))).toBe(false);
+    });
+  });
+
+  it("skips an aligned family member whose target version is not published (predicate gate)", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "}",
+    ].join("\n");
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-api", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+    ];
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.apache.logging.log4j:log4j-api",
+        targetVersion: "2.26.1",
+        because: ["GHSA-test"],
+        installedVersion: "2.25.5",
+      }], [], null, undefined, classpath, name => (name === "org.apache.logging.log4j:log4j-to-slf4j" ? false : true));
+      // The anchor is pinned; the unpublished member stays at its current version.
+      expect(result.constrained).toContain("org.apache.logging.log4j:log4j-api");
+      expect(result.constrained).not.toContain("org.apache.logging.log4j:log4j-to-slf4j");
+      const content = readGradle(filePath);
+      expect(content).toContain("org.apache.logging.log4j:log4j-api:2.26.1");
+      expect(content).not.toContain("log4j-to-slf4j");
+      expect(result.warnings.some(w => w.includes("log4j-to-slf4j") && w.includes("not published"))).toBe(true);
+    });
+  });
+
+  it("does not render dependencyManagement when only the Spring Boot plugin is applied", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "    id 'org.springframework.boot' version '3.2.5'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "}",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      }], [], null, undefined, [{ name: "net.minidev:json-smart", version: "2.6.0" }]);
+      const content = readGradle(filePath);
+      // The Boot plugin does not provide the dependencyManagement extension — a block here breaks the build.
+      expect(content).not.toContain("dependencyManagement {");
+      expect(result.constrained).toContain("net.minidev:json-smart");
+      expect(content).toContain("net.minidev:json-smart:2.6.1");
+    });
+  });
+
+  it("detects the Spring dependency-management plugin only when explicitly applied", () => {
+    expect(hasSpringDependencyManagement("plugins {\n    id 'org.springframework.boot' version '3.2.5'\n}")).toBe(false);
+    expect(hasSpringDependencyManagement("plugins {\n    id 'io.spring.dependency-management'\n}")).toBe(true);
+    expect(hasSpringDependencyManagement("apply plugin: 'org.springframework.boot'")).toBe(false);
+  });
+
+  it("predicts the superset of family-alignment checks before applying", () => {
+    const bumps = [{ packageName: "org.apache.logging.log4j:log4j-api", targetVersion: "2.26.1", because: ["GHSA-test"], installedVersion: "2.25.5" }];
+    const classpath = [
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.25.5" },
+      { name: "org.apache.logging.log4j:log4j-core", version: "2.26.1" },
+      { name: "com.google.guava:guava", version: "33.0.0-jre" },
+    ];
+    expect(predictAlignedChecks(bumps, classpath)).toEqual([
+      { name: "org.apache.logging.log4j:log4j-to-slf4j", version: "2.26.1" },
+    ]);
+    expect(predictAlignedChecks(bumps, null)).toEqual([]);
+  });
+
+  it("does not render dependencyManagement for a bare boot-starter dependency (no extension applied)", () => {
+    const build = [
+      "plugins {",
+      "    id 'java'",
+      "}",
+      "",
+      "dependencies {",
+      "    implementation platform(\"org.glassfish.jersey:jersey-bom:3.1.12-managed\")",
+      "    implementation 'org.springframework.boot:spring-boot-starter-web:3.4.0'",
+      "}",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      }], [], null, undefined, [{ name: "net.minidev:json-smart", version: "2.6.0" }]);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("dependencyManagement {");
+      expect(result.constrained).toContain("net.minidev:json-smart");
+    });
+  });
+
+  it("credits a dependencyManagement pin written this run even when a managed constraint already sits at the target", () => {
+    // Leftover from an earlier run: the constraints block pins json-smart at the fix version, but
+    // no dependencyManagement pin exists — on Spring DM projects only the DM pin is effective.
+    const build = [
+      SPRING_DM_BUILD,
+      "",
+      "// auto-bumper:begin managed constraints (auto-generated, do not edit)",
+      "dependencies {",
+      "    constraints {",
+      "        implementation('net.minidev:json-smart:2.6.1') { because 'SNYK-JAVA-NETMINIDEV-21715438' }",
+      "    }",
+      "}",
+      "// auto-bumper:end",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "net.minidev:json-smart",
+        targetVersion: "2.6.1",
+        because: ["SNYK-JAVA-NETMINIDEV-21715438"],
+        installedVersion: "2.6.0",
+      }], [], null, undefined, [{ name: "net.minidev:json-smart", version: "2.6.0" }]);
+      expect(result.constrained).toContain("net.minidev:json-smart");
+      expect(result.appliedTargets?.["net.minidev:json-smart"]).toBe("2.6.1");
+      const content = readGradle(filePath);
+      expect(content).toContain("dependency 'net.minidev:json-smart:2.6.1'");
+      expect(countOccurrences(content, "implementation('net.minidev:json-smart")).toBe(1);
+    });
+  });
+
+  it("re-bumps an already-pinned transitive dependency through the managed blocks without misclassifying it as direct", () => {
+    // State after a first run: constraint + force + DM pin all at 9.11, no direct declaration.
+    const build = [
+      SPRING_DM_BUILD,
+      "",
+      "// auto-bumper:begin managed constraints (auto-generated, do not edit)",
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.ow2.asm:asm:9.11') { because 'SNYK-JAVA-ORGOW2ASM-21715452' }",
+      "    }",
+      "}",
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'org.ow2.asm:asm:9.11'",
+      "    }",
+      "}",
+      "dependencyManagement {",
+      "    dependencies {",
+      "        // SNYK-JAVA-ORGOW2ASM-21715452",
+      "        dependency 'org.ow2.asm:asm:9.11'",
+      "    }",
+      "}",
+      "// auto-bumper:end",
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      const result = applyBumps(filePath, [{
+        packageName: "org.ow2.asm:asm",
+        targetVersion: "9.11.1",
+        because: ["SNYK-JAVA-ORGOW2ASM-21715452"],
+        installedVersion: "9.11",
+      }], [], null, undefined, [{ name: "org.ow2.asm:asm", version: "9.11" }]);
+      expect(result.direct).not.toContain("org.ow2.asm:asm");
+      expect(result.constrained).toContain("org.ow2.asm:asm");
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, "implementation('org.ow2.asm:asm:9.11.1')")).toBe(1);
+      expect(countOccurrences(content, "force 'org.ow2.asm:asm:9.11.1'")).toBe(1);
+      expect(countOccurrences(content, "dependency 'org.ow2.asm:asm:9.11.1'")).toBe(1);
+      expect(content).not.toContain("'org.ow2.asm:asm:9.11'");
+      expect(countOccurrences(content, "// SNYK-JAVA-ORGOW2ASM-21715452")).toBe(1);
+    });
+  });
+});
+
+describe("legacy managed-block brands", () => {
+  it("consolidates a pre-existing auto-depender block with the current one into a single canonical block", () => {
+    const build = [
+      "plugins { id 'java' }",
+      "",
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('ch.qos.logback:logback-classic:1.6.5') { because 'CVE-2026-104721' }",
+      "    }",
+      "}",
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'ch.qos.logback:logback-classic:1.6.5'",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.glassfish.jaxb:jaxb-core:3.0.2') { because 'CVE-2026-92877' }",
+      "    }",
+      "}",
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      applyBumps(filePath, [{
+        packageName: "org.objenesis:objenesis",
+        targetVersion: "3.6",
+        because: ["CVE-2026-116486"],
+      }]);
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, GRADLE_MARKER_BEGIN)).toBe(1);
+      expect(content).not.toContain(AUTO_DEPENDER_GRADLE_MARKER_BEGIN);
+      expect(content).toContain("implementation('ch.qos.logback:logback-classic:1.6.5')");
+      expect(content).toContain("implementation('org.glassfish.jaxb:jaxb-core:3.0.2')");
+      expect(content).toContain("implementation('org.objenesis:objenesis:3.6')");
+      expect(content).toContain("force 'ch.qos.logback:logback-classic:1.6.5'");
+    });
+  });
+
+  it("keeps the canonical block's version when both blocks pin the same package", () => {
+    const build = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('com.example:lib:1.0.0') { because 'CVE-OLD' }",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('com.example:lib:1.2.0') { because 'CVE-NEW' }",
+      "    }",
+      "}",
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      applyBumps(filePath, [{
+        packageName: "com.other:tool",
+        targetVersion: "2.0.0",
+        because: ["CVE-X"],
+      }]);
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, GRADLE_MARKER_BEGIN)).toBe(1);
+      expect(content).toContain("implementation('com.example:lib:1.2.0')");
+      expect(content).not.toContain(":1.0.0'");
+    });
+  });
+
+  it("extends an auto-depender-only block in place and migrates it to the canonical markers", () => {
+    const build = [
+      "plugins { id 'java' }",
+      "",
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.postgresql:postgresql:42.7.14') { because 'CVE-DB' }",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      applyBumps(filePath, [{
+        packageName: "org.objenesis:objenesis",
+        targetVersion: "3.6",
+        because: ["CVE-2026-116486"],
+      }]);
+      const content = readGradle(filePath);
+      expect(countOccurrences(content, GRADLE_MARKER_BEGIN)).toBe(1);
+      expect(content).not.toContain(AUTO_DEPENDER_GRADLE_MARKER_BEGIN);
+      expect(content).toContain("implementation('org.postgresql:postgresql:42.7.14')");
+      expect(content).toContain("implementation('org.objenesis:objenesis:3.6')");
+    });
+  });
+
+  it("parseUserForces skips forces inside an auto-depender block", () => {
+    const content = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'ch.qos.logback:logback-classic:1.6.5'",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      "configurations.all {",
+      "    resolutionStrategy {",
+      "        force 'org.postgresql:postgresql:42.7.9'",
+      "    }",
+      "}",
+    ].join("\n");
+    const forces = parseUserForces(content);
+    expect(forces.get("org.postgresql:postgresql")).toBe("42.7.9");
+    expect(forces.has("ch.qos.logback:logback-classic")).toBe(false);
+  });
+
+  it("findStaleManagedPins reports stale pins inside an auto-depender block", () => {
+    const content = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('ch.qos.logback:logback-classic:1.3.0') { because 'CVE-OLD' }",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+    ].join("\n");
+    const stale = findStaleManagedPins(content, new Map([["ch.qos.logback:logback-classic", "1.6.5"]]));
+    expect(stale).toEqual([{ packageName: "ch.qos.logback:logback-classic", version: "1.3.0", bomVersion: "1.6.5" }]);
+  });
+
+  it("removeManagedPin clears a package from every managed block", () => {
+    const build = [
+      AUTO_DEPENDER_GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.ow2.asm:asm:9.10') { because 'CVE-A' }",
+      "        implementation('com.example:keep:2.0.0')",
+      "    }",
+      "}",
+      AUTO_DEPENDER_GRADLE_MARKER_END,
+      "",
+      GRADLE_MARKER_BEGIN,
+      "dependencies {",
+      "    constraints {",
+      "        implementation('org.ow2.asm:asm:9.11') { because 'CVE-B' }",
+      "    }",
+      "}",
+      GRADLE_MARKER_END,
+    ].join("\n");
+    withTempGradle(build, filePath => {
+      expect(removeManagedPin(filePath, "org.ow2.asm:asm")).toBe(true);
+      const content = readGradle(filePath);
+      expect(content).not.toContain("org.ow2.asm:asm");
+      expect(content).toContain("implementation('com.example:keep:2.0.0')");
     });
   });
 });

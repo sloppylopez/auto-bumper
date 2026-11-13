@@ -8,7 +8,7 @@ import { compareMavenVersion } from "./matcher.ts";
  * back to a safe rollback.
  */
 
-const MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2";
+export const MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2";
 
 /** Extract repository base URLs declared in a Gradle or Maven manifest. */
 export function extractRepoUrls(manifestPath: string, kind: "gradle" | "maven"): string[] {
@@ -56,10 +56,21 @@ export function versionInMetadata(xml: string, version: string): boolean | null 
 
 /** Smallest non-SNAPSHOT version strictly greater than `minVersion`, or null. Pure — unit-testable. */
 export function pickNextVersion(versions: string[], minVersion: string): string | null {
-  const above = versions.filter(v => !/\.?snapshot$/i.test(v) && compareMavenVersion(v, minVersion) > 0);
+  const above = versions.filter(v => !isPreReleaseOrSnapshot(v) && compareMavenVersion(v, minVersion) > 0);
   if (above.length === 0) return null;
   above.sort(compareMavenVersion);
   return above[0]!;
+}
+
+/** Newest GA release (no SNAPSHOT, milestone, RC, alpha/beta or Java build qualifier) strictly below `boundary`, or null. Pure — unit-testable. */
+export function pickPreviousVersion(versions: string[], boundary: string): string | null {
+  const below = versions.filter(v => !isPreReleaseOrSnapshot(v) && compareMavenVersion(v, boundary) < 0);
+  if (below.length === 0) return null;
+  let best = below[0];
+  for (const v of below.slice(1)) {
+    if (compareMavenVersion(v, best) > 0) best = v;
+  }
+  return best;
 }
 
 /** Version entries of a Maven maven-metadata.xml, in document order. */
@@ -73,10 +84,17 @@ export function extractMetadataVersions(body: string): string[] {
   return versions;
 }
 
-/** True for pre-release / snapshot version strings (Maven convention). */
-function isPreReleaseOrSnapshot(version: string): boolean {
+/**
+ * True for pre-release / snapshot version strings (Maven convention): SNAPSHOT, milestones
+ * (-M1 / .M1), alpha/beta (-Beta1 / .Beta1), release candidates (-RC1/-CR1/.RC1), early
+ * access/dev builds, and Java build qualifiers (-b02, -b140310.1920). Qualifiers may be
+ * dash- or dot-separated. GA releases carry no suffix or a final/release word (.FINAL,
+ * .RELEASE) and pass through.
+ */
+export function isPreReleaseOrSnapshot(version: string): boolean {
   return /SNAPSHOT$/i.test(version) ||
-    /-(alpha|beta|rc|cr|milestone|ea|dev)(\d*)$|-m\d+$/i.test(version);
+    /[.-](alpha|beta|rc|cr|milestone|ea|dev)(\d*)$|[.-]m\d+$/i.test(version) ||
+    /-b\d+(\.\d+)*$/i.test(version);
 }
 
 /** The qualifier after the last dash, e.g. "jre" in "33.6.0-jre". */
@@ -148,7 +166,7 @@ export function repoRequestInit(url: string, creds?: { user?: string; pass?: str
 }
 
 /** Fetch a document with a short timeout and optional env-based Basic auth. Null on any failure. */
-async function fetchText(url: string): Promise<string | null> {
+export async function fetchText(url: string): Promise<string | null> {
   const init = repoRequestInit(url, {
     user: process.env.JFROG_USER || process.env.MAVEN_USERNAME,
     pass: process.env.JFROG_TOKEN || process.env.MAVEN_PASSWORD,
@@ -174,7 +192,7 @@ async function fetchText(url: string): Promise<string | null> {
 }
 
 /** Remove trailing slashes (linear scan, no regex). */
-function stripTrailingSlashes(s: string): string {
+export function stripTrailingSlashes(s: string): string {
   let end = s.length;
   while (end > 0 && s[end - 1] === "/") end--;
   return s.slice(0, end);
@@ -238,6 +256,60 @@ export async function findLatestAvailableVersion(
     return { version: latestReleaseVersion(versions, currentVersion), metadataFound: true };
   }
   return { version: null, metadataFound: false };
+}
+
+/**
+ * Newest non-prerelease release of `packageName` strictly below `boundary`, read from the
+ * repository's maven-metadata.xml (the project's declared repositories first, then Maven
+ * Central). Null when nothing below the boundary exists or no metadata was reachable.
+ * Best-effort.
+ */
+export async function findPreviousAvailableVersion(
+  manifestPath: string,
+  kind: "gradle" | "maven",
+  packageName: string,
+  boundary: string,
+): Promise<string | null> {
+  const [group, artifact] = packageName.split(":");
+  if (!group || !artifact) return null;
+
+  let bases = extractRepoUrls(manifestPath, kind);
+  if (!bases.some(b => stripTrailingSlashes(b) === MAVEN_CENTRAL)) bases.push(MAVEN_CENTRAL);
+  const groupPath = group.replaceAll(".", "/");
+  for (const base of bases) {
+    const xml = await fetchText(`${stripTrailingSlashes(base)}/${groupPath}/${artifact}/maven-metadata.xml`);
+    if (!xml) continue;
+    const versions = extractMetadataVersions(xml);
+    if (versions.length === 0) continue;
+    return pickPreviousVersion(versions, boundary);
+  }
+  return null;
+}
+
+/**
+ * Every version listed in the maven-metadata.xml of the project's declared repositories
+ * plus Maven Central (union; GA and pre-release alike, callers filter). Null when no
+ * metadata could be fetched at all (offline, auth failure) — callers keep best-effort
+ * behavior.
+ */
+export async function listAvailableVersions(
+  manifestPath: string,
+  kind: "gradle" | "maven",
+  packageName: string,
+): Promise<string[] | null> {
+  const [group, name] = packageName.split(":");
+  if (!group || !name) return null;
+
+  let bases = extractRepoUrls(manifestPath, kind);
+  if (!bases.some(b => stripTrailingSlashes(b) === MAVEN_CENTRAL)) bases.push(MAVEN_CENTRAL);
+  const groupPath = group.replaceAll(".", "/");
+  const seen = new Set<string>();
+  for (const base of bases) {
+    const xml = await fetchText(`${stripTrailingSlashes(base)}/${groupPath}/${name}/maven-metadata.xml`);
+    if (!xml) continue;
+    for (const v of extractMetadataVersions(xml)) seen.add(v);
+  }
+  return seen.size > 0 ? [...seen] : null;
 }
 
 /**

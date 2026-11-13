@@ -13,6 +13,8 @@ export interface ParseResult {
   warnings: string[];
   /** Coordinates that failed to resolve (e.g. yanked versions): "group:name@requestedVersion". */
   unresolved?: string[];
+  /** True when a Java manifest was read without a resolved dependency tree. */
+  incompleteTree?: boolean;
 }
 
 /** OSV ecosystem identifier for each internal ecosystem key (used for DB filenames). */
@@ -248,16 +250,26 @@ function mergeParseResult(
   allPackages: PackageRef[],
   warnings: string[],
   allUnresolved: string[] | null,
+  flags?: { incompleteTree: boolean },
 ): void {
   allPackages.push(...result.packages);
   for (const w of result.warnings) {
     if (!warnings.includes(w)) warnings.push(w);
   }
+  if (result.incompleteTree && flags) flags.incompleteTree = true;
   if (allUnresolved) {
     for (const u of result.unresolved ?? []) {
       if (!allUnresolved.includes(u)) allUnresolved.push(u);
     }
   }
+}
+
+/** Direct-manifest fallback is not a full tree. Callers must not treat the scan as clean. */
+function noteIncompleteTree(result: ParseResult, reason: string): ParseResult {
+  result.incompleteTree = true;
+  const msg = `Incomplete dependency tree (${reason}): transitive dependencies were not resolved`;
+  if (!result.warnings.includes(msg)) result.warnings.push(msg);
+  return result;
 }
 
 /**
@@ -287,19 +299,26 @@ export function listNestedManifests(root: string): Array<{ kind: NestedManifestK
     }
     if (dir !== rootResolved) {
       const names = new Set(entries.filter(entry => entry.isFile()).map(entry => entry.name));
-      if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
-      if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
-      else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
-      if (names.has("package.json")) found.push({ kind: "npm", filePath: path.join(dir, "package.json") });
-      if (names.has("Cargo.toml")) found.push({ kind: "crates.io", filePath: path.join(dir, "Cargo.toml") });
-      if (names.has("pyproject.toml")) found.push({ kind: "pypi", filePath: path.join(dir, "pyproject.toml") });
-      if (names.has("requirements.txt")) found.push({ kind: "pypi", filePath: path.join(dir, "requirements.txt") });
+      found.push(...dirManifests(dir, names));
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || NESTED_SKIP_DIRS.has(entry.name)) continue;
       walk(path.join(dir, entry.name));
     }
   }
+}
+
+/** Manifests present in one directory. build.gradle takes precedence over build.gradle.kts. */
+function dirManifests(dir: string, names: Set<string>): Array<{ kind: NestedManifestKind; filePath: string }> {
+  const found: Array<{ kind: NestedManifestKind; filePath: string }> = [];
+  if (names.has("pom.xml")) found.push({ kind: "maven", filePath: path.join(dir, "pom.xml") });
+  if (names.has("build.gradle")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle") });
+  else if (names.has("build.gradle.kts")) found.push({ kind: "gradle", filePath: path.join(dir, "build.gradle.kts") });
+  if (names.has("package.json")) found.push({ kind: "npm", filePath: path.join(dir, "package.json") });
+  if (names.has("Cargo.toml")) found.push({ kind: "crates.io", filePath: path.join(dir, "Cargo.toml") });
+  if (names.has("pyproject.toml")) found.push({ kind: "pypi", filePath: path.join(dir, "pyproject.toml") });
+  if (names.has("requirements.txt")) found.push({ kind: "pypi", filePath: path.join(dir, "requirements.txt") });
+  return found;
 }
 
 /** Java manifests below the scan root. The root pom and build files are parsed by the caller. */
@@ -331,6 +350,7 @@ function appendNestedManifests(
   allPackages: PackageRef[],
   warnings: string[],
   allUnresolved: string[] | null,
+  treeFlags: { incompleteTree: boolean },
 ): boolean {
   let found = false;
   for (const manifest of listNestedManifests(root)) {
@@ -338,11 +358,12 @@ function appendNestedManifests(
     const java = manifest.kind === "maven" || manifest.kind === "gradle";
     if (java) {
       if (result.packages.length === 0 && result.warnings.length === 0) continue;
+      noteIncompleteTree(result, `nested ${manifest.kind} manifest uses direct dependencies only`);
     } else if (result.packages.length === 0) {
       continue;
     }
     found = true;
-    mergeParseResult(result, allPackages, warnings, allUnresolved);
+    mergeParseResult(result, allPackages, warnings, allUnresolved, treeFlags);
   }
   return found;
 }
@@ -361,6 +382,7 @@ export function parseLockfile(dirPath: string): ParseResult {
     );
   }
 
+  const treeFlags = { incompleteTree: false };
   for (const spec of LOCKFILES) {
     const filePath = path.join(resolvedDir, spec.filename);
     if (!fs.existsSync(filePath)) continue;
@@ -368,11 +390,11 @@ export function parseLockfile(dirPath: string): ParseResult {
 
     foundAny = true;
     const result = spec.ecosystem === "gradle" ? parseBuildGradle(filePath) : parseNonGradleSpec(spec, filePath, warnings);
-    mergeParseResult(result, allPackages, warnings, null);
+    mergeParseResult(result, allPackages, warnings, null, treeFlags);
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
-  if (appendNestedManifests(resolvedDir, allPackages, warnings, null)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, null, treeFlags)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -380,7 +402,9 @@ export function parseLockfile(dirPath: string): ParseResult {
     );
   }
 
-  return { packages: allPackages, warnings };
+  const out: ParseResult = { packages: allPackages, warnings };
+  if (treeFlags.incompleteTree) out.incompleteTree = true;
+  return out;
 }
 
 interface PackageLockData {
@@ -812,9 +836,10 @@ export function parsePomXml(filePath: string): ParseResult {
     if (result.warnings.length > 0) {
       warnings.push(...result.warnings);
     }
+    return noteIncompleteTree(parsePomXmlDirect(filePath, warnings), "mvn dependency:tree returned no packages");
   }
 
-  return parsePomXmlDirect(filePath, warnings);
+  return noteIncompleteTree(parsePomXmlDirect(filePath, warnings), "mvn was not found");
 }
 
 /**
@@ -822,7 +847,7 @@ export function parsePomXml(filePath: string): ParseResult {
  * Linear scan; a value may not contain `<` (same shape constraint as the legacy
  * backtracking regex), and malformed pairs resume scanning right after their open tag.
  */
-function parsePomProperties(content: string): Record<string, string> {
+export function parsePomProperties(content: string): Record<string, string> {
   const properties: Record<string, string> = {};
   const openIdx = content.indexOf("<properties>");
   if (openIdx < 0) return properties;
@@ -930,13 +955,65 @@ function findUp(dir: string, fileName: string): string | null {
 }
 
 /**
- * cmd.exe /d /s /c line. The outer quotes are stripped by /s, leaving the path quoted
- * so a folder name like `ok & calc` cannot start a second command.
+ * Launcher script. Values stay in the environment. Delayed expansion copies them
+ * into locals, then `setlocal DisableDelayedExpansion` turns it off before the
+ * real `.bat`/`.cmd` runs. Bare names stay unquoted so PATH lookup works.
  */
-export function windowsBatchArgs(executable: string, args: string[]): string[] {
-  const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
-  const command = `"${[quote(executable), ...args.map(quote)].join(" ")}"`;
-  return ["/d", "/s", "/c", command];
+export function windowsBatchScript(executable: string, args: string[]): string {
+  const bare = /^[A-Za-z0-9._-]+$/.test(executable);
+  const lines = [
+    "@echo off",
+    "setlocal EnableDelayedExpansion",
+    "set \"EXE=!AUTO_BUMPER_BATCH_EXECUTABLE!\"",
+  ];
+  args.forEach((_, i) => {
+    lines.push(`set "A${i}=!AUTO_BUMPER_BATCH_ARG_${i}!"`);
+  });
+  lines.push("setlocal DisableDelayedExpansion");
+  const exe = bare ? "%EXE%" : "\"%EXE%\"";
+  const rendered = [exe, ...args.map((_, i) => `"%A${i}%"`)].join(" ");
+  lines.push(rendered);
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+/** Static cmd line. The launcher path is `AUTO_BUMPER_BATCH_LAUNCHER`, never user text. */
+export function windowsBatchArgs(_executable: string, _args: string[]): string[] {
+  return ["/d", "/v:on", "/s", "/c", "\"\"!AUTO_BUMPER_BATCH_LAUNCHER!\"\""];
+}
+
+export function windowsBatchEnv(executable: string, args: string[]): Record<string, string> {
+  const env: Record<string, string> = { AUTO_BUMPER_BATCH_EXECUTABLE: executable };
+  args.forEach((arg, i) => {
+    env[`AUTO_BUMPER_BATCH_ARG_${i}`] = arg;
+  });
+  return env;
+}
+
+export interface WindowsBatchLaunch {
+  file: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  windowsVerbatimArguments: true;
+  cleanup: () => void;
+}
+
+/** cmd.exe launch for a `.bat`/`.cmd`. Drops leftover `AUTO_BUMPER_BATCH_ARG_*` from the parent env. */
+export function windowsBatchLaunch(executable: string, args: string[], base: NodeJS.ProcessEnv = process.env): WindowsBatchLaunch {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-bat-"));
+  const launcher = path.join(dir, "launch.bat");
+  fs.writeFileSync(launcher, windowsBatchScript(executable, args));
+  const env: NodeJS.ProcessEnv = { ...base, ...windowsBatchEnv(executable, args), AUTO_BUMPER_BATCH_LAUNCHER: launcher };
+  for (const key of Object.keys(env)) {
+    const index = /^AUTO_BUMPER_BATCH_ARG_(\d+)$/.exec(key);
+    if (index && Number(index[1]) >= args.length) delete env[key];
+  }
+  return {
+    file: process.env.ComSpec || "cmd.exe",
+    args: windowsBatchArgs(executable, args),
+    env,
+    windowsVerbatimArguments: true,
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
 }
 
 /**
@@ -957,17 +1034,22 @@ function spawnCaptured(
     shell: false as const,
   };
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(executable)) {
-    const comspec = process.env.ComSpec || "cmd.exe";
-    return childProcess.spawnSync(comspec, windowsBatchArgs(executable, args), {
-      ...base,
-      windowsVerbatimArguments: true,
-    });
+    const launch = windowsBatchLaunch(executable, args);
+    try {
+      return childProcess.spawnSync(launch.file, launch.args, {
+        ...base,
+        env: launch.env,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      });
+    } finally {
+      launch.cleanup();
+    }
   }
   return childProcess.spawnSync(executable, args, base);
 }
 
 /** Find mvnw or system mvn. Wrapper search stops at the git root. */
-function detectMaven(dir: string): { executable: string; isWrapper: boolean } | null {
+export function detectMaven(dir: string): { executable: string; isWrapper: boolean } | null {
   const isWin = process.platform === "win32";
   const wrapperName = isWin ? "mvnw.cmd" : "mvnw";
   const wrapper = findUp(dir, wrapperName);
@@ -1023,7 +1105,17 @@ export function dedupeResolvedPackages(packages: PackageRef[]): PackageRef[] {
   const unique = new Map<string, PackageRef>();
   for (const pkg of packages) {
     const key = `${pkg.name.toLowerCase()}@${pkg.version}`;
-    if (!unique.has(key)) unique.set(key, pkg);
+    const existing = unique.get(key);
+    if (!existing) {
+      unique.set(key, pkg);
+      continue;
+    }
+    if (pkg.requiredBy?.length) {
+      const requiredBy = existing.requiredBy ?? (existing.requiredBy = []);
+      for (const parent of pkg.requiredBy) {
+        if (!requiredBy.includes(parent)) requiredBy.push(parent);
+      }
+    }
   }
   return [...unique.values()];
 }
@@ -1166,34 +1258,81 @@ function matchesCoordShape(token: string): boolean {
   return false;
 }
 
-/** Parse Maven dependency:tree output into PackageRef[]. */
-function parseMavenTree(output: string, filePath: string): ParseResult {
-  const pkgs: PackageRef[] = [];
-  const seen = new Set<string>();
-
-  for (const rawLine of output.split("\n")) {
-    const line = rawLine.replace(/^\[INFO\]\s*/, "").trim();
-    if (!line || /omitted for duplicate|omitted for conflict/i.test(line)) continue;
-
-    const trimmed = line.replace(/^[|\s+\\-]+/, "");
-    const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
-    if (!match) continue;
-
-    const [, group, artifact, version] = match;
-    if (!version || version.startsWith("(")) continue;
-
-    const key = `${group.toLowerCase()}:${artifact.toLowerCase()}@${version}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    pkgs.push({
-      ecosystem: "maven",
-      name: `${group}:${artifact}`,
-      version,
-      manifestPath: filePath,
-    });
+/** Pop a tree stack down to `prefixLen`; returns the surviving parent's name, or null when none remains. */
+function popToDepth(stack: Array<{ prefixLen: number; name: string }>, prefixLen: number): string | null {
+  while (stack.length > 0 && stack.at(-1)!.prefixLen >= prefixLen) {
+    stack.pop();
   }
+  return stack.length > 0 ? stack.at(-1)!.name : null;
+}
 
-  return pkgs.length > 0 ? { packages: pkgs, warnings: [] } : { packages: [], warnings: [] };
+/** Append a parent to a package's requiredBy list, skipping duplicates. */
+function appendRequiredBy(pkg: PackageRef | undefined, parentName: string | null): void {
+  if (!pkg || !parentName) return;
+  const requiredBy = pkg.requiredBy ?? (pkg.requiredBy = []);
+  if (!requiredBy.includes(parentName)) requiredBy.push(parentName);
+}
+
+interface MavenTreeState {
+  pkgs: PackageRef[];
+  seen: Set<string>;
+  byKey: Map<string, PackageRef>;
+  /** Monotonic stack of (prefix length, coordinate) — the top entry with a shorter prefix than the
+   * current line is its parent. Prefix length grows strictly with depth in dependency:tree output,
+   * so raw lengths compare correctly without assuming an exact cell width. */
+  parentStack: Array<{ prefixLen: number; name: string }>;
+}
+
+/** Record a first-seen coordinate and push it onto the parent stack. */
+function recordMavenNode(name: string, version: string, parentName: string | null, prefixLen: number, filePath: string, state: MavenTreeState): void {
+  const key = `${name.toLowerCase()}@${version}`;
+  state.seen.add(key);
+  const pkg: PackageRef = {
+    ecosystem: "maven",
+    name,
+    version,
+    manifestPath: filePath,
+  };
+  if (parentName) pkg.requiredBy = [parentName];
+  state.pkgs.push(pkg);
+  state.byKey.set(key, pkg);
+  state.parentStack.push({ prefixLen, name });
+}
+
+/** Process one dependency:tree line: update the parent stack and collect packages. */
+function processMavenTreeLine(line: string, filePath: string, state: MavenTreeState): void {
+  const prefixMatch = /^[|\s+\\-]+/.exec(line);
+  const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
+  const trimmed = line.slice(prefixLen).trim();
+  if (!trimmed) return;
+  if (/omitted for conflict/i.test(trimmed)) return;
+  const duplicate = /omitted for duplicate/i.test(trimmed);
+  const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
+  if (!match) return;
+
+  const [, group, artifact, version] = match;
+  if (!version || version.startsWith("(")) return;
+
+  const parentName = popToDepth(state.parentStack, prefixLen);
+  const name = `${group}:${artifact}`;
+  const key = `${name.toLowerCase()}@${version}`;
+  if (duplicate || state.seen.has(key)) {
+    appendRequiredBy(state.byKey.get(key), parentName);
+    state.parentStack.push({ prefixLen, name });
+    return;
+  }
+  recordMavenNode(name, version, parentName, prefixLen, filePath, state);
+}
+
+/** Parse Maven dependency:tree output into PackageRef[]. */
+export function parseMavenTree(output: string, filePath: string): ParseResult {
+  const state: MavenTreeState = { pkgs: [], seen: new Set(), byKey: new Map(), parentStack: [] };
+  for (const rawLine of output.split("\n")) {
+    // Strip only the "[INFO]" marker. The indentation that follows encodes tree depth; removing it
+    // collapses nodes drawn under a last-child branch (space-indented, no leading "|") into their grandparent.
+    processMavenTreeLine(rawLine.replace(/^\[INFO\]/, ""), filePath, state);
+  }
+  return state.pkgs.length > 0 ? { packages: state.pkgs, warnings: [] } : { packages: [], warnings: [] };
 }
 
 /**
@@ -1226,16 +1365,18 @@ export function parseBuildGradle(filePath: string): ParseResult {
     if (result.warnings.length > 0) {
       warnings.push(...result.warnings);
     }
+    const direct = parseBuildGradleDirect(filePath);
+    if (gradleUnresolved && gradleUnresolved.length > 0) direct.unresolved = gradleUnresolved;
+    return noteIncompleteTree(direct, "gradlew dependencies returned no packages");
   }
 
   // Fallback: parse build.gradle directly (only explicit deps)
   const direct = parseBuildGradleDirect(filePath);
-  if (gradleUnresolved && gradleUnresolved.length > 0) direct.unresolved = gradleUnresolved;
-  return direct;
+  return noteIncompleteTree(direct, "gradlew was not found");
 }
 
 /** Find gradlew. Search stops at the git root so a parent outside the repo is not executed. */
-function detectGradlew(dir: string): string | null {
+export function detectGradlew(dir: string): string | null {
   const name = process.platform === "win32" ? "gradlew.bat" : "gradlew";
   return findUp(dir, name);
 }
@@ -1273,12 +1414,14 @@ function runGradlewConfigAsync(
   const args = ["dependencies", "--configuration", config, "--quiet"];
 
   return new Promise(resolve => {
-    const child = isWin && /\.(cmd|bat)$/i.test(gradlew)
-      ? childProcess.spawn(process.env.ComSpec || "cmd.exe", windowsBatchArgs(gradlew, args), {
+    const launch = isWin && /\.(cmd|bat)$/i.test(gradlew) ? windowsBatchLaunch(gradlew, args) : null;
+    const child = launch
+      ? childProcess.spawn(launch.file, launch.args, {
         cwd,
+        env: launch.env,
         windowsHide: true,
         shell: false,
-        windowsVerbatimArguments: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
         stdio: ["ignore", "pipe", "pipe"],
       })
       : childProcess.spawn(gradlew, args, {
@@ -1290,6 +1433,12 @@ function runGradlewConfigAsync(
 
     let stdout = "";
     let stderr = "";
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      launch?.cleanup();
+    };
     child.stdout?.on("data", (chunk: Buffer | string) => { stdout += String(chunk); });
     child.stderr?.on("data", (chunk: Buffer | string) => { stderr += String(chunk); });
 
@@ -1300,11 +1449,13 @@ function runGradlewConfigAsync(
 
     child.on("error", err => {
       clearTimeout(timer);
+      cleanup();
       resolve({ output: "", warning: `${config}: ${err.message}` });
     });
 
     child.on("close", code => {
       clearTimeout(timer);
+      cleanup();
       const output = (stdout + stderr).trim();
       if (code !== 0 && code !== null && !output) {
         resolve({ output: "", warning: `${config}: gradlew exited with code ${code}` });
@@ -1488,12 +1639,15 @@ export async function parseBuildGradleAsync(
     if (result.warnings.length > 0) {
       warnings.push(...result.warnings);
     }
+    onProgress?.("Parsing build.gradle...");
+    const failedDirect = parseBuildGradleDirect(filePath);
+    if (gradleUnresolved && gradleUnresolved.length > 0) failedDirect.unresolved = gradleUnresolved;
+    return noteIncompleteTree(failedDirect, "gradlew dependencies returned no packages");
   }
 
   onProgress?.("Parsing build.gradle...");
   const direct = parseBuildGradleDirect(filePath);
-  if (gradleUnresolved && gradleUnresolved.length > 0) direct.unresolved = gradleUnresolved;
-  return direct;
+  return noteIncompleteTree(direct, "gradlew was not found");
 }
 
 export async function parseLockfileAsync(
@@ -1507,6 +1661,7 @@ export async function parseLockfileAsync(
   const resolvedDir = path.resolve(dirPath);
 
   let foundAny = false;
+  const treeFlags = { incompleteTree: false };
 
   const flags = detectLockfiles(resolvedDir);
   if (flags.hasPomXml && (flags.hasBuildGradle || flags.hasBuildGradleKts)) {
@@ -1524,11 +1679,11 @@ export async function parseLockfileAsync(
     const result = spec.ecosystem === "gradle"
       ? await parseBuildGradleAsync(filePath, onProgress, options)
       : parseNonGradleSpec(spec, filePath, warnings);
-    mergeParseResult(result, allPackages, warnings, allUnresolved);
+    mergeParseResult(result, allPackages, warnings, allUnresolved, treeFlags);
   }
 
   if (appendDirectManifests(resolvedDir, allPackages, warnings)) foundAny = true;
-  if (appendNestedManifests(resolvedDir, allPackages, warnings, allUnresolved)) foundAny = true;
+  if (appendNestedManifests(resolvedDir, allPackages, warnings, allUnresolved, treeFlags)) foundAny = true;
 
   if (!foundAny) {
     warnings.push(
@@ -1538,6 +1693,7 @@ export async function parseLockfileAsync(
 
   const out: ParseResult = { packages: allPackages, warnings };
   if (allUnresolved.length > 0) out.unresolved = allUnresolved;
+  if (treeFlags.incompleteTree) out.incompleteTree = true;
   return out;
 }
 
@@ -1546,6 +1702,11 @@ interface GradleTreeState {
   unresolved: string[];
   seen: Set<string>;
   failedSeen: Set<string>;
+  // Monotonic stack of (prefix length, coordinate): the top entry with a shorter prefix than the
+  // current line is its parent. Prefix length grows strictly with depth in `gradlew dependencies`
+  // output, so raw lengths compare correctly without assuming an exact cell width.
+  parentStack: Array<{ prefixLen: number; name: string }>;
+  byKey: Map<string, PackageRef>;
 }
 
 /** Strip Gradle decoration from a tree-line version: "->" resolution, "{strictly x}" braces, "(...)" notes. */
@@ -1564,34 +1725,51 @@ function normalizeGradleTreeVersion(rawVersion: string): string {
   return version;
 }
 
+/** Collect a "FAILED" line into the unresolved list (once per coordinate). */
+function recordGradleFailed(group: string, name: string, rawVersion: string, state: GradleTreeState): void {
+  const requested = rawVersion.slice(0, -"FAILED".length);
+  const reqVersion = (requested.includes('->') ? requested.split('->').pop()! : requested).trim();
+  const failedKey = `${group}:${name}`.toLowerCase();
+  if (!state.failedSeen.has(failedKey)) {
+    state.failedSeen.add(failedKey);
+    state.unresolved.push(`${failedKey}@${reqVersion}`);
+  }
+}
+
 function parseGradleTreeLine(line: string, filePath: string, state: GradleTreeState): void {
-  const match = /^[|\s]*[+\\-]---\s+([\w.@-]+):([\w.@-]+):(.*)$/.exec(line);
+  const match = /^([|\s]*)([+\\-])---\s+([\w.@-]+):([\w.@-]+):(.*)$/.exec(line);
   if (!match) return;
-  const [, group, name, rawVersionPart] = match;
+  const prefixLen = match[1].length;
+  const [, , , group, name, rawVersionPart] = match;
   const rawVersion = rawVersionPart.trimStart();
   // Gradle marks unresolvable deps with a trailing "FAILED" (e.g. "10.1.58 FAILED" or "1.2 -> 3.4 FAILED")
   if (/\sFAILED$/.test(rawVersion)) {
-    const requested = rawVersion.slice(0, -"FAILED".length);
-    const reqVersion = (requested.includes('->') ? requested.split('->').pop()! : requested).trim();
-    const failedKey = `${group}:${name}`.toLowerCase();
-    if (!state.failedSeen.has(failedKey)) {
-      state.failedSeen.add(failedKey);
-      state.unresolved.push(`${failedKey}@${reqVersion}`);
-    }
+    recordGradleFailed(group, name, rawVersion, state);
     return;
   }
   // Take resolved version after -> arrow if present; unwrap "{strictly x}" and "(...)" notes.
   const version = normalizeGradleTreeVersion(rawVersion);
   if (!version || version.startsWith('(')) return;
   const key = `${group}:${name}`.toLowerCase();
-  if (state.seen.has(key)) return;
-  state.seen.add(key);
-  state.pkgs.push({ ecosystem: 'maven', name: `${group}:${name}`, version, manifestPath: filePath });
+
+  const parentName = popToDepth(state.parentStack, prefixLen);
+
+  if (state.seen.has(key)) {
+    // Diamond: the first occurrence must not hide later parents — append this one.
+    appendRequiredBy(state.byKey.get(key), parentName);
+  } else {
+    state.seen.add(key);
+    const pkg: PackageRef = { ecosystem: 'maven', name: `${group}:${name}`, version, manifestPath: filePath };
+    if (parentName) pkg.requiredBy = [parentName];
+    state.pkgs.push(pkg);
+    state.byKey.set(key, pkg);
+  }
+  state.parentStack.push({ prefixLen, name: `${group}:${name}` });
 }
 
 /** Parse Gradle dependency tree output into PackageRef[] */
 export function parseGradleTree(output: string, filePath: string): ParseResult {
-  const state: GradleTreeState = { pkgs: [], unresolved: [], seen: new Set(), failedSeen: new Set() };
+  const state: GradleTreeState = { pkgs: [], unresolved: [], seen: new Set(), failedSeen: new Set(), parentStack: [], byKey: new Map() };
   for (const line of output.split(/\r?\n/)) {
     parseGradleTreeLine(line, filePath, state);
   }
@@ -1639,7 +1817,7 @@ function gradleDepVersion(
 /** Collect excluded group:module pairs from Groovy and Kotlin exclude syntaxes. */
 function collectGradleExcludes(content: string): Set<string> {
   const excludes = new Set<string>();
-  for (const em of content.matchAll(/exclude\s+group:\s*["']([^"']+)[\"'],\s*module:\s*["']([^"']+)["']/g)) {
+  for (const em of content.matchAll(/exclude\s+group:\s*["']([^"']+)["'],\s*module:\s*["']([^"']+)["']/g)) {
     excludes.add(em[1].toLowerCase() + ":" + em[2].toLowerCase());
   }
   // Kotlin form: normalize `group = "x", module = "y"` labels away before matching

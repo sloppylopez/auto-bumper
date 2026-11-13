@@ -24,6 +24,84 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
+interface XmlBlock {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** `<dependency>` at `index`, not `<dependencies>` or `<dependencyManagement>`. */
+function dependencyTagAt(content: string, index: number): { close: boolean; end: number } | null {
+  const close = content.startsWith("</", index);
+  const nameAt = index + (close ? 2 : 1);
+  if (!content.startsWith("dependency", nameAt)) return null;
+  const after = nameAt + "dependency".length;
+  const next = content[after];
+  if (next !== ">" && next !== "/" && next !== " " && next !== "\t" && next !== "\n" && next !== "\r") return null;
+  const gt = content.indexOf(">", after);
+  if (gt === -1) return null;
+  return { close: close || content[gt - 1] === "/", end: gt + 1 };
+}
+
+/** End index of the `<!-- -->` or `<![CDATA[ ]]>` section starting at `i`; null when neither. */
+function skipXmlSection(content: string, i: number): number | null {
+  if (content.startsWith("<!--", i)) {
+    const end = content.indexOf("-->", i + 4);
+    return end === -1 ? content.length : end + 3;
+  }
+  if (content.startsWith("<![CDATA[", i)) {
+    const end = content.indexOf("]]>", i + 9);
+    return end === -1 ? content.length : end + 3;
+  }
+  return null;
+}
+
+/** Apply one dependency tag to the scan state, closing the outermost block when depth returns to zero. */
+function applyDependencyTag(
+  tag: { close: boolean; end: number },
+  depth: number,
+  start: number,
+  i: number,
+  blocks: XmlBlock[],
+  content: string,
+): { depth: number; start: number } {
+  if (tag.close) {
+    if (depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        blocks.push({ start, end: tag.end, text: content.slice(start, tag.end) });
+        start = -1;
+      }
+    }
+    return { depth, start };
+  }
+  if (depth === 0) return { depth: 1, start: i };
+  return { depth: depth + 1, start };
+}
+
+/** Every <dependency> element (with its full text); nested elements stay inside the outer one. */
+function dependencyBlocks(content: string): XmlBlock[] {
+  const blocks: XmlBlock[] = [];
+  let i = 0;
+  let depth = 0;
+  let start = -1;
+  while (i < content.length) {
+    const skip = skipXmlSection(content, i);
+    if (skip !== null) {
+      i = skip;
+      continue;
+    }
+    const tag = content[i] === "<" ? dependencyTagAt(content, i) : null;
+    if (!tag) {
+      i++;
+      continue;
+    }
+    ({ depth, start } = applyDependencyTag(tag, depth, start, i, blocks, content));
+    i = tag.end;
+  }
+  return blocks;
+}
+
 /** Replace a run of trailing newlines with `count` newlines; no-op when none present. */
 function collapseTrailingNewlines(s: string, count: number): string {
   let end = s.length;
@@ -54,13 +132,11 @@ function findDepBlocks(content: string): DepBlock[] {
   const blocks: DepBlock[] = [];
   const dmStart = content.indexOf("<dependencyManagement>");
   const dmEnd = dmStart >= 0 ? content.indexOf("</dependencyManagement>", dmStart) : -1;
-  const markerBegin = content.indexOf(MARKER_BEGIN);
-  const markerEnd = markerBegin >= 0 ? content.indexOf(MARKER_END, markerBegin) : -1;
+  const regions = findManagedBlocks(content);
 
-  const re = /<dependency>[\s\S]*?<\/dependency>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    const block = m[0];
+  for (const found of dependencyBlocks(content)) {
+    const block = found.text;
+    const idx = found.start;
     const groupMatch = /<groupId>([^<]+)<\/groupId>/.exec(block);
     const artifactMatch = /<artifactId>([^<]+)<\/artifactId>/.exec(block);
     if (!groupMatch || !artifactMatch) continue;
@@ -69,10 +145,10 @@ function findDepBlocks(content: string): DepBlock[] {
       group: groupMatch[1].trim(),
       artifact: artifactMatch[1].trim(),
       version: versionMatch ? versionMatch[1].trim() : null,
-      start: m.index,
-      end: m.index + block.length,
-      managed: dmStart >= 0 && dmEnd > dmStart && m.index > dmStart && m.index < dmEnd,
-      inMarker: markerBegin >= 0 && markerEnd > markerBegin && m.index >= markerBegin && m.index <= markerEnd,
+      start: idx,
+      end: idx + block.length,
+      managed: dmStart >= 0 && dmEnd > dmStart && idx > dmStart && idx < dmEnd,
+      inMarker: regions.some(r => idx >= r.begin && idx <= r.end + r.endLen),
     });
   }
   return blocks;
@@ -168,7 +244,7 @@ function renderPinDependency(pkg: string, version: string): string {
 
 function parseExistingPins(block: string): Map<string, string> {
   const entries = new Map<string, string>();
-  for (const dep of block.match(/<dependency>[\s\S]*?<\/dependency>/g) || []) {
+  for (const dep of dependencyBlocks(block).map(found => found.text)) {
     const group = /<groupId>([^<]+)<\/groupId>/.exec(dep)?.[1]?.trim();
     const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(dep)?.[1]?.trim();
     const version = /<version>([^<]+)<\/version>/.exec(dep)?.[1]?.trim();
@@ -177,39 +253,183 @@ function parseExistingPins(block: string): Map<string, string> {
   return entries;
 }
 
-function renderManagedBlock(entries: Map<string, string>): string {
+/** Free-text bucket keys for comments that document the block rather than one pin. */
+const FREE_TEXT_HEADER = "\u0000header";
+const FREE_TEXT_FOOTER = "\u0000footer";
+
+/**
+ * Bucket user comments from an existing managed block by the pin they document, so a
+ * re-render keeps them above their entry. A comment attaches to the NEXT <dependency>
+ * below it (or to the footer when nothing follows). Blank lines are dropped (the
+ * renderer owns layout); multi-line XML comments are captured whole.
+ */
+function parsePomBlockFreeText(block: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  let pending: string[] = [];
+  let inComment = false;
+  const flush = (key: string) => {
+    if (pending.length === 0) return;
+    const lines = out.get(key);
+    if (lines) lines.push(...pending);
+    else out.set(key, [...pending]);
+    pending = [];
+  };
+  const lines = block.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const trimmed = lines[i].trim();
+    if (trimmed === "") {
+      i++;
+      continue;
+    }
+    if (POM_MARKERS.some(m => m.begin === trimmed || m.end === trimmed)) {
+      if (POM_MARKERS.some(m => m.end === trimmed)) flush(FREE_TEXT_FOOTER);
+      i++;
+      continue;
+    }
+    if (inComment || trimmed.startsWith("<!--")) {
+      pending.push(trimmed);
+      inComment = !trimmed.includes("-->");
+      i++;
+      continue;
+    }
+    if (trimmed.startsWith("<dependency>")) {
+      i = skipDependencySpan(lines, i, flush) + 1;
+      continue;
+    }
+    // Unrecognized structural line: treat pending text as block-level.
+    flush(FREE_TEXT_HEADER);
+    i++;
+  }
+  flush(FREE_TEXT_FOOTER);
+  return out;
+}
+
+/** Consume a <dependency> element starting at line i, flushing pending text to its coordinate key. Returns the last consumed line index. */
+function skipDependencySpan(lines: string[], i: number, flush: (key: string) => void): number {
+  let span = lines[i];
+  let j = i;
+  while (!span.includes("</dependency>") && j + 1 < lines.length) {
+    j++;
+    span += "\n" + lines[j];
+  }
+  const group = /<groupId>([^<]+)<\/groupId>/.exec(span)?.[1]?.trim();
+  const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(span)?.[1]?.trim();
+  if (group && artifact) flush(`${group}:${artifact}`);
+  return j;
+}
+
+/** Drop preserved comments whose pin no longer exists. */
+function prunePomFreeText(
+  freeText: Map<string, string[]> | null,
+  entries: Map<string, string>,
+): Map<string, string[]> | null {
+  if (!freeText || freeText.size === 0) return freeText;
+  const out = new Map<string, string[]>();
+  for (const [key, lines] of freeText) {
+    if (key === FREE_TEXT_HEADER || key === FREE_TEXT_FOOTER || entries.has(key)) out.set(key, lines);
+  }
+  return out;
+}
+
+/** Preserved comments for a pin, indented to align with <dependency>. */
+function pomFreeTextLines(freeText: Map<string, string[]> | null, key: string, indent: string): string[] {
+  const lines = freeText?.get(key) ?? [];
+  return lines.map(l => `${indent}${l}`);
+}
+
+/** Render the managed block as XML, preserving user comments. */
+function renderManagedBlock(entries: Map<string, string>, freeText: Map<string, string[]> | null = null): string {
   const lines = [MARKER_BEGIN];
+  lines.push(...pomFreeTextLines(freeText, FREE_TEXT_HEADER, "  "));
   const sorted = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [pkg, version] of sorted) {
-    lines.push(renderPinDependency(pkg, version));
+    lines.push(...pomFreeTextLines(freeText, pkg, "  "), renderPinDependency(pkg, version));
   }
-  lines.push(MARKER_END);
+  lines.push(...pomFreeTextLines(freeText, FREE_TEXT_FOOTER, "  "), MARKER_END);
   return lines.join("\n");
 }
 
-function findManagedBlock(content: string): { begin: number; end: number; endLen: number } | null {
+interface ManagedRegion {
+  begin: number;
+  end: number;
+  endLen: number;
+}
+
+/** All managed blocks present (any recognized brand), in POM_MARKERS priority order. */
+function findManagedBlocks(content: string): ManagedRegion[] {
+  const regions: ManagedRegion[] = [];
   for (const { begin, end } of POM_MARKERS) {
-    const beginIdx = content.indexOf(begin);
-    const endIdx = content.indexOf(end);
-    if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
-      return { begin: beginIdx, end: endIdx, endLen: end.length };
+    let from = 0;
+    for (;;) {
+      const beginIdx = content.indexOf(begin, from);
+      if (beginIdx === -1) break;
+      const endIdx = content.indexOf(end, beginIdx + begin.length);
+      if (endIdx === -1) break;
+      regions.push({ begin: beginIdx, end: endIdx, endLen: end.length });
+      from = endIdx + end.length;
     }
   }
-  return null;
+  return regions;
+}
+
+/** Consolidate several managed blocks (different tool brands) into the highest-priority one. */
+function consolidateManagedBlocks(content: string): string {
+  let base = content;
+  for (;;) {
+    const regions = findManagedBlocks(base);
+    if (regions.length <= 1) return base;
+    const victim = regions.at(-1)!; // lowest brand priority
+    const before = collapseTrailingNewlines(base.slice(0, victim.begin), 1);
+    const after = base.slice(victim.end + victim.endLen).replace(/^\n+/, "\n");
+    base = `${before}${after}`;
+  }
+}
+
+/** Merged pins/comments of every managed block (brand priority decides conflicts — canonical wins). */
+function parseAllManagedPins(content: string): { entries: Map<string, string>; freeText: Map<string, string[]> | null } {
+  const entries = new Map<string, string>();
+  let freeText: Map<string, string[]> | null = null;
+  for (const region of findManagedBlocks(content)) {
+    const existing = content.slice(region.begin, region.end + region.endLen);
+    for (const [pkg, v] of parseExistingPins(existing)) if (!entries.has(pkg)) entries.set(pkg, v);
+    const ft = parsePomBlockFreeText(existing);
+    if (ft.size > 0) freeText = mergePomFreeText(freeText, ft);
+  }
+  return { entries, freeText };
+}
+
+/** Merge one block's free-text buckets into the running map; a null map materializes on first content. */
+function mergePomFreeText(
+  freeText: Map<string, string[]> | null,
+  ft: Map<string, string[]>,
+): Map<string, string[]> {
+  const target = freeText ?? new Map<string, string[]>();
+  for (const [key, lines] of ft) {
+    const prev = target.get(key);
+    if (prev) prev.push(...lines);
+    else target.set(key, [...lines]);
+  }
+  return target;
 }
 
 function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandled: string[] = []): string {
-  const found = findManagedBlock(content);
+  // Merge any legacy-brand blocks into one before upserting, so the file ends with a single block.
+  const merged = parseAllManagedPins(content);
+  content = consolidateManagedBlocks(content);
+  const found = findManagedBlocks(content)[0] ?? null;
 
   let entries = new Map<string, string>();
   let before = content;
   let after = "";
   let hasBlock = found !== null;
+  let freeText: Map<string, string[]> | null = null;
 
   if (found) {
     const { begin: beginIdx, end: endIdx, endLen } = found;
-    const existing = content.slice(beginIdx, endIdx + endLen);
-    entries = parseExistingPins(existing);
+    // Parsed across every brand's block before consolidation — dropped blocks' pins carry over.
+    entries = merged.entries;
+    freeText = merged.freeText;
     before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
     after = content.slice(endIdx + endLen).replace(/^\n+/, "\n");
   }
@@ -221,7 +441,7 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
   for (const ga of directlyHandled) entries.delete(ga);
   if (entries.size === 0) return hasBlock ? `${before}${after}` : content;
 
-  const block = renderManagedBlock(entries);
+  const block = renderManagedBlock(entries, prunePomFreeText(freeText, entries));
   if (hasBlock) {
     // A misplaced marker (e.g. left between </dependencies> and
     // </dependencyManagement>) must be relocated, not kept in place.
@@ -264,23 +484,19 @@ function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandle
  * Returns true when the file was modified.
  */
 export function removeManagedPin(filePath: string, packageName: string): boolean {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const found = findManagedBlock(content);
-  if (!found) return false;
-
-  const { begin: beginIdx, end: endIdx, endLen } = found;
-  const block = content.slice(beginIdx, endIdx + endLen);
-  const entries = parseExistingPins(block);
-  if (!entries.delete(packageName)) return false;
-
-  const before = collapseTrailingNewlines(content.slice(0, beginIdx), 1);
-  const after = content.slice(endIdx + endLen).replace(/^\n+/, "");
-  if (entries.size === 0) {
-    fs.writeFileSync(filePath, `${before}${after}`);
-    return true;
+  let content = fs.readFileSync(filePath, "utf-8");
+  const merged = parseAllManagedPins(content);
+  if (!merged.entries.delete(packageName)) return false;
+  content = consolidateManagedBlocks(content);
+  const found = findManagedBlocks(content)[0];
+  if (found) {
+    const before = collapseTrailingNewlines(content.slice(0, found.begin), 1);
+    const after = content.slice(found.end + found.endLen).replace(/^\n+/, "");
+    content = merged.entries.size > 0
+      ? `${before}${renderManagedBlock(merged.entries, prunePomFreeText(merged.freeText, merged.entries))}\n${after}`
+      : `${before}${after}`;
   }
-  const next = renderManagedBlock(entries);
-  fs.writeFileSync(filePath, `${before}${next}\n${after}`);
+  fs.writeFileSync(filePath, content, "utf-8");
   return true;
 }
 
@@ -303,17 +519,25 @@ function rewriteRename(
   };
   let { content: next, changed } = rewriteDirect(content, bump, warnings);
 
-  const depBlocks = next.match(/<dependency>[\s\S]*?<\/dependency>/g) || [];
-  for (const block of depBlocks) {
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  for (const found of dependencyBlocks(next)) {
+    const block = found.text;
     const groupMatch = /<groupId>([^<]+)<\/groupId>/.exec(block);
     const artifactMatch = /<artifactId>([^<]+)<\/artifactId>/.exec(block);
     if (!groupMatch || !artifactMatch) continue;
     if (groupMatch[1].trim() !== fromGroup || artifactMatch[1].trim() !== fromArt) continue;
 
-    const updated = block
-      .replace(/<groupId>[^<]+<\/groupId>/, `<groupId>${toGroup}</groupId>`)
-      .replace(/<artifactId>[^<]+<\/artifactId>/, `<artifactId>${toArt}</artifactId>`);
-    next = next.replace(block, updated);
+    edits.push({
+      start: found.start,
+      end: found.end,
+      text: block
+        .replace(/<groupId>[^<]+<\/groupId>/, `<groupId>${toGroup}</groupId>`)
+        .replace(/<artifactId>[^<]+<\/artifactId>/, `<artifactId>${toArt}</artifactId>`),
+    });
+  }
+  edits.sort((a, b) => b.start - a.start);
+  for (const edit of edits) {
+    next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
     changed = true;
   }
 
@@ -418,40 +642,59 @@ function applyMavenExclusions(content: string, excludes: ExcludeRequest[], resul
   if (excludes.length === 0) return content;
   const spans = dependencyManagementSpans(content);
   let next = content;
-
   for (const ex of excludes) {
-    const [group, artifact] = ex.packageName.split(":");
-    if (!group || !artifact) {
-      result.warnings.push(`${ex.packageName}: not a valid group:artifact exclusion`);
-      continue;
-    }
-    const re = /<dependency>[\s\S]*?<\/dependency>/g;
-    const edits: Array<{ start: number; end: number; text: string }> = [];
-    let already = false;
-    let match: RegExpExecArray | null;
-    while ((match = re.exec(next)) !== null) {
-      if (insideSpan(match.index, spans)) continue;
-      const block = match[0];
-      if (blockCoordinates(block) === ex.packageName) continue;
-      if (blockHasExclusion(block, group, artifact)) {
-        already = true;
-        continue;
-      }
-      edits.push({
-        start: match.index,
-        end: match.index + block.length,
-        text: insertExclusion(block, group, artifact),
-      });
-    }
-    if (edits.length === 0 && !already) {
-      result.warnings.push(`${ex.packageName}: no direct dependency to attach <exclusion> to`);
-      continue;
-    }
-    for (const edit of edits.sort((a, b) => b.start - a.start)) {
-      next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
-    }
-    result.excluded.push(ex.packageName);
+    next = applyOneExclusion(next, ex, spans, result);
   }
+  return next;
+}
+
+/** True when a block is not an attachment target: inside dependencyManagement, the excluded coordinate itself, or out of scope. */
+function exclusionBlocked(
+  found: XmlBlock,
+  packageName: string,
+  spans: Array<[number, number]>,
+  scopedTo: Set<string> | null,
+): boolean {
+  if (insideSpan(found.start, spans)) return true;
+  const coords = blockCoordinates(found.text);
+  if (coords === packageName) return true;
+  return scopedTo !== null && !scopedTo.has(coords ?? "");
+}
+
+/** Attach one exclusion to every direct dependency block outside dependencyManagement (or only to ex.attachTo when scoped). */
+function applyOneExclusion(
+  content: string,
+  ex: ExcludeRequest,
+  spans: Array<[number, number]>,
+  result: ApplyResult,
+): string {
+  const [group, artifact] = ex.packageName.split(":");
+  if (!group || !artifact) {
+    result.warnings.push(`${ex.packageName}: not a valid group:artifact exclusion`);
+    return content;
+  }
+  const scopedTo = ex.attachTo && ex.attachTo.length > 0 ? new Set(ex.attachTo) : null;
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  let already = false;
+  for (const found of dependencyBlocks(content)) {
+    if (exclusionBlocked(found, ex.packageName, spans, scopedTo)) continue;
+    const block = found.text;
+    if (blockHasExclusion(block, group, artifact)) {
+      already = true;
+      continue;
+    }
+    edits.push({ start: found.start, end: found.end, text: insertExclusion(block, group, artifact) });
+  }
+  if (edits.length === 0 && !already) {
+    result.warnings.push(scopedTo ? `${ex.packageName}: none of its resolved sources (${[...scopedTo].join(", ")}) are direct dependencies — nothing to attach <exclusion> to` : `${ex.packageName}: no direct dependency to attach <exclusion> to`);
+    return content;
+  }
+  edits.sort((a, b) => b.start - a.start);
+  let next = content;
+  for (const edit of edits) {
+    next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
+  }
+  result.excluded.push(ex.packageName);
   return next;
 }
 

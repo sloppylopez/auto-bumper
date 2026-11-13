@@ -35,3 +35,30 @@ export function loadLocalAdvisories(dir: string = getLocalAdvisoriesDir()): Advi
   }
   return out;
 }
+
+/**
+ * Package-shipped advisories, plus `<target>/local-advisories/*.json` when that
+ * directory is a different folder. Same id in the project file replaces the packaged one.
+ */
+export function loadLocalAdvisoriesForTarget(targetDir: string): AdvisoryEntry[] {
+  const packageDir = path.resolve(getLocalAdvisoriesDir());
+  const projectDir = path.resolve(targetDir, "local-advisories");
+  const packaged = loadLocalAdvisories(packageDir);
+  if (projectDir === packageDir) return packaged;
+  const project = loadLocalAdvisories(projectDir);
+  if (project.length === 0) return packaged;
+  const out = [...packaged];
+  const indexById = new Map<string, number>();
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].id) indexById.set(out[i].id, i);
+  }
+  for (const entry of project) {
+    if (entry.id && indexById.has(entry.id)) {
+      out[indexById.get(entry.id)!] = entry;
+    } else {
+      if (entry.id) indexById.set(entry.id, out.length);
+      out.push(entry);
+    }
+  }
+  return out;
+}

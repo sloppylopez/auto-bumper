@@ -1,6 +1,6 @@
 import type { AdvisoryEntry, Finding } from "../src/lib/types.ts";
 import { buildFixPlan } from "../src/lib/fixer.ts";
-import { detectMavenRenames } from "../src/lib/maven-renames.ts";
+import { consumerVariantsForFamily, detectMavenRenames, topLevelAncestors } from "../src/lib/maven-renames.ts";
 
 const jacksonAdvisory: AdvisoryEntry = {
   id: "GHSA-5jmj-h7xm-6q6v",
@@ -101,5 +101,72 @@ describe("buildFixPlan renames", () => {
     expect(plan.fixable).toEqual([]);
     expect(plan.renames.length).toBe(1);
     expect(plan.renames[0].renameTo).toBe("tools.jackson.core:jackson-databind");
+  });
+});
+
+describe("consumerVariantsForFamily", () => {
+  it("returns the jetty wiremock variant and nothing for other families", () => {
+    const jetty = consumerVariantsForFamily("jetty");
+    expect(jetty.length).toBe(1);
+    expect(jetty[0].from).toBe("org.wiremock:wiremock");
+    expect(jetty[0].to).toBe("org.wiremock:wiremock-jetty12");
+    expect(consumerVariantsForFamily("jackson")).toEqual([]);
+  });
+});
+
+describe("topLevelAncestors", () => {
+  it("reports a direct dependency as its own top-level source", () => {
+    const pkgs = [
+      { name: "com.example:consumer-project" }, // project artifact (tree root line)
+      { name: "org.wiremock:wiremock", requiredBy: ["com.example:consumer-project"] },
+      { name: "org.eclipse.jetty:jetty-server", requiredBy: ["org.wiremock:wiremock"] },
+    ];
+    expect([...topLevelAncestors("org.eclipse.jetty:jetty-server", pkgs)]).toEqual(["org.wiremock:wiremock"]);
+    expect([...topLevelAncestors("org.wiremock:wiremock", pkgs)]).toEqual(["org.wiremock:wiremock"]);
+  });
+
+  it("walks transitive chains to their top-level roots", () => {
+    const pkgs = [
+      { name: "com.app:app" }, // project artifact (tree root line)
+      { name: "g:a", requiredBy: ["com.app:app"] },
+      { name: "g:b", requiredBy: ["g:a"] },
+      { name: "g:c", requiredBy: ["g:b"] },
+      { name: "g:d", requiredBy: ["g:c", "g:b"] },
+    ];
+    expect([...topLevelAncestors("g:d", pkgs)].sort()).toEqual(["g:a"]);
+  });
+
+  it("treats a coordinate whose only parent is the absent project artifact as top-level", () => {
+    const pkgs = [
+      { name: "g:a", requiredBy: ["com.example:consumer-project"] },
+    ];
+    expect([...topLevelAncestors("g:a", pkgs)]).toEqual(["g:a"]);
+  });
+
+  it("treats a parent that is itself a root-line entry (project artifact) as the boundary", () => {
+    const pkgs = [
+      { name: "g:a", requiredBy: ["com.example:consumer-project"] },
+      { name: "com.example:consumer-project" }, // present, never required by anything
+    ];
+    expect([...topLevelAncestors("g:a", pkgs)]).toEqual(["g:a"]);
+  });
+
+  it("terminates on cycles without reporting anything", () => {
+    const pkgs = [
+      { name: "g:x", requiredBy: ["g:y"] },
+      { name: "g:y", requiredBy: ["g:x"] },
+    ];
+    expect(topLevelAncestors("g:x", pkgs).size).toBe(0);
+  });
+
+  it("reports both a direct occurrence and transitive sources of the same coordinate", () => {
+    const pkgs = [
+      { name: "com.app:app" }, // project artifact (tree root line)
+      { name: "g:a" }, // direct occurrence (no parents)
+      { name: "g:a", requiredBy: ["g:b"] }, // also pulled transitively
+      { name: "g:b", requiredBy: ["g:c"] },
+      { name: "g:c", requiredBy: ["com.app:app"] }, // direct dependency of the project
+    ];
+    expect([...topLevelAncestors("g:a", pkgs)].sort()).toEqual(["g:a", "g:c"]);
   });
 });

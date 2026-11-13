@@ -12,7 +12,9 @@ import { downloadOsvEcosystemDump, checkRemoteEtag } from "./lib/osv-export.ts";
 import { loadRepoAdvisories } from "./lib/github-repo-advisories.ts";
 import { packagesNeedOrphanBridge } from "./lib/osv-package-bridge.ts";
 import { loadOrphanBridgedAdvisories } from "./lib/osv-orphan-cves.ts";
-import { loadLocalAdvisories } from "./lib/local-advisories.ts";
+import { loadLocalAdvisoriesForTarget } from "./lib/local-advisories.ts";
+import { loadSnykAdvisories } from "./lib/snyk-advisories.ts";
+import { unionAdvisory } from "./lib/advisory-merge.ts";
 import { readCacheFile, writeCacheFile, getCacheAgeMs, readCacheEtag, writeCacheEtag } from "./lib/osv-cache.ts";
 
 export { normalizeCliPath, pathHint, repairMangledCliPath, CACHE_DIR, getOsvDbDir } from "./path.ts";
@@ -22,6 +24,17 @@ export { CACHE_TTL_MS } from "./lib/osv-db.ts";
 export { readCacheFile, writeCacheFile } from "./lib/osv-cache.ts";
 
 export const DB_DIR = getOsvDbDir();
+/**
+ * True when AUTO_BUMPER_SUPPLEMENTAL is set to `off`, `0`, or `false` (case-insensitive).
+ * Disables the supplemental advisory sources (GitHub repo advisories, orphan-CVE bridge,
+ * and Snyk public per-package advisories), leaving runs strictly on the OSV bulk dump plus locally-vendored advisories. Unset/other → current behavior.
+ */
+export function supplementalDisabled(): boolean {
+  const v = process.env.AUTO_BUMPER_SUPPLEMENTAL;
+  if (v === undefined) return false;
+  const normalized = v.toLowerCase();
+  return normalized === "off" || normalized === "0" || normalized === "false";
+}
 export const ECOSYSTEM_MAP = ECOSYSTEM_OSV_NAME;
 
 export interface ScanResult {
@@ -32,6 +45,8 @@ export interface ScanResult {
   resolvedTarget?: string;
   /** Coordinates that failed to resolve in the build (e.g. yanked versions). */
   unresolved?: string[];
+  /** True when a clean result would hide a missing tree or a missing advisory cache. */
+  incomplete?: boolean;
 }
 
 export interface ScanOptions {
@@ -60,8 +75,13 @@ export async function loadAdvisoriesForEcosystem(
   const logFn = makeLogFn(spinner);
 
   const cachedData = readCacheFile(osvName);
+  if (offline) {
+    if (cachedData === null) {
+      throw new Error(`No cached ${osvName} advisory DB. Run update-db while online, then retry --offline.`);
+    }
+    return cachedData;
+  }
   if (cachedData === null) return downloadAndCache(osvName, logFn, spinner);
-  if (offline) return cachedData;
 
   // Online: probe the remote dump; re-download only when it changed since we cached it.
   const remoteEtag = await checkRemoteEtag(osvName);
@@ -126,7 +146,9 @@ export async function prefetchMissingCaches(
   detectedEcosystems: string[],
   oraFactory: SpinnerFactory,
   sharedSpinner?: Spinner,
+  offline = false,
 ): Promise<void> {
+  if (offline) return;
   const missing = findMissingEcosystems(detectedEcosystems);
   if (missing.length === 0) return;
 
@@ -238,6 +260,21 @@ async function loadAdvisoriesForEcosystems(
   return allAdvData;
 }
 
+/** Load one supplemental advisory source, converting a failure into a warning + incomplete flag instead of aborting the scan. */
+async function loadSupplementalAdvisories(
+  warnings: string[],
+  markIncomplete: () => void,
+  load: (onWarning: (msg: string) => void) => Promise<AdvisoryEntry[]>,
+): Promise<AdvisoryEntry[]> {
+  try {
+    return await load(msg => warnings.push(msg));
+  } catch (err) {
+    warnings.push(err instanceof Error ? err.message : String(err));
+    markIncomplete();
+    return [];
+  }
+}
+
 export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = {}): Promise<ScanResult> {
   const { ecosystemFilter = null, quiet = false, quietBanner = quiet, spinnerPrefix } = opts;
   const oraFactory = resolveOraFactory(quiet, opts.ora);
@@ -249,10 +286,10 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   const setText = makeSetText(spinner, spinnerPrefix);
 
   // Phase 1: Parse & filter packages
-  const { packages, warnings, unresolved } = await parseAndFilter(resolvedTarget, setText, ecosystemFilter, opts);
+  const { packages, warnings, unresolved, incompleteTree } = await parseAndFilter(resolvedTarget, setText, ecosystemFilter, opts);
   if (packages.length === 0) {
     spinner?.stop();
-    return { packages: [], findings: [], warnings, advisories: [], ...(unresolved ? { unresolved } : {}) };
+    return { packages: [], findings: [], warnings, advisories: [], incomplete: incompleteTree, ...(unresolved ? { unresolved } : {}) };
   }
 
   // Phase 2: Load advisories
@@ -261,27 +298,32 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   );
 
   // Bridge package-less OSV records (e.g. log4j CVEs) onto Maven coordinates.
-  if (packagesNeedOrphanBridge(packages)) {
+  if (!supplementalDisabled() && packagesNeedOrphanBridge(packages)) {
     allAdvData = mergeAdvisories(allAdvData, await loadOrphanBridgedAdvisories(packages, { offline: opts.offline }));
   }
 
-  // Phase 3: Load repo-published advisories (vendor GHSAs missing from bulk OSV dumps)
+  // Phase 3: Reviewed GitHub Maven advisories (global list, incremental after the first pull)
   let repoAdvisories: AdvisoryEntry[] = [];
-  if (!opts.offline) {
-    try {
-      setText("Loading repo-published advisories...");
-      repoAdvisories = await loadRepoAdvisories({ setText });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`GitHub repo advisories unavailable: ${msg}`);
-    }
+  let advisoryIncomplete = false;
+  const markAdvisoriesIncomplete = () => { advisoryIncomplete = true; };
+  if (!supplementalDisabled() && packages.some(pkg => pkg.ecosystem.toLowerCase() === "maven")) {
+    repoAdvisories = await loadSupplementalAdvisories(warnings, markAdvisoriesIncomplete, async onWarning => {
+      setText(opts.offline ? "Loading cached GitHub Maven advisories..." : "Loading GitHub Maven advisories...");
+      return loadRepoAdvisories({ setText, offline: opts.offline, onWarning, onIncomplete: markAdvisoriesIncomplete });
+    });
   }
-  // Phase 3b: Merge locally-vendored advisories (offline; disclosures not yet in OSV dumps)
-  const localAdvisories = loadLocalAdvisories();
+  // Phase 3b: Merge locally-vendored advisories (package dir + <target>/local-advisories)
+  const localAdvisories = loadLocalAdvisoriesForTarget(resolvedTarget);
   if (localAdvisories.length > 0) {
     setText(`Loaded ${localAdvisories.length} locally-vendored advisories`);
   }
-  const combinedData = mergeAdvisories(allAdvData, [...repoAdvisories, ...localAdvisories]);
+  // Phase 3c: Snyk Open Source public advisories (per-package pages, cached per coordinate)
+  let snykAdvisories: AdvisoryEntry[] = [];
+  if (!supplementalDisabled()) {
+    snykAdvisories = await loadSupplementalAdvisories(warnings, markAdvisoriesIncomplete, onWarning =>
+      loadSnykAdvisories(packages, { offline: opts.offline, setText, onWarning, onIncomplete: markAdvisoriesIncomplete }));
+  }
+  const combinedData = mergeAdvisories(allAdvData, [...repoAdvisories, ...snykAdvisories, ...localAdvisories]);
 
   // Phase 4: Match & report — excluded coordinates are dropped before counting/reporting
   const allFindings = matchVulnerabilities(packages, combinedData);
@@ -295,7 +337,15 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   const gradleScopeNote = gradleScanScopeNote(packages, opts.gradleConfigurations);
   reportStatus(spinner, findings, packages, allAdvData.length, gradleScopeNote);
 
-  return { packages, findings, warnings: uniqueWarnings, advisories: combinedData, resolvedTarget, ...(unresolved ? { unresolved } : {}) };
+  return {
+    packages,
+    findings,
+    warnings: uniqueWarnings,
+    advisories: combinedData,
+    resolvedTarget,
+    incomplete: incompleteTree || advisoryIncomplete,
+    ...(unresolved ? { unresolved } : {}),
+  };
 }
 
 /** Resolve the spinner factory from options */
@@ -317,7 +367,7 @@ async function parseAndFilter(
   setText: (msg: string) => void,
   ecosystemFilter: string | null,
   opts: { gradleConfigurations?: readonly string[] },
-): Promise<{ packages: PackageRef[]; warnings: string[]; unresolved?: string[] }> {
+): Promise<{ packages: PackageRef[]; warnings: string[]; unresolved?: string[]; incompleteTree: boolean }> {
   const parseResult = await parseLockfileAsync(
     resolvedTarget,
     setText,
@@ -326,6 +376,7 @@ async function parseAndFilter(
   let packages = parseResult.packages;
   const warnings = [...parseResult.warnings];
   const unresolved = parseResult.unresolved;
+  const incompleteTree = parseResult.incompleteTree === true;
 
   if (ecosystemFilter) {
     packages = filterPackagesByEcosystem(packages, ecosystemFilter);
@@ -336,7 +387,7 @@ async function parseAndFilter(
     }
   }
 
-  return { packages, warnings, ...(unresolved ? { unresolved } : {}) };
+  return { packages, warnings, incompleteTree, ...(unresolved ? { unresolved } : {}) };
 }
 
 /** Load cached + live advisories across all ecosystems */
@@ -376,7 +427,7 @@ async function loadAllAdvisories(
     }
   }
 
-  if (oraFactory) await prefetchMissingCaches(detectedEcosystems, oraFactory, spinner);
+  if (oraFactory) await prefetchMissingCaches(detectedEcosystems, oraFactory, spinner, offline);
 
   setText("Loading vulnerability database...");
   const allAdvData = await loadAdvisoriesForEcosystems(detectedEcosystems, oraFactory, spinner, offline);
@@ -410,18 +461,19 @@ export function advisoryRichness(entry: AdvisoryEntry): number {
 }
 
 /**
- * Merge local cache with live/API advisories by ID.
- * Same ID: keep the richer record so stale cache cannot shadow fresher fixedVersions/ranges.
+ * Merge advisory lists by id.
+ * Same id: union aliases, links, severity, and affected packages. Ranges for the
+ * same package are concatenated so a richer record cannot drop another package
+ * or a newer fixed version.
  */
 export function mergeAdvisories(local: AdvisoryEntry[], extra: AdvisoryEntry[]): AdvisoryEntry[] {
   const byId = new Map<string, AdvisoryEntry>();
-  for (const e of local) byId.set(e.id, e);
-  for (const e of extra) {
-    const existing = byId.get(e.id);
-    if (!existing || advisoryRichness(e) > advisoryRichness(existing)) {
-      byId.set(e.id, e);
-    }
-  }
+  const put = (entry: AdvisoryEntry) => {
+    const existing = byId.get(entry.id);
+    byId.set(entry.id, existing ? unionAdvisory(existing, entry) : entry);
+  };
+  for (const e of local) put(e);
+  for (const e of extra) put(e);
   return [...byId.values()];
 }
 

@@ -27,7 +27,29 @@ describe("reportMarkdown", () => {
     expect(output).toContain("|");
     expect(output).toContain("High");
     expect(output).toContain("Package");
-    expect(output).toContain("Version");
+    expect(output).toContain("Installed");
+    expect(output).toContain("any → 4.6.0");
+  });
+
+  it("shows introduced and last-affected when the advisory has no fixed version", () => {
+    const output = reportMarkdown([makeFinding({
+      installedVersion: "1.13",
+      introduced: "1.12",
+      fixedVersions: [],
+      lastAffected: "1.13",
+    })]);
+    expect(output).toContain("1.13");
+    expect(output).toContain("1.12 → 1.13 last");
+  });
+
+  it("does not show a fix that is already below the installed version", () => {
+    const output = reportMarkdown([makeFinding({
+      installedVersion: "3.1.0",
+      introduced: "3.0.0",
+      fixedVersions: ["2.5.0"],
+    })]);
+    expect(output).toContain("3.0.0 → no fix");
+    expect(output).not.toContain("2.5.0");
   });
 
   it("includes emoji indicators per severity", () => {

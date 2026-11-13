@@ -54,3 +54,21 @@ export function runApplyTransaction(opts: {
     throw err;
   }
 }
+/**
+ * Discard a manifest's backup only if it no longer matches the file it protects.
+ * A leftover .bak from an earlier run whose manifest has since changed would restore
+ * stale content on failure; a backup identical to the current file is still a valid
+ * pre-state snapshot (e.g. an interrupted run that wrote nothing) and is kept.
+ */
+export function discardStaleBackup(filePath: string): void {
+  for (const suffix of [BACKUP_SUFFIX, LEGACY_BACKUP_SUFFIX]) {
+    try {
+      const bak = `${filePath}${suffix}`;
+      if (!fs.existsSync(bak)) continue;
+      if (fs.readFileSync(bak, "utf-8") === fs.readFileSync(filePath, "utf-8")) continue;
+      fs.unlinkSync(bak);
+    } catch {
+      // best effort
+    }
+  }
+}

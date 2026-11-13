@@ -4,7 +4,8 @@ import {
   packagesNeedOrphanBridge,
   resolveBridgedMavenPackages,
 } from "../src/lib/osv-package-bridge.ts";
-import { extractCveIdsFromHtml } from "../src/lib/osv-orphan-cves.ts";
+import { extractCveIdsFromHtml, orphanCacheName } from "../src/lib/osv-orphan-cves.ts";
+import { BRIDGE_PRODUCTS, type BridgeProduct } from "../src/lib/osv-package-bridge.ts";
 import { mapOsvVulnToAdvisory } from "../src/lib/osv-export.ts";
 import { matchVulnerabilities } from "../src/lib/matcher.ts";
 
@@ -162,5 +163,33 @@ describe("extractCveIdsFromHtml", () => {
   it("collects unique CVE ids", () => {
     const html = "see CVE-2026-49844 and cve-2021-44228 plus CVE-2026-49844 again";
     expect(extractCveIdsFromHtml(html).sort()).toEqual(["CVE-2021-44228", "CVE-2026-49844"]);
+  });
+});
+
+describe("orphanCacheName", () => {
+  const product: BridgeProduct = {
+    id: "test-product",
+    mavenNamePrefixes: ["com.example:test"],
+    cpeProducts: [],
+    repos: [],
+    advisoryIdSources: [],
+    knownCveIds: ["CVE-2026-10000"],
+    resolvePackages: () => ["com.example:test"],
+  };
+
+  it("is stable for the same product set", () => {
+    expect(orphanCacheName([product])).toBe(orphanCacheName([{ ...product }]));
+    expect(orphanCacheName(BRIDGE_PRODUCTS)).toMatch(/^Maven-orphan-[0-9a-f]{12}$/);
+  });
+
+  it("changes when a known CVE id is added so stale caches are invalidated", () => {
+    const before = orphanCacheName([product]);
+    const after = orphanCacheName([{ ...product, knownCveIds: ["CVE-2026-10000", "CVE-2026-10001"] }]);
+    expect(after).not.toBe(before);
+  });
+
+  it("is independent of product order", () => {
+    const other: BridgeProduct = { ...product, id: "other-product" };
+    expect(orphanCacheName([product, other])).toBe(orphanCacheName([other, product]));
   });
 });

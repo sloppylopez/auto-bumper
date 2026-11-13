@@ -11,6 +11,8 @@ export interface PackageRef {
   version: string;
   /** Path to the lockfile/manifest that declared this package */
   manifestPath: string;
+  /** Parent coordinates ("group:artifact") from the resolved dependency tree, when parsed from a full tree. */
+  requiredBy?: string[];
 }
 
 export interface Finding {
@@ -30,6 +32,8 @@ export interface Finding {
   fixedVersions: string[];
   /** Inclusive last affected version when the advisory has no `fixed` event. */
   lastAffected?: string;
+  /** Inclusive lower bound of the matching affected window (OSV `introduced` event); versions below it are not affected by this advisory. Event-based ranges only — undefined when the range carries no such bound. */
+  introduced?: string;
   /** Severity level */
   severity: "LOW" | "MODERATE" | "HIGH" | "CRITICAL" | "UNKNOWN";
   /** Short description of the vulnerability */
