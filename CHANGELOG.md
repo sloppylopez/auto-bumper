@@ -4,6 +4,13 @@ All notable changes to `@elephantseed/auto-bumper`.
 
 ## [Unreleased]
 
+### Added
+- Progress lines on a terminal flip the hourglass between the two hourglass glyphs, twice a second. A new status rewrites that same line, so the glass keeps turning while a counter advances. Piped output and `TERM=dumb` keep one static hourglass per status
+- `fix -y` / `fix --yes` says yes to every consent prompt: same as `--apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades --apply-excludes`. It does not imply `--force-exclude` or `--latest`. `--dry-run` still only prints the plan
+- `fix` now supports Kotlin DSL build files (`build.gradle.kts`) end to end: direct declarations are rewritten in place — string literals, map-style `group = "g", name = "a", version = …` (quoted versions and shared `val`/`def` variables), and `"g:a:${var}"` interpolation — and the managed constraints block is emitted as valid Kotlin
+- Gradle version catalogs (`gradle/libs.versions.toml`) are auto-fixed: `[versions]` aliases (via `version.ref`) and inline `version = "…"` values are bumped in place instead of accumulating pins; the catalog is discovered by walking up from the build file to its build root, so a multi-module subproject bumps the shared root catalog
+- Offline scans now resolve Kotlin catalog accessors: `implementation(libs.jackson.core)` and `"g:a:${libs.versions.jackson}"` are read through the project's version catalog, so catalog-driven builds report their dependencies even without a resolved classpath tree
+
 ### Fixed
 - `fix --apply` (Maven) no longer rolls back downgrades on an environmental compile-check failure: when the pom's required Java release (compiler plugin `<release>`, else `maven.compiler.release`, else `java.version`) is newer than the JDK in `JAVA_HOME`/PATH, the post-downgrade compile check cannot succeed for reasons unrelated to the downgrade — e.g. a pom targeting Java 25 built with JDK 21 fails with "release version 25 not supported". The check is now skipped for that project, the downgrades are kept, and they are reported as `Unverified downgrades` (counted toward a non-zero exit under strict mode) with advice to re-run under the project's JDK
 - Compile-check failure details no longer show only the last three lines of build output — for Maven that was always the generic `[Help 1]` footer, hiding the real error. The reported detail now leads with the `Failed to execute goal` / `FAILURE:` headline and its concrete error lines, with the footer noise dropped

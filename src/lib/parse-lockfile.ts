@@ -6,6 +6,7 @@ import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { findVersionCatalog, parseVersionCatalog, resolveCatalogAccessor, type VersionCatalog } from "./gradle-catalog.ts";
 import type { PackageRef } from "./types.ts";
 
 export interface ParseResult {
@@ -1885,6 +1886,53 @@ function findGradleCoordinates(content: string): Array<{ group: string; name: st
   return out;
 }
 
+/** Collect version variable definitions (Groovy `def` / Kotlin `val`) from a build file. */
+function collectVersionVars(content: string): Record<string, string> {
+  const versionVars: Record<string, string> = {};
+  for (const m of content.matchAll(/(?:def|val)\s+(\w+_?(?:version|Version|VERSION)?)\s*=\s*"([^"]+)"/g)) {
+    versionVars[m[1]] = m[2];
+  }
+  return versionVars;
+}
+
+/** Record fully-quoted `group:name:version` coordinates, resolving Kotlin `$var` / `${var}` versions. */
+function recordQuotedCoordinateDeps(
+  content: string,
+  packages: PackageRef[],
+  filePath: string,
+  versionVars: Record<string, string>,
+  excludes: Set<string>,
+  seen: Set<string>,
+): void {
+  const quotedPattern = /["'](\w[\w.@-]*):(\w[\w.-]*):([^"']+)["']/g;
+  for (const match of content.matchAll(quotedPattern)) {
+    let version: string | null = match[3].trim();
+    if (version.startsWith("${")) {
+      version = versionVars[version.slice(2, -1)] || null;
+    } else if (version.startsWith("$")) {
+      version = versionVars[version.slice(1)] || null;
+    }
+    recordGradleDep(packages, filePath, match[1].trim(), match[2].trim(), version, excludes, seen);
+  }
+}
+
+/** Record Kotlin catalog accessor deps (`libs.jackson.core`); only [libraries] entries resolve. */
+function recordCatalogAccessorDeps(
+  content: string,
+  packages: PackageRef[],
+  filePath: string,
+  catalog: VersionCatalog,
+  excludes: Set<string>,
+  seen: Set<string>,
+): void {
+  for (const m of content.matchAll(/\blibs\.([a-z0-9]+(?:\.[a-z0-9]+)+)/g)) {
+    const lib = resolveCatalogAccessor(catalog, m[1]);
+    if (!lib?.version) continue;
+    const [group, name] = lib.module.split(":");
+    if (group && name) recordGradleDep(packages, filePath, group, name, lib.version, excludes, seen);
+  }
+}
+
 /** Direct parser for build.gradle (fallback when gradlew unavailable) */
 export function parseBuildGradleDirect(filePath: string): ParseResult {
   const warnings: string[] = [];
@@ -1892,9 +1940,14 @@ export function parseBuildGradleDirect(filePath: string): ParseResult {
   const packages: PackageRef[] = [];
 
   // Extract version variable definitions (Groovy def / Kotlin val)
-  const versionVars: Record<string, string> = {};
-  for (const m of content.matchAll(/(?:def|val)\s+(\w+_?(?:version|Version|VERSION)?)\s*=\s*"([^"]+)"/g)) {
-    versionVars[m[1]] = m[2];
+  const versionVars = collectVersionVars(content);
+
+  // Version catalog (libs.versions.toml): its [versions] entries back `${libs.versions.x}` refs in
+  // the interpolation paths below, and its [libraries] entries back `libs.x.y` accessor deps.
+  const catalogPath = findVersionCatalog(filePath);
+  const catalog = catalogPath ? parseVersionCatalog(catalogPath) : null;
+  if (catalog) {
+    for (const [alias, ver] of catalog.versions) versionVars[`libs.versions.${alias}`] = ver;
   }
 
   // Extract exclude blocks - skip excluded group:module pairs (Groovy + Kotlin)
@@ -1908,15 +1961,13 @@ export function parseBuildGradleDirect(filePath: string): ParseResult {
     recordGradleDep(packages, filePath, coord.group, coord.name, gradleDepVersion(`${coord.group}:${coord.name}`, rest, versionVars, content), excludes, seen);
   }
   // Fully-quoted coordinates: "group:name:version" / Kotlin $var interpolation
-  const quotedPattern = /["'](\w[\w.@-]*):(\w[\w.-]*):([^"']+)["']/g;
-  for (const match of content.matchAll(quotedPattern)) {
-    let version: string | null = match[3].trim();
-    if (version.startsWith("${")) {
-      version = versionVars[version.slice(2, -1)] || null;
-    } else if (version.startsWith("$")) {
-      version = versionVars[version.slice(1)] || null;
-    }
-    recordGradleDep(packages, filePath, match[1].trim(), match[2].trim(), version, excludes, seen);
+  recordQuotedCoordinateDeps(content, packages, filePath, versionVars, excludes, seen);
+
+  // Kotlin catalog accessors: implementation(libs.jackson.core) — the coordinate exists only in
+  // the TOML. Only matches that resolve to a [libraries] entry are recorded, which filters out
+  // versions/bundles/category accessors (no library under those aliases).
+  if (catalog) {
+    recordCatalogAccessorDeps(content, packages, filePath, catalog, excludes, seen);
   }
 
   if (packages.length === 0) {
