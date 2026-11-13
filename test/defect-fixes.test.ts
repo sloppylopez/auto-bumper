@@ -14,7 +14,7 @@ import {
   matchesSemverRange,
   matchVulnerabilities,
 } from "../src/lib/matcher.ts";
-import { dedupeResolvedPackages, listNestedJavaManifests, listNestedManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { dedupeResolvedPackages, listNestedJavaManifests, listNestedManifests, parseLockfile, parseRequirementsTxt, windowsBatchArgs, windowsBatchEnv } from "../src/lib/parse-lockfile.ts";
 import { assertNoZipSlip, zipEntryNames } from "../src/lib/osv-export.ts";
 import { extractNextLink } from "../src/lib/github-repo-advisories.ts";
 import { isInsideDir } from "../src/path.ts";
@@ -421,20 +421,22 @@ describe("gradle catalog and kotlin pin", () => {
 
 describe("security guards", () => {
   it("quotes a batch path so cmd cannot split on &", () => {
-    const line = windowsBatchArgs(String.raw`C:\ok & calc\gradlew.bat`, ["dependencies", "--quiet"]);
-    expect(line.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
-    expect(line[3]).toBe(String.raw`""C:\ok & calc\gradlew.bat" "dependencies" "--quiet""`);
+    const executable = String.raw`C:\ok & calc\gradlew.bat`;
+    const line = windowsBatchArgs(executable, ["dependencies", "--quiet"]);
+    expect(line.slice(0, 4)).toEqual(["/d", "/v:on", "/s", "/c"]);
+    expect(line[4]).toBe('"\"!AUTO_BUMPER_BATCH_EXECUTABLE!\" \"!AUTO_BUMPER_BATCH_ARG_0!\" \"!AUTO_BUMPER_BATCH_ARG_1!\""');
+    expect(windowsBatchEnv(executable, ["dependencies", "--quiet"]).AUTO_BUMPER_BATCH_EXECUTABLE).toBe(executable);
   });
 
   it("leaves a bare batch name unquoted so cmd resolves it through PATH", () => {
     const line = windowsBatchArgs("mvn.cmd", ["--version"]);
-    expect(line.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
-    expect(line[3]).toBe('"mvn.cmd "--version""');
+    expect(line.slice(0, 4)).toEqual(["/d", "/v:on", "/s", "/c"]);
+    expect(line[4]).toBe('"!AUTO_BUMPER_BATCH_EXECUTABLE! "!AUTO_BUMPER_BATCH_ARG_0!""');
   });
 
   it("quotes wrapper paths with cmd metacharacters even without whitespace", () => {
     const line = windowsBatchArgs(String.raw`C:\work&whoami\gradlew.bat`, ["dependencies"]);
-    expect(line[3]).toBe(String.raw`""C:\work&whoami\gradlew.bat" "dependencies""`);
+    expect(line[4]).toContain('"!AUTO_BUMPER_BATCH_EXECUTABLE!"');
   });
 
   it("rejects a zip entry that climbs out of the extract dir", () => {

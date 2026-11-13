@@ -97,7 +97,7 @@ function ghSaOnlyFetch(hits: string[]) {
   return mock(async (url: string | URL) => {
     const u = String(url);
     hits.push(u);
-    if (u.includes("api.github.com")) {
+    if (hasOrigin(u, "https://api.github.com")) {
       return new Response(
         JSON.stringify([
           {
@@ -116,6 +116,14 @@ function ghSaOnlyFetch(hits: string[]) {
     }
     return new Response(null, { status: 404 });
   });
+}
+
+function hasOrigin(value: string, origin: string): boolean {
+  try {
+    return new URL(value).origin === origin;
+  } catch {
+    return false;
+  }
 }
 
 describe("supplementalDisabled", () => {
@@ -152,8 +160,8 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL=off", () => {
       }
 
       // Neither supplemental source may be touched.
-      expect(hits.some((u) => u.includes("api.github.com"))).toBe(false);
-      expect(hits.some((u) => u.includes("api.osv.dev"))).toBe(false);
+      expect(hits.some(u => hasOrigin(u, "https://api.github.com"))).toBe(false);
+      expect(hits.some(u => hasOrigin(u, "https://api.osv.dev"))).toBe(false);
 
       // Findings still served from dump + local advisories (the project-vendored entry must match).
       const local = result.findings.find((f) => f.id === "CVE-2026-90001");
@@ -178,7 +186,7 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL=off", () => {
         globalThis.fetch = originalFetch;
       }
 
-      expect(hits.some((u) => u.includes("api.github.com"))).toBe(false);
+      expect(hits.some(u => hasOrigin(u, "https://api.github.com"))).toBe(false);
       // GHSA-only advisory must NOT appear when supplemental is off.
       expect(result.findings.some((f) => f.id === "GHSA-q9pg-8h3j-8hvm")).toBe(false);
     });

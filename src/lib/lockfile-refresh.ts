@@ -7,7 +7,7 @@
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { windowsBatchArgs } from "./parse-lockfile.ts";
+import { windowsBatchArgs, windowsBatchEnv } from "./parse-lockfile.ts";
 
 export interface LockRefreshCommand {
   bin: string;
@@ -141,6 +141,7 @@ function spawnCaptured(
     const comspec = process.env.ComSpec || "cmd.exe";
     return childProcess.spawnSync(comspec, windowsBatchArgs(executable, args), {
       ...base,
+      env: { ...process.env, ...windowsBatchEnv(executable, args) },
       windowsVerbatimArguments: true,
     });
   }

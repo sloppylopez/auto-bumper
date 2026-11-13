@@ -564,13 +564,24 @@ function applyOneExclusion(
     return content;
   }
   const scopedTo = ex.attachTo && ex.attachTo.length > 0 ? new Set(ex.attachTo) : null;
-  const re = /<dependency>[\s\S]*?<\/dependency>/g;
+  const openTag = "<dependency>";
+  const closeTag = "</dependency>";
   const edits: Array<{ start: number; end: number; text: string }> = [];
   let already = false;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(content)) !== null) {
-    if (insideSpan(match.index, spans)) continue;
-    const block = match[0];
+  let blockStart = -1;
+  for (const tag of content.matchAll(/<\/?dependency>/g)) {
+    if (tag[0] === openTag) {
+      if (blockStart === -1) blockStart = tag.index!;
+      continue;
+    }
+    if (blockStart === -1) {
+      continue;
+    }
+    const start = blockStart;
+    const end = tag.index! + closeTag.length;
+    const block = content.slice(start, end);
+    blockStart = -1;
+    if (insideSpan(start, spans)) continue;
     if (blockCoordinates(block) === ex.packageName) continue;
     if (scopedTo && !scopedTo.has(blockCoordinates(block) ?? "")) continue;
     if (blockHasExclusion(block, group, artifact)) {
@@ -578,8 +589,8 @@ function applyOneExclusion(
       continue;
     }
     edits.push({
-      start: match.index,
-      end: match.index + block.length,
+      start,
+      end,
       text: insertExclusion(block, group, artifact),
     });
   }

@@ -954,16 +954,21 @@ function findUp(dir: string, fileName: string): string | null {
   }
 }
 
-/**
- * cmd.exe /d /s /c line. The outer quotes are stripped by /s, leaving the path quoted
- * so a folder name like `ok & calc` cannot start a second command.
- */
+/** Keep command text static; delayed expansion inserts quoted executable and argument values. */
 export function windowsBatchArgs(executable: string, args: string[]): string[] {
-  const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
-  // Keep simple bare names unquoted for PATH lookup; quote wrapper paths even without spaces.
-  const exe = /^[A-Za-z0-9._-]+$/.test(executable) ? executable : quote(executable);
-  const command = `"${[exe, ...args.map(quote)].join(" ")}"`;
-  return ["/d", "/s", "/c", command];
+  const exe = /^[A-Za-z0-9._-]+$/.test(executable)
+    ? "!AUTO_BUMPER_BATCH_EXECUTABLE!"
+    : '"!AUTO_BUMPER_BATCH_EXECUTABLE!"';
+  const command = `"${[exe, ...args.map((_, i) => `"!AUTO_BUMPER_BATCH_ARG_${i}!"`)].join(" ")}"`;
+  return ["/d", "/v:on", "/s", "/c", command];
+}
+
+export function windowsBatchEnv(executable: string, args: string[]): Record<string, string> {
+  const env: Record<string, string> = { AUTO_BUMPER_BATCH_EXECUTABLE: executable };
+  args.forEach((arg, i) => {
+    env[`AUTO_BUMPER_BATCH_ARG_${i}`] = arg;
+  });
+  return env;
 }
 
 /**
@@ -987,6 +992,7 @@ function spawnCaptured(
     const comspec = process.env.ComSpec || "cmd.exe";
     return childProcess.spawnSync(comspec, windowsBatchArgs(executable, args), {
       ...base,
+      env: { ...process.env, ...windowsBatchEnv(executable, args) },
       windowsVerbatimArguments: true,
     });
   }
@@ -1342,6 +1348,7 @@ function runGradlewConfigAsync(
     const child = isWin && /\.(cmd|bat)$/i.test(gradlew)
       ? childProcess.spawn(process.env.ComSpec || "cmd.exe", windowsBatchArgs(gradlew, args), {
         cwd,
+        env: { ...process.env, ...windowsBatchEnv(gradlew, args) },
         windowsHide: true,
         shell: false,
         windowsVerbatimArguments: true,
