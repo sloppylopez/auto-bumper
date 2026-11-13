@@ -73,62 +73,97 @@ export interface VersionCatalog {
  * TOML: double-quoted values, inline tables (optionally spanning lines), `#` comments ignored by
  * anchoring on quoted values. Other tables are skipped.
  */
-export function parseVersionCatalog(tomlPath: string): VersionCatalog | null {
-  let text: string;
+/** Read the TOML file, returning null when it is missing or unreadable. */
+function readTomlOrNull(tomlPath: string): string | null {
   try {
-    text = fs.readFileSync(tomlPath, "utf-8");
+    return fs.readFileSync(tomlPath, "utf-8");
   } catch {
     return null;
   }
+}
+
+/** Parse a `[versions]` line of the form `alias = "value"`. */
+function recordVersion(versions: Map<string, string>, line: string): void {
+  const m = /^([A-Za-z0-9_-]+)\s*=\s*"([^"]+)"/.exec(line);
+  if (m) versions.set(m[1], m[2]);
+}
+
+/** Parse a `[libraries]` inline-table body into the libraries map. */
+function recordLibrary(
+  libraries: Map<string, CatalogLibrary>,
+  versions: Map<string, string>,
+  alias: string,
+  tableText: string,
+): void {
+  const module = /module\s*=\s*"([^"]+)"/.exec(tableText)?.[1];
+  if (!module) return;
+  const versionRef = /version\.ref\s*=\s*"([^"]+)"/.exec(tableText)?.[1];
+  const inlineVersion = /version\s*=\s*"([^"]+)"/.exec(tableText)?.[1];
+  const version = versionRef ? (versions.get(versionRef) ?? null) : (inlineVersion ?? null);
+  libraries.set(alias, { alias, module, version });
+}
+
+/** Append a continuation line to a multi-line inline table; records the library once it closes. */
+function appendToOpenTable(
+  open: { alias: string; text: string },
+  line: string,
+  versions: Map<string, string>,
+  libraries: Map<string, CatalogLibrary>,
+): { alias: string; text: string } | null {
+  const text = open.text + " " + line;
+  if (!/\}\s*$/.test(text)) return { alias: open.alias, text };
+  recordLibrary(libraries, versions, open.alias, text.slice(1));
+  return null;
+}
+
+/** Mutable state carried across lines while parsing a catalog. */
+interface CatalogLineState {
+  table: string;
+  open: { alias: string; text: string } | null; // multi-line inline table in progress
+}
+
+/** Apply one trimmed line to the parse state, recording any version or library it completes. */
+function parseCatalogLine(
+  state: CatalogLineState,
+  line: string,
+  versions: Map<string, string>,
+  libraries: Map<string, CatalogLibrary>,
+): CatalogLineState {
+  if (state.open !== null) {
+    return { table: state.table, open: appendToOpenTable(state.open, line, versions, libraries) };
+  }
+  const header = /^\[([^\]]+)\]$/.exec(line);
+  if (header) return { table: header[1].trim(), open: null };
+  if (!line || line.startsWith("#")) return state;
+  if (state.table === "versions") {
+    recordVersion(versions, line);
+    return state;
+  }
+  if (state.table !== "libraries") return state;
+  const head = /^([A-Za-z0-9_-]+)\s*=\s*\{(.*)$/.exec(line);
+  if (!head) return state;
+  if (head[2].includes("}")) {
+    recordLibrary(libraries, versions, head[1], head[2]);
+    return state;
+  }
+  return { table: state.table, open: { alias: head[1], text: "{" + head[2] } };
+}
+
+export function parseVersionCatalog(tomlPath: string): VersionCatalog | null {
+  const text = readTomlOrNull(tomlPath);
+  if (text === null) return null;
   const versions = new Map<string, string>();
   const libraries = new Map<string, CatalogLibrary>();
 
-  const recordLibrary = (alias: string, tableText: string): void => {
-    const module = /module\s*=\s*"([^"]+)"/.exec(tableText)?.[1];
-    if (!module) return;
-    const versionRef = /version\.ref\s*=\s*"([^"]+)"/.exec(tableText)?.[1];
-    const inlineVersion = /version\s*=\s*"([^"]+)"/.exec(tableText)?.[1];
-    const version = versionRef ? (versions.get(versionRef) ?? null) : (inlineVersion ?? null);
-    libraries.set(alias, { alias, module, version });
-  };
-
-  let table = "";
-  let openTable: { alias: string; text: string } | null = null; // multi-line inline table
+  let state: CatalogLineState = { table: "", open: null };
   for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (openTable !== null) {
-      openTable.text += " " + line;
-      if (!/\}\s*$/.test(openTable.text)) continue;
-      recordLibrary(openTable.alias, openTable.text.slice(1));
-      openTable = null;
-      continue;
-    }
-    const header = /^\[([^\]]+)\]$/.exec(line);
-    if (header) {
-      table = header[1].trim();
-      continue;
-    }
-    if (!line || line.startsWith("#")) continue;
-    if (table === "versions") {
-      const m = /^([A-Za-z0-9_-]+)\s*=\s*"([^"]+)"/.exec(line);
-      if (m) versions.set(m[1], m[2]);
-      continue;
-    }
-    if (table === "libraries") {
-      const head = /^([A-Za-z0-9_-]+)\s*=\s*\{(.*)$/.exec(line);
-      if (!head) continue;
-      if (head[2].includes("}")) {
-        recordLibrary(head[1], head[2]);
-      } else {
-        openTable = { alias: head[1], text: "{" + head[2] };
-      }
-    }
+    state = parseCatalogLine(state, rawLine.trim(), versions, libraries);
   }
   return { versions, libraries };
 }
 
 /** Map a `libs.<a>.<b>` accessor path to its catalog alias (dots become dashes, per Gradle). */
 export function resolveCatalogAccessor(catalog: VersionCatalog, accessorPath: string): CatalogLibrary | null {
-  const alias = accessorPath.split(".").join("-");
+  const alias = accessorPath.replaceAll(".", "-");
   return catalog.libraries.get(alias) ?? null;
 }
