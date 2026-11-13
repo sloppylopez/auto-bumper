@@ -37,6 +37,15 @@ function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<vo
   });
 }
 
+/** Direct pom parse. A runner with mvn on PATH otherwise spends the test budget on dependency:tree. */
+function withoutMaven<T>(fn: () => Promise<T>): Promise<T> {
+  const savedPath = process.env.PATH;
+  process.env.PATH = process.platform === "win32" ? "C:\\Windows" : "/nonexistent";
+  return fn().finally(() => {
+    process.env.PATH = savedPath;
+  });
+}
+
 /**
  * Maven project with a netty dep (GHSA-flaggable, absent from the mocked dump) and a log4j-core dep
  * (would trigger the orphan-CVE bridge if supplemental sources were active).
@@ -154,7 +163,7 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL=off", () => {
       globalThis.fetch = ghSaOnlyFetch(hits);
       let result: ScanResult;
       try {
-        result = await runAutoBumperScan(proj, { quiet: true });
+        result = await withoutMaven(() => runAutoBumperScan(proj, { quiet: true }));
       } finally {
         globalThis.fetch = originalFetch;
       }
@@ -181,7 +190,7 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL=off", () => {
       globalThis.fetch = ghSaOnlyFetch(hits);
       let result: ScanResult;
       try {
-        result = await runAutoBumperScan(proj, { quiet: true });
+        result = await withoutMaven(() => runAutoBumperScan(proj, { quiet: true }));
       } finally {
         globalThis.fetch = originalFetch;
       }
@@ -221,7 +230,7 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL unset", () => {
       // loadRepoAdvisories attempts a re-sync.
       fs.writeFileSync(path.join(dbDir, "repo-advisories.since"), "2026-01-01T00:00:00Z");
 
-      const result = await runAutoBumperScan(proj, { quiet: true, offline: true });
+      const result = await withoutMaven(() => runAutoBumperScan(proj, { quiet: true, offline: true }));
       expect(result.findings.some((f) => f.id === "GHSA-q9pg-8h3j-8hvm")).toBe(true);
       // No degraded-advisory warning for a source we intentionally kept.
       expect(result.warnings.some((w) => w.includes("GitHub Maven advisories"))).toBe(false);
