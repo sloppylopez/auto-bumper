@@ -87,6 +87,7 @@
 │  Gates: major (--allow-major) | rename (--allow-renames)            │
 │      unfixable --> --apply-excludes (Maven/Gradle)                  │
 │      no OSV forward fix --> --allow-downgrades (Maven, Gradle)      │
+│  -y / --yes: yes to every gate above, then --apply                  │
 │  --apply: re-scan until clean or stalled (default cap 10)           │
 │    dry-run shows plan; TTY prompts; CI skips risky                  │
 │        │                                                            │
@@ -110,11 +111,13 @@
 
 > ### ⚡ The one command that does it all
 >
-> Don't feel like reading the rest? This single command scans your project (all ecosystems — npm, Rust, Python, Java) and **applies every fix it can make**: patch/minor bumps, **major** version upgrades, dependency **renames** (e.g. Jackson `com.fasterxml.jackson` → `tools.jackson`), and matching **source-code import migrations**. Fully non-interactive — no prompts:
+> Don't feel like reading the rest? This single command scans your project (all ecosystems — npm, Rust, Python, Java) and **applies every fix it can make**: patch/minor bumps, **major** version upgrades, dependency **renames** (e.g. Jackson `com.fasterxml.jackson` → `tools.jackson`), matching **source-code import migrations**, **downgrades** when that is the only GA escape, and **excludes** for packages with no fix. Fully non-interactive — no prompts:
 >
 > ```bash
-> bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades
+> bunx --package @elephantseed/auto-bumper fix -- ./my-project --yes
 > ```
+>
+> `--yes` (short form `-y`) is `--apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades --apply-excludes`. It does not pass `--force-exclude` (those stay refused when other packages still need the library) or `--latest`. `--dry-run` still only prints the plan.
 >
 > Each edited file gets a `.auto-bumper-bak` backup first — review with `git diff` afterwards.
 
@@ -144,6 +147,7 @@ bunx --package @elephantseed/auto-bumper scan -- ./my-project --ecosystem=npm
 bunx --package @elephantseed/auto-bumper scan -- ./my-project --format=json
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --dry-run
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply
+bunx --package @elephantseed/auto-bumper fix -- ./my-project -y
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply --allow-major --allow-renames --allow-source-migrations
 bunx --package @elephantseed/auto-bumper fix -- ./my-project --latest --apply
 bunx --package @elephantseed/auto-bumper update-db
@@ -154,6 +158,7 @@ Windows:
 ```powershell
 bunx --package @elephantseed/auto-bumper scan -- C:\dev\code\my-app
 bunx --package @elephantseed/auto-bumper fix -- C:\dev\code\my-app --dry-run
+bunx --package @elephantseed/auto-bumper fix -- C:\dev\code\my-app -y
 bunx --package @elephantseed/auto-bumper fix -- C:\dev\code\my-app --apply --allow-major --allow-renames --allow-source-migrations
 ```
 
@@ -178,7 +183,7 @@ bun run security:scan -- .
 bun run security:fix -- . --dry-run
 ```
 
-`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain, a downgrade was rolled back, a `--latest` target did not resolve, or a downgrade was left unverified. Add `--strict` to exit 1 in those cases.
+`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Pass `-y` (or `--yes`) to say yes to those plus `--allow-downgrades` and `--apply-excludes` in one flag. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain, a downgrade was rolled back, a `--latest` target did not resolve, or a downgrade was left unverified. Add `--strict` to exit 1 in those cases.
 
 **Unfixable packages** (no fixed version in OSV) are reported, never bumped — except by downgrade. When every finding for a package carries an introduced bound and a published release sits strictly below it, `fix` names that newest GA sub-introduced release as the candidate — pre-releases (SNAPSHOT, milestones, RCs, alpha/beta) and Java build qualifiers (`-bNN`) are never targets: without `--allow-downgrades` (Maven/Gradle) it stays in the Unfixable section as a proposal; with the flag the downgrade is applied (marked ↓), a downgrade crossing a major boundary additionally needs `--allow-major` and is checked against the co-versioned-family rules — refused when the package or any classpath sibling is pinned by the project's own `resolutionStrategy.force` on the old line, otherwise siblings are pulled along to the target line — each touched project is compile-checked (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`) — runtime behavior stays unverified, so run the test suite afterwards — and any bump that breaks the build is rolled back automatically. On Maven, if the pom's required Java release (compiler `<release>`, else `maven.compiler.release`, else `java.version`) is newer than the JDK in `JAVA_HOME`/PATH, that check cannot succeed for reasons unrelated to the downgrade: it is skipped, the downgrade is kept, and the run reports `Unverified downgrades`. Those count toward exit 1 under `--strict`. Re-run with the project's JDK to verify. Add `--apply-excludes` (Maven/Gradle only) to have the tool exclude them from the dependency graph instead — Gradle gets a managed `configurations.all { exclude … }` block; Maven attaches `<exclusion>` to the parent dependency. An exclusion counts only when every touched project actually wrote it: a Maven *direct* dependency cannot be excluded and is reported with manual-removal advice instead of a false success. Excluding a coordinate that other resolved packages still depend on would remove classes from **every** configuration and break class loading, so the tool refuses such exclusions by default (no prompt, no approval — even under `--apply-excludes`) and reports a health warning naming the dependents. The same refusal applies when project source imports that Maven group — the classpath graph does not see direct source usage. Pass `--force-exclude=group:artifact` (repeatable) to accept either risk explicitly.
 
@@ -323,6 +328,7 @@ fix [path] [options]
 | `[path]` | `.` | Project directory |
 | `--dry-run` | false | Show plan without modifying files |
 | `--apply` | false | Write changes, then re-scan until clean or stalled (`--max-iterations`, default 10) |
+| `-y`, `--yes` | false | Say yes to every consent prompt. Same as `--apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades --apply-excludes`. Does not set `--force-exclude` or `--latest`. With `--dry-run`, still only prints the plan |
 | `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back. Requires network (not with `--offline`) |
 | `--allow-major` | false | Skip interactive prompts for major version changes — bumps and downgrades that cross a major boundary |
 | `--allow-downgrades` | false | Maven/Gradle only — apply downgrades for vulnerabilities with no OSV fixed version: the newest published **GA** release strictly below the advisory's introduced bound (project repos, then Maven Central) — pre-releases and Java `-bNN` builds are never targets. Without the flag the target is only proposed in Unfixable. A downgrade crossing a major boundary additionally requires `--allow-major` and respects the co-versioned-family rules: it is refused when the package or any classpath sibling is pinned by the project's own `resolutionStrategy.force` on the old line, otherwise siblings are pulled along to the target line. Each downgrade is compile-checked (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`) — runtime behavior stays unverified, run the test suite — and rolled back automatically if the build fails. On Maven, if the pom requires a newer Java release than the JDK in `JAVA_HOME`/PATH, the check is skipped, the downgrade is kept, and the run reports `Unverified downgrades` (exit 1 under `--strict`); re-run with the project's JDK. Requires network (not with `--offline`) |
@@ -344,7 +350,7 @@ fix [path] [options]
 - Backup discarded after successful full resolution
 - Dry-run mode does not write manifests
 
-**CI note:** non-TTY environments skip interactive prompts. Use `fix --apply` explicitly — `fix` alone in CI only prints the plan and exits.
+**CI note:** non-TTY environments skip interactive prompts. Use `fix --apply` explicitly — `fix` alone in CI only prints the plan and exits. `fix -y` is fully non-interactive in CI too (it turns the consent flags on).
 
 ### `update-db`
 
@@ -513,6 +519,7 @@ The tool returns non-zero exit codes on findings, making it ideal for CI gates:
 # Apply fixes in CI (non-TTY — must pass --apply)
 - name: Apply security fixes
   run: bunx --package @elephantseed/auto-bumper fix -- . --apply --allow-major
+# Every consent gate, still no prompts: bunx --package @elephantseed/auto-bumper fix -- . -y
 ```
 
 Or pipe JSON into custom logic:

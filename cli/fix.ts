@@ -3,7 +3,7 @@
  * Auto-Bumper Fix — Polyglot auto-remediation for Java, npm, Rust, Python.
  *
  * Usage:
- *   fix [path] [--dry-run] [--apply] [--allow-major] [--allow-renames] [--allow-downgrades] [--allow-source-migrations] [--apply-excludes] [--force-exclude=group:artifact] [--latest] [--offline] [options]
+ *   fix [path] [--dry-run] [--apply] [-y|--yes] [--allow-major] [--allow-renames] [--allow-downgrades] [--allow-source-migrations] [--apply-excludes] [--force-exclude=group:artifact] [--latest] [--offline] [options]
  *   bun cli/fix.ts [path] [options]   (local dev)
  */
 import fs from "node:fs";
@@ -110,19 +110,23 @@ import { renameNeedsSourceMigration } from "../src/lib/rename-source-gate.ts";
 import { colorizeFixReport, formatUnresolvableSection, paint, stdoutColorEnabled, uniqueRollbackCount } from "../src/lib/report-color.ts";
 
 const args = process.argv.slice(2);
-const targetPath = args.find(a => !a.startsWith("--")) || ".";
+const yesFlag = args.includes("--yes") || args.includes("-y");
+// -y is a flag, not a path. Every other non-option token is the project directory.
+const targetPath = args.find(a => a !== "-y" && !a.startsWith("--")) || ".";
 if (args.includes("--yolo")) {
   console.error("Error: --yolo was removed. Use --apply. Add --strict to exit 1 if vulnerabilities remain.");
   process.exit(2);
 }
 const dryRun = args.includes("--dry-run");
-const applyFlag = args.includes("--apply");
-const allowMajor = args.includes("--allow-major");
-const allowDowngrades = args.includes("--allow-downgrades");
-const allowRenames = args.includes("--allow-renames");
-const applyExcludes = args.includes("--apply-excludes");
+// -y / --yes says yes to every consent prompt. --dry-run still only prints the plan.
+// Does not imply --force-exclude (those break class loading) or --latest.
+const applyFlag = args.includes("--apply") || (yesFlag && !dryRun);
+const allowMajor = args.includes("--allow-major") || yesFlag;
+const allowDowngrades = args.includes("--allow-downgrades") || yesFlag;
+const allowRenames = args.includes("--allow-renames") || yesFlag;
+const applyExcludes = args.includes("--apply-excludes") || yesFlag;
 const deprecatedJavaImports = args.includes("--allow-java-imports");
-const allowSourceMigrations = args.includes("--allow-source-migrations") || deprecatedJavaImports;
+const allowSourceMigrations = args.includes("--allow-source-migrations") || deprecatedJavaImports || yesFlag;
 if (deprecatedJavaImports) {
   console.error("Warning: --allow-java-imports is deprecated; use --allow-source-migrations");
 }
@@ -2448,7 +2452,7 @@ function reportFinal(ctx: FixLoopContext, finalFindings: Finding[]): never {
   if (ctx.allSkippedUnresolvable.length > 0) logTone(`Rolled back fixes: ${ctx.allSkippedUnresolvable.length} — target version not resolvable from project repositories.`, "33");
   if (ctx.allRolledBackDowngrades.length > 0) logTone(`Rolled back downgrades: ${ctx.allRolledBackDowngrades.length} — build failed after downgrade; original versions kept.`, "33");
   if (ctx.unverifiedDowngrades > 0) logTone(`Unverified downgrades: ${ctx.unverifiedDowngrades} — compile check skipped because this environment cannot build the project; re-run with the project's JDK to verify.`, "33");
-  if (reportApplied.length > 0) logTone("Bumps were applied. Re-run scan to verify, or use --exclude=group:artifact for unfixable OSV noise.", "32");
+  if (reportApplied.length > 0) logTone("Bumps were applied. Re-run scan to verify, or use --exclude=group:artifact for unfixable OSV noise.", "34");
   process.exit((finalFindings.length > 0 || ctx.allSkippedUnresolvable.length > 0 || ctx.allRolledBackDowngrades.length > 0 || ctx.unverifiedDowngrades > 0) && strictExit ? 1 : 0);
 }
 

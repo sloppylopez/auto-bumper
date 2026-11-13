@@ -45,7 +45,8 @@ class EmojiStatus implements Spinner {
   }
 
   warn(text?: string): this {
-    return this.say("\u26a0\ufe0f", text, true);
+    // Two spaces: a Windows console eats the single gap after this emoji, so the count sticks to the triangle.
+    return this.say("\u26a0\ufe0f ", text, true);
   }
 
   private say(mark: string, text: string | undefined, toStderr = false): this {
