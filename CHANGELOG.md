@@ -5,6 +5,7 @@ All notable changes to `@elephantseed/auto-bumper`.
 ## [Unreleased]
 
 ### Added
+- Progress lines on a terminal flip the hourglass between the two hourglass glyphs, twice a second. A new status rewrites that same line, so the glass keeps turning while a counter advances. Piped output and `TERM=dumb` keep one static hourglass per status
 - `fix -y` / `fix --yes` says yes to every consent prompt: same as `--apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades --apply-excludes`. It does not imply `--force-exclude` or `--latest`. `--dry-run` still only prints the plan
 - `fix` now supports Kotlin DSL build files (`build.gradle.kts`) end to end: direct declarations are rewritten in place — string literals, map-style `group = "g", name = "a", version = …` (quoted versions and shared `val`/`def` variables), and `"g:a:${var}"` interpolation — and the managed constraints block is emitted as valid Kotlin
 - Gradle version catalogs (`gradle/libs.versions.toml`) are auto-fixed: `[versions]` aliases (via `version.ref`) and inline `version = "…"` values are bumped in place instead of accumulating pins; the catalog is discovered by walking up from the build file to its build root, so a multi-module subproject bumps the shared root catalog

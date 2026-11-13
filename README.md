@@ -1,7 +1,3 @@
-> ```bash
-> --allow-downgrades
-> ```
-
  ![Auto-Bumper mascot](https://raw.githubusercontent.com/sloppylopez/auto-bumper/main/public/Auto-Bumper%20Mascot%20Logo.png)
 
 # Auto-Bumper
@@ -19,10 +15,25 @@
 | Feature | Detail |
 |---------|--------|
 | **What it does** | Finds vulnerable dependencies → proposes minimal version bumps → edits your manifest files |
-| **How it knows** | Downloads OSV advisory dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/) and keeps them cached locally; reviewed Maven advisories come from the GitHub global advisory list (cached, refreshed by `updated` time, and read again with `--offline`); Snyk's public per-package advisory pages supplement both for Maven and npm packages (one request per unique package, cached 7 days); locally-vendored advisory files in the package `local-advisories/` and in `<project>/local-advisories/` cover disclosures OSV, GitHub, and Snyk have not ingested yet. Set `AUTO_BUMPER_SUPPLEMENTAL=off` (or `0`/`false`, case-insensitive) to disable all supplemental sources and run strictly on the dump + local advisories |
+| **How it knows** | OSV dumps, GitHub's reviewed Maven list, Snyk public pages, and local advisory files. Details below |
 | **Where data lives** | `.auto-bumper/db/` in the target project — `osv/` for advisory caches, `bom/` for platform BOM maps |
-| **Network needed?** | Only to refresh vulnerability data and, for Maven/Gradle, to look up published releases. Each online run sends a lightweight HEAD probe (~ms, no project data) per OSV ecosystem and re-downloads only when the remote dump changed; otherwise the local cache is used (7-day TTL fallback if the probe fails). It also fetches Snyk's public advisory page for each unique Maven/npm package not yet cached (7-day TTL) — package coordinates are sent to Snyk, nothing else. All matching runs against the local DB — your full dependency tree is never sent anywhere. Pass `--offline` to skip even that |
-| **LLM involved?** | No. Fix versions come from advisory metadata (OSV, GitHub, Snyk, and local files). When an advisory has no GA fix, Maven/Gradle can still target a published release (the next version after a last-affected bound, or a downgrade below the introduced bound). `--latest` uses the newest non-prerelease in the project repositories |
+| **Network needed?** | Only to refresh advisory data and, for Maven/Gradle, to look up published releases. `--offline` skips the network. Details below |
+| **LLM involved?** | No. Fix versions come from advisory metadata and, when OSV has no GA fix, from published releases |
+
+**Advisory sources**
+
+- OSV dumps (~few MB per ecosystem, gzipped) from the public [osv.dev GCS bucket](https://google.github.io/osv.dev/data/), cached locally.
+- Reviewed Maven advisories from the GitHub global advisory list. Cached, refreshed by `updated` time, and read again with `--offline`.
+- Snyk's public per-package pages for Maven and npm. One request per unique package, cached 7 days.
+- Local files in the package `local-advisories/` and in `<project>/local-advisories/`, for disclosures the three sources above have not ingested yet.
+- `AUTO_BUMPER_SUPPLEMENTAL=off` (or `0` / `false`, case-insensitive) turns off GitHub, the orphan-CVE bridge, and Snyk. The scan then uses the OSV dump plus local advisories only.
+
+**Network**
+
+- Each online run sends a lightweight HEAD probe (no project data) per OSV ecosystem and re-downloads only when the remote dump changed. If the probe fails, the local cache is used (7-day TTL).
+- Snyk: one public page per unique Maven/npm package not yet cached. Package coordinates are sent. Nothing else. 7-day TTL.
+- Matching runs on the local DB. The full dependency tree is never sent.
+- `--offline` skips the probes too.
 
 ---
 
@@ -111,7 +122,14 @@
 
 > ### ⚡ The one command that does it all
 >
-> Don't feel like reading the rest? This single command scans your project (all ecosystems — npm, Rust, Python, Java) and **applies every fix it can make**: patch/minor bumps, **major** version upgrades, dependency **renames** (e.g. Jackson `com.fasterxml.jackson` → `tools.jackson`), matching **source-code import migrations**, **downgrades** when that is the only GA escape, and **excludes** for packages with no fix. Fully non-interactive — no prompts:
+> Don't feel like reading the rest? One command scans the project (npm, Rust, Python, Java) and applies every fix it can, with no prompts:
+>
+> - Patch and minor bumps
+> - Major upgrades
+> - Dependency renames (for example Jackson `com.fasterxml.jackson` → `tools.jackson`)
+> - Matching source-code import migrations
+> - Downgrades, when that is the only GA escape
+> - Excludes, for a package with no fix
 >
 > ```bash
 > bunx --package @elephantseed/auto-bumper fix -- ./my-project --yes
@@ -123,7 +141,13 @@
 
 > ### 🚀 Want to bring all your Java dependencies up to date?
 >
-> `fix --latest` (Maven/Gradle) goes beyond security fixes — it bumps **every directly declared dependency** to the newest non-prerelease available in the project's repositories (falling back to Maven Central), even when there are zero vulnerabilities. Prereleases/SNAPSHOTS are excluded, qualifier suffixes are preserved (`guava 33.6.0-jre` → `33.7.2-jre`), major bumps still require `--allow-major`, and targets that don't resolve in the project repositories are rolled back automatically instead of breaking the build:
+> `fix --latest` (Maven/Gradle) bumps **every directly declared dependency** to the newest non-prerelease, even when nothing is vulnerable.
+>
+> - Project repositories first, then Maven Central
+> - Prereleases and SNAPSHOTS are skipped
+> - Qualifier suffixes stay (`guava 33.6.0-jre` → `33.7.2-jre`)
+> - A major bump still needs `--allow-major`
+> - A target that does not resolve is rolled back, so the build is not left broken
 >
 > ```bash
 > bunx --package @elephantseed/auto-bumper fix -- ./my-project --latest --dry-run
@@ -183,19 +207,71 @@ bun run security:scan -- .
 bun run security:fix -- . --dry-run
 ```
 
-`fix --dry-run` shows planned bumps/renames. `fix --apply` backs up manifests (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, change with `--max-iterations`). Restores the backup on failure. Majors, coordinate renames, and source migrations still need `--allow-major`, `--allow-renames`, and `--allow-source-migrations`. Pass `-y` (or `--yes`) to say yes to those plus `--allow-downgrades` and `--apply-excludes` in one flag. Later passes prompt again on a TTY unless those flags are set. Exit stays 0 if vulnerabilities remain, a downgrade was rolled back, a `--latest` target did not resolve, or a downgrade was left unverified. Add `--strict` to exit 1 in those cases.
+### Applying a fix
 
-**Unfixable packages** (no fixed version in OSV) are reported, never bumped — except by downgrade. When every finding for a package carries an introduced bound and a published release sits strictly below it, `fix` names that newest GA sub-introduced release as the candidate — pre-releases (SNAPSHOT, milestones, RCs, alpha/beta) and Java build qualifiers (`-bNN`) are never targets: without `--allow-downgrades` (Maven/Gradle) it stays in the Unfixable section as a proposal; with the flag the downgrade is applied (marked ↓), a downgrade crossing a major boundary additionally needs `--allow-major` and is checked against the co-versioned-family rules — refused when the package or any classpath sibling is pinned by the project's own `resolutionStrategy.force` on the old line, otherwise siblings are pulled along to the target line — each touched project is compile-checked (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`) — runtime behavior stays unverified, so run the test suite afterwards — and any bump that breaks the build is rolled back automatically. On Maven, if the pom's required Java release (compiler `<release>`, else `maven.compiler.release`, else `java.version`) is newer than the JDK in `JAVA_HOME`/PATH, that check cannot succeed for reasons unrelated to the downgrade: it is skipped, the downgrade is kept, and the run reports `Unverified downgrades`. Those count toward exit 1 under `--strict`. Re-run with the project's JDK to verify. Add `--apply-excludes` (Maven/Gradle only) to have the tool exclude them from the dependency graph instead — Gradle gets a managed `configurations.all { exclude … }` block; Maven attaches `<exclusion>` to the parent dependency. An exclusion counts only when every touched project actually wrote it: a Maven *direct* dependency cannot be excluded and is reported with manual-removal advice instead of a false success. Excluding a coordinate that other resolved packages still depend on would remove classes from **every** configuration and break class loading, so the tool refuses such exclusions by default (no prompt, no approval — even under `--apply-excludes`) and reports a health warning naming the dependents. The same refusal applies when project source imports that Maven group — the classpath graph does not see direct source usage. Pass `--force-exclude=group:artifact` (repeatable) to accept either risk explicitly.
+- `fix --dry-run` shows the plan. Nothing is written.
+- `fix --apply` backs up each manifest (`.auto-bumper-bak`), writes the plan, and re-scans until clean or stalled (default cap 10, `--max-iterations`). The backup is restored on failure.
+- A major bump, a coordinate rename, or a source migration still needs its own flag: `--allow-major`, `--allow-renames`, `--allow-source-migrations`.
+- `-y` / `--yes` says yes to those three, plus `--allow-downgrades` and `--apply-excludes`.
+- Later passes ask again on a terminal unless those flags are set.
+- Exit stays 0 when vulnerabilities remain, a downgrade was rolled back, a `--latest` target did not resolve, or a downgrade was left unverified. `--strict` exits 1 in those cases.
 
-**OSV fixed versions that are pre-releases** (e.g. `fixed: 9.2.0.Beta1`) are treated as unfixable the same way: never bumped, reported in Unfixable naming the pre-release (`no GA fix available; only pre-release X fixes this`). Accepting one is a manual decision — edit the manifest yourself or exclude the package.
+### Unfixable packages
 
-**Last-affected promotion** (Maven): when an advisory has no `fixed` version but an inclusive last-affected bound, `fix` targets the next published release after that bound. The last-affected version itself stays vulnerable and is never the target. Skipped with `--offline`.
+A package with no fixed version in OSV is reported, not bumped. The two ways out are a downgrade or an exclude.
 
-**Lockfiles:** after `--apply` writes a manifest, the tool refreshes the lock so the next scan sees the new pins: `npm install --package-lock-only --ignore-scripts`, Yarn Berry `yarn install --mode=update-lockfile`, Yarn classic `yarn install --ignore-scripts` (a full install — classic has no lockfile-only mode), `pnpm install --lockfile-only --ignore-scripts`, `bun install --lockfile-only --ignore-scripts`, `cargo update -p <crate>` for each bumped crate, and `poetry lock` (`poetry lock --no-update` on Poetry 1). `--offline` or a failed refresh leaves the lock unchanged; later scans then trust the lockfile and say so. Re-scans also overlay direct deps from `package.json` / `Cargo.toml` so bump loops can progress before that refresh.
+**Downgrade** (Maven/Gradle, `--allow-downgrades`):
 
-`--latest` (Maven/Gradle) bulk-updates every directly declared dependency to its newest non-prerelease in addition to vulnerability fixes — see the 🚀 callout above.
+- Every finding for the package must carry an introduced bound.
+- The candidate is the newest published GA release strictly below that bound.
+- Never a target: SNAPSHOT, milestone, RC, alpha/beta, or a Java `-bNN` build.
+- Without the flag, the candidate stays in the Unfixable section as a proposal. With the flag, it is applied and marked ↓.
+- A downgrade that crosses a major also needs `--allow-major`.
+- Co-versioned family: refused when this package, or any classpath sibling, is pinned by the project's own `resolutionStrategy.force` on the old line. Otherwise those siblings move to the target line.
+- Each touched project is compile-checked (`gradlew compileJava compileTestJava`, or `mvn -DskipTests test-compile`). Runtime behavior is not checked. Run the test suite.
+- A bump that breaks the build is rolled back.
+- Maven: the compile check is skipped when the pom requires a newer Java release than the JDK on `JAVA_HOME` / PATH. The required release is the compiler `<release>`, else `maven.compiler.release`, else `java.version`. That failure is the JDK, not the downgrade.
+- The downgrade is kept, and the run reports `Unverified downgrades`. Those count toward exit 1 under `--strict`. Re-run with the project's JDK.
+- Needs network. Skipped with `--offline`.
 
-**Gradle platforms and BOMs.** On Spring Boot's `io.spring.dependency-management` plugin, non-direct vulnerability pins are written as `dependencyManagement { dependencies { dependency 'g:a:v' } }` entries — force and constraint pins do not beat that plugin. An undeclared `org.springframework.boot` fix rewrites the Spring Boot plugin version instead of pinning one starter. A same-line or cross-minor fix on `spring-boot-dependencies` moves that BOM and, when it still matches, the plugin version. A same-minor Quarkus patch bumps `quarkusPlatformVersion` and `quarkusPluginVersion` instead of pinning one extension off the BOM. Pins at or below the version a platform BOM already manages are dropped as stale (BOM maps are cached under `.auto-bumper/db/bom/` with no TTL). A new bump at or below a BOM-managed version is skipped, except an explicit `--allow-downgrades` target. A failed BOM fetch leaves the run without that cleanup.
+**Exclude** (Maven/Gradle, `--apply-excludes`):
+
+- Gradle writes a managed `configurations.all { exclude … }` block.
+- Maven attaches `<exclusion>` to the parent dependency.
+- It counts only when every touched project wrote it. A Maven direct dependency cannot be excluded. The report then says to remove it by hand, instead of claiming success.
+- Refused by default, with no prompt, even under `--apply-excludes`, when other resolved packages still need the coordinate. Removing it drops classes from every configuration. The health warning names those dependents.
+- The same refusal applies when project source imports that Maven group. The classpath graph does not see a direct source import.
+- `--force-exclude=group:artifact` (repeatable) accepts either risk.
+
+**Pre-release fixes.** An OSV `fixed` version that is itself a pre-release (for example `9.2.0.Beta1`) is unfixable the same way: never bumped. The Unfixable line names it (`no GA fix available; only pre-release X fixes this`). Accepting one is a manual edit, or an exclude.
+
+**Last-affected promotion** (Maven). When an advisory has no `fixed` version but an inclusive last-affected bound, `fix` targets the next published release after that bound. The last-affected version itself stays vulnerable and is never the target. Skipped with `--offline`.
+
+### Lockfiles
+
+After `--apply` writes a manifest, the lock is refreshed so the next scan sees the new pins:
+
+- npm: `npm install --package-lock-only --ignore-scripts`
+- Yarn Berry: `yarn install --mode=update-lockfile`
+- Yarn classic: `yarn install --ignore-scripts` (a full install — classic has no lockfile-only mode)
+- pnpm: `pnpm install --lockfile-only --ignore-scripts`
+- bun: `bun install --lockfile-only --ignore-scripts`
+- cargo: `cargo update -p <crate>` for each bumped crate
+- poetry: `poetry lock` (`poetry lock --no-update` on Poetry 1)
+
+`--offline`, or a failed refresh, leaves the lock unchanged. Later scans then trust the lockfile and say so. Re-scans also overlay direct deps from `package.json` / `Cargo.toml`, so a bump loop can move forward before that refresh.
+
+`--latest` (Maven/Gradle) also bumps every directly declared dependency to its newest non-prerelease. See the callout above.
+
+### Gradle platforms and BOMs
+
+- On Spring Boot's `io.spring.dependency-management` plugin, a non-direct vulnerability pin is written as `dependencyManagement { dependencies { dependency 'g:a:v' } }`. A force or a constraint does not beat that plugin.
+- An undeclared `org.springframework.boot` fix rewrites the Spring Boot plugin version, instead of pinning one starter.
+- A same-line or cross-minor fix on `spring-boot-dependencies` moves that BOM and, when it still matches, the plugin version.
+- A same-minor Quarkus patch bumps `quarkusPlatformVersion` and `quarkusPluginVersion`, instead of pinning one extension off the BOM.
+- A pin at or below the version a platform BOM already manages is dropped as stale. BOM maps are cached under `.auto-bumper/db/bom/` with no TTL.
+- A new bump at or below a BOM-managed version is skipped, except an explicit `--allow-downgrades` target.
+- A failed BOM fetch leaves the run without that cleanup.
 
 After large **coordinate migrations**, later passes may pin transitive deps via managed constraints. Results are deterministic for a fixed OSV cache and resolved dependency tree; Gradle re-resolve can surface new findings mid-run.
 
@@ -214,10 +290,19 @@ Some CVE fixes move to **new Maven coordinates** (new `group:artifact`), not jus
 
 - **Scan** warns when old and new groups from the same migration both appear on the classpath.
 - **Fix** can rename coords (`--allow-renames`), bundles siblings in the same migration cluster, and prints **health warnings** (mixed groups, managed-block excludes, platform pins that should be plugin/BOM bumps).
-- **Co-versioned families** (`jetty`, `netty`, `vertx`, `jackson`): a cross-major bump that would split the family is clamped to the best same-line GA fix, or reported unfixable. When the installed line is end of life (every per-artifact fix is unpublished there), Maven `fix` tries one whole-family migration to the lowest published GA line where no member is affected. Cross-major still needs `--allow-major`. A member whose upstream coordinate was renamed also needs `--allow-renames`. Members with no release on the chosen line stay put. Gradle leaves family alignment to the BOM or platform.
+- **Co-versioned families** (`jetty`, `netty`, `vertx`, `jackson`):
+  - A cross-major bump that would split the family is clamped to the best same-line GA fix, or reported unfixable.
+  - When the installed line is end of life (every per-artifact fix is unpublished there), Maven `fix` tries one whole-family migration to the lowest published GA line where no member is affected.
+  - A cross-major move still needs `--allow-major`. A member whose upstream coordinate was renamed also needs `--allow-renames`.
+  - A member with no release on the chosen line stays put.
+  - Gradle leaves family alignment to the BOM or platform.
 - **Consumer variants:** when a family crosses an ecosystem line, a direct dependency that only publishes a line-specific build is swapped in place (today: `org.wiremock:wiremock` → `org.wiremock:wiremock-jetty12`, same version). Old-coordinate exclusions are attached only to the direct dependencies that still pull the old artifacts in.
 - **Jackson 3** (`com.fasterxml.jackson.core` → `tools.jackson.core`): fix auto-adds global excludes for legacy `com.fasterxml.jackson.core` artifacts and pins `tools.jackson` constraints for transitives.
-- **Source migrations (opt-in):** `--allow-renames` updates dependency declarations only. `--allow-source-migrations` applies known source rewrite rules from migration clusters (Java import prefixes for Jackson today). Dry-run shows **Planned source migrations**. Does **not** migrate full API breaking changes — only known import paths.
+- **Source migrations (opt-in):**
+  - `--allow-renames` updates dependency declarations only.
+  - `--allow-source-migrations` applies known source rewrite rules from migration clusters (Java import prefixes for Jackson today).
+  - Dry-run shows **Planned source migrations**.
+  - This does not migrate a full API break. Only known import paths.
 - **Jackson annotations:** Jackson 3 still uses `com.fasterxml.jackson.core:jackson-annotations` **2.x** on the classpath for `@Json`* — the tool does not exclude or rename that artifact.
 - **Scan clean ≠ ship ready** — after coordinate migrations, health warnings may still mention mixed groups or managed excludes. Always run `gradlew build` / `mvn verify` and your test suite before merge; scan only reflects the resolved tree at scan time.
 
@@ -261,11 +346,14 @@ scan [path] [options]
 | `[path]` | `.` | Directory containing lockfiles |
 | `--format=markdown\|json` | `markdown` | Output format |
 | `--ecosystem=<name>` | *(all)* | Filter: `npm`, `crates.io`, `pypi`, `maven`, `gradle` (Gradle = deps from `build.gradle` via `gradlew`) |
-
-**Gradle scan scope:** `runtimeClasspath` + `testRuntimeClasspath` via `gradlew dependencies` (285 pkgs typical Spring app). Not scanned: Gradle plugin classpath, custom configs (e.g. `jaxb` in applied scripts), `annotationProcessor` deps. `scan` and `fix` use the same two configurations.
 | `--exclude=<name>` | *(none)* | Package coordinate to drop from findings (repeatable). Same flag as `fix` |
 | `--offline` | false | No network access at all; use cached advisory DB only |
 | `--json` | — | Deprecated alias for `--format=json` (prints a warning) |
+
+**Gradle scan scope.** `scan` and `fix` use the same two configurations:
+
+- Scanned: `runtimeClasspath` and `testRuntimeClasspath`, via `gradlew dependencies`
+- Not scanned: the Gradle plugin classpath, custom configurations (for example `jaxb` in an applied script), and `annotationProcessor` dependencies
 
 **Exit codes:**
 
@@ -331,15 +419,15 @@ fix [path] [options]
 | `-y`, `--yes` | false | Say yes to every consent prompt. Same as `--apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades --apply-excludes`. Does not set `--force-exclude` or `--latest`. With `--dry-run`, still only prints the plan |
 | `--latest` | false | Maven/Gradle only — also bump every directly declared dependency to its newest non-prerelease (project repos, then Maven Central). Majors still need `--allow-major`; unresolvable targets roll back. Requires network (not with `--offline`) |
 | `--allow-major` | false | Skip interactive prompts for major version changes — bumps and downgrades that cross a major boundary |
-| `--allow-downgrades` | false | Maven/Gradle only — apply downgrades for vulnerabilities with no OSV fixed version: the newest published **GA** release strictly below the advisory's introduced bound (project repos, then Maven Central) — pre-releases and Java `-bNN` builds are never targets. Without the flag the target is only proposed in Unfixable. A downgrade crossing a major boundary additionally requires `--allow-major` and respects the co-versioned-family rules: it is refused when the package or any classpath sibling is pinned by the project's own `resolutionStrategy.force` on the old line, otherwise siblings are pulled along to the target line. Each downgrade is compile-checked (`gradlew compileJava compileTestJava` / `mvn -DskipTests test-compile`) — runtime behavior stays unverified, run the test suite — and rolled back automatically if the build fails. On Maven, if the pom requires a newer Java release than the JDK in `JAVA_HOME`/PATH, the check is skipped, the downgrade is kept, and the run reports `Unverified downgrades` (exit 1 under `--strict`); re-run with the project's JDK. Requires network (not with `--offline`) |
+| `--allow-downgrades` | false | Maven/Gradle. Apply a GA downgrade when OSV has no fixed version. Rules are under **Unfixable packages**. Needs network (not with `--offline`) |
 | `--allow-renames` | false | Skip prompts for Maven coordinate renames (group:artifact migrations from OSV / known group moves) |
 | `--allow-source-migrations` | false | Apply known source rewrites for applied rename clusters (Java, JS/TS, Python, Rust) |
 | `--ecosystem=<name>` | *(all)* | Limit to one ecosystem |
 | `--max-iterations=N` | `10` | Safety cap on apply re-scan loops |
 | `--strict` | false | Exit `1` when vulnerabilities remain, a downgrade was rolled back, a `--latest` target did not resolve, or a downgrade was left unverified |
 | `--exclude=group:pkg` | *(none)* | Packages to skip (repeatable) |
-| `--apply-excludes` | false | Maven/Gradle only — exclude unfixable packages (no fixed version) from the dependency graph: Gradle gets a managed `configurations.all { exclude … }` block, Maven attaches `<exclusion>` to the parent dependency. Recorded only when every touched project wrote it; a Maven direct dependency cannot be excluded and is reported instead |
-| `--force-exclude=group:artifact` | *(none)* | Maven/Gradle only — allow excluding an unfixable package that other resolved packages depend on, or that project source imports (repeatable). Without it, such exclusions are refused with a health warning naming the dependents or the importing files, because removing the coordinate breaks class loading or compilation |
+| `--apply-excludes` | false | Maven/Gradle. Exclude an unfixable package from the graph. Rules are under **Unfixable packages** |
+| `--force-exclude=group:artifact` | *(none)* | Maven/Gradle, repeatable. Allow an exclude the tool would otherwise refuse. See **Unfixable packages** |
 | `--offline` | false | No network access during re-scans |
 | `--format=markdown\|json` | `markdown` | Output format |
 
@@ -371,7 +459,11 @@ update-db [--ecosystem=<name>]
 3. Stores as gzip-compressed JSON (~few MB per ecosystem)
 4. Falls back to cached data if download fails (never breaks your workflow)
 
-**Cache location:** all caches (OSV dumps, the GitHub advisory mirror, its sync cursor, Snyk pages, and platform BOM maps) live in `<target project>/.auto-bumper/` — the CLI changes into the target directory first, so each project keeps its own copy. Override with `AUTO_BUMPER_CACHE_DIR=<dir>`. A GitHub mirror interrupted mid-download is kept as a partial cache and completed on the next run.
+**Cache location.** OSV dumps, the GitHub advisory mirror and its sync cursor, Snyk pages, and platform BOM maps all live in `<target project>/.auto-bumper/`.
+
+- The CLI changes into the target directory first, so each project keeps its own copy.
+- Override with `AUTO_BUMPER_CACHE_DIR=<dir>`.
+- A GitHub mirror interrupted mid-download is kept as a partial cache and finished on the next run.
 
 ---
 
@@ -385,9 +477,15 @@ update-db [--ecosystem=<name>]
 | **Java (Maven)** | `pom.xml` | `pom.xml` | Via `mvn dependency:tree` (requires `mvn`/`mvnw` on PATH) |
 | **Java (Gradle)** | `build.gradle`, `build.gradle.kts` | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | Via `gradlew dependencies` (requires `gradlew` present) |
 
-**Gradle version catalogs:** the default `libs` catalog (`gradle/libs.versions.toml`) is auto-fixed — `[versions]` aliases (via `version.ref`) and inline `version = "…"` values are bumped in place instead of accumulating pins. A multi-module subproject resolves its catalog by walking up to the build root (the directory holding `settings.gradle[.kts]` or the wrapper), so shared catalogs are bumped where they live. Kotlin `libs.x.y` accessor dependencies and `"g:a:${libs.versions.x}"` version refs are scanned through that catalog, so catalog-driven builds report their dependencies even without a resolved classpath tree.
+**Gradle version catalogs.** The default `libs` catalog (`gradle/libs.versions.toml`) is auto-fixed:
 
-**Nested projects:** manifests below the scan root are included — `pom.xml`, `build.gradle` / `build.gradle.kts`, `package.json`, `Cargo.toml`, `pyproject.toml`, `requirements.txt`. Root files stay parsed by the top-level scan. Skipped directories: `node_modules`, `target`, `build`, `dist`, `out`, `vendor`, plus `.git`, `.gradle`, `.idea`, and `.auto-bumper`.
+- A `[versions]` alias (via `version.ref`) and an inline `version = "…"` are bumped in place, instead of accumulating pins.
+- A multi-module subproject finds the catalog by walking up to the build root (the directory with `settings.gradle[.kts]` or the wrapper). A shared catalog is bumped where it lives.
+- Kotlin `libs.x.y` accessors and `"g:a:${libs.versions.x}"` version refs are read from that catalog, so a catalog-driven build is scanned even without a resolved classpath tree.
+
+**Nested projects.** Manifests below the scan root are included: `pom.xml`, `build.gradle` / `build.gradle.kts`, `package.json`, `Cargo.toml`, `pyproject.toml`, `requirements.txt`. Root files stay with the top-level scan.
+
+Skipped directories: `node_modules`, `target`, `build`, `dist`, `out`, `vendor`, plus `.git`, `.gradle`, `.idea`, and `.auto-bumper`.
 
 ### Deduplication rules
 
@@ -468,11 +566,26 @@ const npmOnly = await runAutoBumperScan("/path/to/project", {
 - **Location:** The CLI changes into the target directory first, so caches live in `<target>/.auto-bumper/`. Override with `AUTO_BUMPER_CACHE_DIR=<dir>`
 - **Format:** Gzip-compressed JSON arrays of OSV advisory entries
 - **Freshness:** every online run HEAD-probes each remote dump by ETag — if the remote object changed since the cache was written, it is re-downloaded immediately; otherwise the local cache is used. If the probe fails (no network), the 7-day TTL applies (configurable via `CACHE_TTL_MS` constant)
-- **GitHub Maven advisories:** reviewed advisories from the GitHub global advisory API (`ecosystem=maven`), cached as `repo-advisories.json.gz`. The first online refresh downloads the list. Later refreshes send `updated>=` the timestamp in `repo-advisories.since`, plus a withdrawn pass so revoked ids drop out of the cache. The request does not include project package names. A failed fetch keeps the last cache and does not move the cursor. Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the unauthenticated rate limit (the first full pull is many pages). A rejected token is retried once anonymously, and later requests in that run stay anonymous. `--offline` reads that cache and does not call GitHub
-- **Snyk public advisories (Maven + npm):** for every unique scanned Maven/npm package, Snyk's public per-package advisory page is fetched once and cached under `snyk/` with a 7-day TTL (a package absent from Snyk's database is cached as empty). Advisories are converted to OSV format — id is the first CVE alias when present, otherwise the SNYK id; the same CVE on several packages keeps every affected package. Severity uses the page's numeric CVSS score when present, otherwise critical/high/medium/low map to 9.0/7.5/4.0/3.0, and a missing label maps to 3.0. A failed fetch serves the stale cache when one exists (logged, no warning); with no cache at all the affected packages are reported as a single warning, those packages go unmatched, and the scan is marked incomplete so `fix` will not report a clean result. `--offline` reads the caches without fetching; never-fetched packages produce a "cache missing" warning
+- **GitHub Maven advisories.** Reviewed advisories from the GitHub global advisory API (`ecosystem=maven`), cached as `repo-advisories.json.gz`.
+  - The first online refresh downloads the list.
+  - Later refreshes send `updated>=` the timestamp in `repo-advisories.since`, plus a withdrawn pass so revoked ids drop out of the cache.
+  - The request does not include project package names.
+  - A failed fetch keeps the last cache and does not move the cursor.
+  - `GITHUB_TOKEN` or `GH_TOKEN` raises the unauthenticated rate limit. The first full pull is many pages. A rejected token is retried once anonymously, and later requests in that run stay anonymous.
+  - `--offline` reads the cache and does not call GitHub.
+- **Snyk public advisories (Maven and npm).** One public page per unique scanned package, cached under `snyk/` for 7 days. A package absent from Snyk is cached as empty.
+  - Converted to OSV. The id is the first CVE alias when one exists, otherwise the SNYK id. The same CVE on several packages keeps every affected package.
+  - Severity uses the page's numeric CVSS score when present. Otherwise critical / high / medium / low map to 9.0 / 7.5 / 4.0 / 3.0. A missing label maps to 3.0.
+  - A failed fetch serves the stale cache when one exists (logged, no warning).
+  - With no cache at all, those packages are one warning, they go unmatched, and the scan is incomplete, so `fix` will not report a clean result.
+  - `--offline` reads the caches and does not fetch. A never-fetched package produces a "cache missing" warning.
 - **Fallback strategy:** Stale cache > no cache. If download fails, uses whatever is cached
 - **Disk usage:** OSV dumps are ~8MB across all four ecosystems. Each platform BOM adds one small JSON file under `bom/` (`<group>__<artifact>__<version>.json`), kept with no TTL
-- **Local vendored advisories:** disclosures not yet in the OSV bulk dump can be added as OSV-format JSON files under `<packageRoot>/local-advisories/` (shipped with this package) and under `<project>/local-advisories/` (the repo you scan). A project file with the same advisory id replaces the packaged copy. Loaded on every scan, works offline, never fetched
+- **Local vendored advisories.** Disclosures not yet in the OSV bulk dump can be added as OSV-format JSON.
+  - Shipped copies live in `<packageRoot>/local-advisories/`.
+  - Project copies live in `<project>/local-advisories/`.
+  - A project file with the same advisory id replaces the packaged copy.
+  - Loaded on every scan. Works offline. Never fetched.
 
 ---
 
