@@ -1,4 +1,8 @@
-![Auto-Bumper mascot](https://raw.githubusercontent.com/sloppylopez/auto-bumper/main/public/Auto-Bumper%20Mascot%20Logo.png)
+> ```bash
+> --allow-downgrades
+> ```
+
+ ![Auto-Bumper mascot](https://raw.githubusercontent.com/sloppylopez/auto-bumper/main/public/Auto-Bumper%20Mascot%20Logo.png)
 
 # Auto-Bumper
 
@@ -109,7 +113,7 @@
 > Don't feel like reading the rest? This single command scans your project (all ecosystems — npm, Rust, Python, Java) and **applies every fix it can make**: patch/minor bumps, **major** version upgrades, dependency **renames** (e.g. Jackson `com.fasterxml.jackson` → `tools.jackson`), and matching **source-code import migrations**. Fully non-interactive — no prompts:
 >
 > ```bash
-> bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply --allow-major --allow-renames --allow-source-migrations
+> bunx --package @elephantseed/auto-bumper fix -- ./my-project --apply --allow-major --allow-renames --allow-source-migrations --allow-downgrades
 > ```
 >
 > Each edited file gets a `.auto-bumper-bak` backup first — review with `git diff` afterwards.
