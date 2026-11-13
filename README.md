@@ -367,9 +367,9 @@ update-db [--ecosystem=<name>]
 | **Rust** | `Cargo.lock` | `Cargo.toml` | Built-in (lockfile has full tree) |
 | **Python** | `requirements.txt`, `poetry.lock` | `requirements.txt`, `pyproject.toml` | Built-in (lockfile has full tree) |
 | **Java (Maven)** | `pom.xml` | `pom.xml` | Via `mvn dependency:tree` (requires `mvn`/`mvnw` on PATH) |
-| **Java (Gradle)** | `build.gradle`, `build.gradle.kts` | `build.gradle` (Groovy only) | Via `gradlew dependencies` (requires `gradlew` present) |
+| **Java (Gradle)** | `build.gradle`, `build.gradle.kts` | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | Via `gradlew dependencies` (requires `gradlew` present) |
 
-**Not supported yet:** auto-fix for `build.gradle.kts` (it is scanned, but edits target Groovy `build.gradle`), `libs.versions.toml`, Gradle version catalogs.
+**Gradle version catalogs:** the default `libs` catalog (`gradle/libs.versions.toml`) is auto-fixed — `[versions]` aliases (via `version.ref`) and inline `version = "…"` values are bumped in place instead of accumulating pins. A multi-module subproject resolves its catalog by walking up to the build root (the directory holding `settings.gradle[.kts]` or the wrapper), so shared catalogs are bumped where they live. Kotlin `libs.x.y` accessor dependencies and `"g:a:${libs.versions.x}"` version refs are scanned through that catalog, so catalog-driven builds report their dependencies even without a resolved classpath tree.
 
 **Nested projects:** manifests below the scan root are included — `pom.xml`, `build.gradle` / `build.gradle.kts`, `package.json`, `Cargo.toml`, `pyproject.toml`, `requirements.txt`. Root files stay parsed by the top-level scan. Skipped directories: `node_modules`, `target`, `build`, `dist`, `out`, `vendor`, plus `.git`, `.gradle`, `.idea`, and `.auto-bumper`.
 

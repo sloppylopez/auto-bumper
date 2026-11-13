@@ -10,6 +10,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { findVersionCatalog } from "./gradle-catalog.ts";
 import { compareMavenVersion } from "./matcher.ts";
 import {
   isJackson3AnnotationsCoord,
@@ -154,6 +155,23 @@ function rewriteDirect(
     changed = true;
     return `${pre}${bump.targetVersion}${close}`;
   });
+
+  // 2b. Map style with an unquoted version variable: group = "g", name = "a", version = myVar
+  //     (Kotlin idiom; Groovy allows it too). Bump the def/val in place like case 3.
+  const varMapRe = new RegExp(
+    String.raw`group\s*[:=]\s*(["'])${g}\1\s*,\s*name\s*[:=]\s*(["'])${a}\2\s*,\s*version\s*[:=]\s+([A-Za-z_]\w*)`,
+    "g",
+  );
+  for (const vm of content.matchAll(varMapRe)) {
+    const varName = vm[3]!;
+    const defRe = new RegExp(String.raw`((?:def|val)\s+${escapeRegex(varName)}\s*=\s*["'])([^"']+)(["'])`);
+    if (!defRe.test(content)) continue; // not a local variable — the managed pin enforces it
+    content = content.replace(defRe, (m, pre, oldVer, close) => {
+      if (compareMavenVersion(oldVer, bump.targetVersion) >= 0) return m;
+      changed = true;
+      return `${pre}${bump.targetVersion}${close}`;
+    });
+  }
 
   // 3. Version variable: "group:artifact:${someVersion}" -> bump `def someVersion = "..."`
   const varResult = rewriteSharedVariable(content, bump.packageName, bump.targetVersion, warnings);
@@ -1755,15 +1773,6 @@ function mergePinsToEffective(
   return [...pins.values()];
 }
 
-function catalogFileFor(buildFile: string): string | null {
-  const dir = path.dirname(buildFile);
-  for (const rel of ["gradle/libs.versions.toml", "libs.versions.toml"]) {
-    const candidate = path.join(dir, rel);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
 function replaceTomlAlias(content: string, alias: string, version: string): string | null {
   const lines = content.split("\n");
   let inVersions = false;
@@ -1786,9 +1795,13 @@ function replaceTomlAlias(content: string, alias: string, version: string): stri
   return changed ? lines.join("\n") : null;
 }
 
-/** Bump gradle/libs.versions.toml entries that point at these coordinates. */
+/**
+ * Bump libs.versions.toml entries that point at these coordinates. The catalog is discovered by
+ * walking up from the build file to its build root, so a multi-module subproject bumps the shared
+ * root catalog instead of accumulating pins in its own build file.
+ */
 function applyCatalogBumps(buildFile: string, bumps: BumpRequest[]): string[] {
-  const tomlPath = catalogFileFor(buildFile);
+  const tomlPath = findVersionCatalog(buildFile);
   if (!tomlPath || bumps.length === 0) return [];
   let content = fs.readFileSync(tomlPath, "utf-8");
   const changed: string[] = [];

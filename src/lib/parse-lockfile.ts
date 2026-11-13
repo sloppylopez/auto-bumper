@@ -6,6 +6,7 @@ import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { findVersionCatalog, parseVersionCatalog, resolveCatalogAccessor } from "./gradle-catalog.ts";
 import type { PackageRef } from "./types.ts";
 
 export interface ParseResult {
@@ -1897,6 +1898,14 @@ export function parseBuildGradleDirect(filePath: string): ParseResult {
     versionVars[m[1]] = m[2];
   }
 
+  // Version catalog (libs.versions.toml): its [versions] entries back `${libs.versions.x}` refs in
+  // the interpolation paths below, and its [libraries] entries back `libs.x.y` accessor deps.
+  const catalogPath = findVersionCatalog(filePath);
+  const catalog = catalogPath ? parseVersionCatalog(catalogPath) : null;
+  if (catalog) {
+    for (const [alias, ver] of catalog.versions) versionVars[`libs.versions.${alias}`] = ver;
+  }
+
   // Extract exclude blocks - skip excluded group:module pairs (Groovy + Kotlin)
   const excludes = collectGradleExcludes(content);
 
@@ -1917,6 +1926,18 @@ export function parseBuildGradleDirect(filePath: string): ParseResult {
       version = versionVars[version.slice(1)] || null;
     }
     recordGradleDep(packages, filePath, match[1].trim(), match[2].trim(), version, excludes, seen);
+  }
+
+  // Kotlin catalog accessors: implementation(libs.jackson.core) — the coordinate exists only in
+  // the TOML. Only matches that resolve to a [libraries] entry are recorded, which filters out
+  // versions/bundles/category accessors (no library under those aliases).
+  if (catalog) {
+    for (const m of content.matchAll(/\blibs\.([a-z0-9]+(?:\.[a-z0-9]+)+)/g)) {
+      const lib = resolveCatalogAccessor(catalog, m[1]);
+      if (!lib || !lib.version) continue;
+      const [group, name] = lib.module.split(":");
+      if (group && name) recordGradleDep(packages, filePath, group, name, lib.version, excludes, seen);
+    }
   }
 
   if (packages.length === 0) {
