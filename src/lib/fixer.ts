@@ -127,7 +127,7 @@ function minimalFixForFinding(finding: Finding): string | null {
 function sameMajorFixForFinding(finding: Finding): string | undefined {
   const installedMajor = majorOf(finding.installedVersion);
   const sameMajor = gaCandidatesAboveInstalled(finding).filter(v => majorOf(v) === installedMajor);
-  return sameMajor.length > 0 ? sameMajor[sameMajor.length - 1] : undefined;
+  return sameMajor.length > 0 ? sameMajor.at(-1) : undefined;
 }
 
 /** Max same-major fix across findings — the fallback target when a cross-major bump is clamped. */
@@ -169,6 +169,9 @@ export function familyOf(packageName: string): { name: string; prefix: string } 
   return best;
 }
 
+/** Classpath package fields the fix plan needs from a finding. */
+type ClasspathFields = "packageName" | "installedVersion" | "ecosystem";
+
 /**
  * Co-versioned-family consistency guard. A cross-major target is only allowed when every
  * classpath sibling of the same family also moves to that major in this pass; otherwise the
@@ -177,7 +180,7 @@ export function familyOf(packageName: string): { name: string; prefix: string } 
  */
 export function applyFamilyConsistency(
   plan: FixPlan,
-  classpath: ReadonlyArray<Pick<Finding, "packageName" | "installedVersion" | "ecosystem">>,
+  classpath: ReadonlyArray<Pick<Finding, ClasspathFields>>,
 ): FixPlan {
   const plannedMajor = new Map<string, number>();
   for (const c of plan.fixable) {
@@ -194,27 +197,9 @@ export function applyFamilyConsistency(
         const siblings = classpath.filter(
           p => p.ecosystem === "maven" && p.packageName !== c.packageName && familyOf(p.packageName)?.name === fam.name,
         );
-        if (siblings.length > 0) {
-          const targetMajor = majorOf(c.targetVersion);
-          const split = siblings.some(s => plannedMajor.get(s.packageName) !== targetMajor && !renamedAway.has(s.packageName));
-          if (split) {
-            if (c.sameMajorTarget !== undefined) {
-              fixable.push({
-                ...c,
-                targetVersion: c.sameMajorTarget,
-                isMajor: false,
-                familyClamped: `clamped to ${c.sameMajorTarget}: cross-major ${c.targetVersion} would split family '${fam.name}' (siblings on ${majorOf(c.installedVersion)}.x not moving in this pass)`,
-              });
-              continue;
-            }
-            unfixable.push({
-              ...c,
-              targetVersion: null,
-              isMajor: false,
-              familyClamped: `no fix on installed line; cross-major ${c.targetVersion} would split family '${fam.name}' (siblings not moving)`,
-            });
-            continue;
-          }
+        if (siblings.length > 0 && splitsFamily(siblings, plannedMajor, renamedAway, majorOf(c.targetVersion))) {
+          clampFamilySplit(c, fam.name, fixable, unfixable);
+          continue;
         }
       }
     }
@@ -224,6 +209,40 @@ export function applyFamilyConsistency(
   fixable.sort(bySeverityDesc);
   unfixable.sort(bySeverityDesc);
   return { ...plan, fixable, unfixable };
+}
+
+/** True when a classpath sibling of the family does not move to the target major in this pass. */
+function splitsFamily(
+  siblings: ReadonlyArray<Pick<Finding, ClasspathFields>>,
+  plannedMajor: ReadonlyMap<string, number>,
+  renamedAway: ReadonlySet<string>,
+  targetMajor: number,
+): boolean {
+  return siblings.some(s => plannedMajor.get(s.packageName) !== targetMajor && !renamedAway.has(s.packageName));
+}
+
+/** Clamp a would-be family-splitting candidate to its same-line fix, or demote it to unfixable. */
+function clampFamilySplit(
+  c: FixCandidate,
+  famName: string,
+  fixable: FixCandidate[],
+  unfixable: FixCandidate[],
+): void {
+  if (c.sameMajorTarget !== undefined) {
+    fixable.push({
+      ...c,
+      targetVersion: c.sameMajorTarget,
+      isMajor: false,
+      familyClamped: `clamped to ${c.sameMajorTarget}: cross-major ${c.targetVersion} would split family '${famName}' (siblings on ${majorOf(c.installedVersion)}.x not moving in this pass)`,
+    });
+    return;
+  }
+  unfixable.push({
+    ...c,
+    targetVersion: null,
+    isMajor: false,
+    familyClamped: `no fix on installed line; cross-major ${c.targetVersion} would split family '${famName}' (siblings not moving)`,
+  });
 }
 
 /** A co-versioned family on the classpath that needs a coherent whole-family move decision. */
@@ -243,7 +262,7 @@ export interface FamilyMigration {
  * decided by the caller, which has the published-version lists.
  */
 export function planFamilyMigrations(
-  classpath: ReadonlyArray<Pick<Finding, "packageName" | "installedVersion" | "ecosystem">>,
+  classpath: ReadonlyArray<Pick<Finding, ClasspathFields>>,
   findings: Finding[],
 ): FamilyMigration[] {
   const affected = new Set(findings.filter(f => f.ecosystem === "maven").map(f => f.packageName));
@@ -264,18 +283,27 @@ export function planFamilyMigrations(
     const memberSet = new Set(members.map(p => p.packageName));
     const installedMajors = [...new Set(members.map(p => majorOf(p.installedVersion)))];
     const base = Math.max(...installedMajors);
-    const lines = new Set<number>([base, base + 1]);
-    for (const f of findings) {
-      if (!memberSet.has(f.packageName) || f.ecosystem !== "maven") continue;
-      for (const v of f.fixedVersions || []) {
-        if (isPreReleaseOrSnapshot(v)) continue;
-        const m = majorOf(v);
-        if (m > base) lines.add(m);
-      }
-    }
-    out.push({ familyName: name, memberPackages: [...memberSet], linesToTry: [...lines].sort((a, b) => a - b) });
+    out.push({ familyName: name, memberPackages: [...memberSet], linesToTry: familyLines(base, memberSet, findings) });
   }
   return out;
+}
+
+/** Candidate target major lines for a family: the newest installed line plus every GA fix major above it. */
+function familyLines(
+  base: number,
+  memberSet: ReadonlySet<string>,
+  findings: Finding[],
+): number[] {
+  const lines = new Set<number>([base, base + 1]);
+  for (const f of findings) {
+    if (!memberSet.has(f.packageName) || f.ecosystem !== "maven") continue;
+    for (const v of f.fixedVersions || []) {
+      if (isPreReleaseOrSnapshot(v)) continue;
+      const m = majorOf(v);
+      if (m > base) lines.add(m);
+    }
+  }
+  return [...lines].sort((a, b) => a - b);
 }
 
 /**
@@ -288,7 +316,7 @@ export function planFamilyMigrations(
 export function buildFixPlan(
   findings: Finding[],
   advisories: AdvisoryEntry[] = [],
-  classpath?: ReadonlyArray<Pick<Finding, "packageName" | "installedVersion" | "ecosystem">>,
+  classpath?: ReadonlyArray<Pick<Finding, ClasspathFields>>,
 ): FixPlan {
   const byPackage = new Map<string, Finding[]>();
   for (const f of findings) {

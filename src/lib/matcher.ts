@@ -141,6 +141,20 @@ interface AffectedResult {
   introduced?: string;
 }
 
+/** Exact-list match, merged with the same block's window bounds when they carry them. Null when not an exact match. */
+function mergeExactWithRanges(cleanVersion: string, affected: any, eco: string): AffectedResult | null {
+  const exactResult = tryExactVersion(cleanVersion, affected);
+  if (!exactResult.isAffected) return null;
+  // The flat list decides matching; the same block's ranges still carry the window
+  // bounds the downgrade planner needs. Dropping them loses the introduced bound and
+  // no safe downgrade can ever be proposed for this finding.
+  const rangeResult = tryRanges(cleanVersion, affected, eco);
+  if (rangeResult.isAffected && (rangeResult.introduced || rangeResult.lastAffected)) {
+    return { ...exactResult, introduced: rangeResult.introduced, lastAffected: rangeResult.lastAffected };
+  }
+  return exactResult;
+}
+
 /** Check if a specific version falls within the affected range of an OSV entry */
 function checkAffected(packageName: string, version: string, ecosystem: string, entry: any): AffectedResult {
   const cleanVersion = version.replace(/^v/, "").replace(/^[~^]/, "");
@@ -153,17 +167,8 @@ function checkAffected(packageName: string, version: string, ecosystem: string, 
     if (!isSamePackage(pkgNameNorm, affected, eco)) continue;
 
     // Try exact version list — an explicit vendor statement, never excluded
-    const exactResult = tryExactVersion(cleanVersion, affected);
-    if (exactResult.isAffected) {
-      // The flat list decides matching; the same block's ranges still carry the window
-      // bounds the downgrade planner needs. Dropping them loses the introduced bound and
-      // no safe downgrade can ever be proposed for this finding.
-      const rangeResult = tryRanges(cleanVersion, affected, eco);
-      if (rangeResult.isAffected && (rangeResult.introduced || rangeResult.lastAffected)) {
-        return { ...exactResult, introduced: rangeResult.introduced, lastAffected: rangeResult.lastAffected };
-      }
-      return exactResult;
-    }
+    const exactMatch = mergeExactWithRanges(cleanVersion, affected, eco);
+    if (exactMatch) return exactMatch;
 
     // GHSA-curated advisories state affected versions explicitly; their auto-derived
     // ECOSYSTEM ranges are coarse bounds that over-cover backported lines (e.g. fixed
@@ -292,6 +297,17 @@ function keepVersionEvents(seq: EcoEvent[]): EcoEvent[] {
   );
 }
 
+/** Try each extracted_events sequence as an independent window; first match wins. */
+function tryExtractedSequences(version: string, sequences: EcoEvent[][], useVersionEvents: boolean, eco: string): AffectedResult {
+  for (const seq of sequences) {
+    const usable = useVersionEvents ? keepVersionEvents(seq) : seq;
+    if (usable.length === 0) continue; // no version data in this window → cannot prove impact
+    const result = matchesEcosystemEvents(version, usable, eco);
+    if (result.isAffected) return result;
+  }
+  return { isAffected: false };
+}
+
 /** Match against ECOSYSTEM or GIT event-based ranges */
 function tryEventRange(version: string, range: { type?: string; events?: unknown[]; database_specific?: { extracted_events?: unknown[] } }, eco: string): AffectedResult {
   if (!range.events || !(range.type === "ECOSYSTEM" || range.type === "GIT")) return { isAffected: false };
@@ -301,13 +317,7 @@ function tryEventRange(version: string, range: { type?: string; events?: unknown
   // window; the version is affected when any one of them matches.
   const sequences = extractedEventSequences(range);
   if (sequences.length > 0) {
-    for (const seq of sequences) {
-      const usable = range.type === "ECOSYSTEM" ? keepVersionEvents(seq) : seq;
-      if (usable.length === 0) continue; // no version data in this window → cannot prove impact
-      const result = matchesEcosystemEvents(version, usable, eco);
-      if (result.isAffected) return result;
-    }
-    return { isAffected: false };
+    return tryExtractedSequences(version, sequences, range.type === "ECOSYSTEM", eco);
   }
 
   let eventsToUse = (range.events as EcoEvent[]) ?? [];

@@ -34,37 +34,38 @@ function profilesTagAt(content: string, index: number): { close: boolean; end: n
   return { close: close || content[gt - 1] === "/", end: gt + 1 };
 }
 
+/** End index of a `<!-- -->` or `<![CDATA[ ]]>` section starting at `i`; null when neither. */
+function skipXmlSection(xml: string, i: number): number | null {
+  if (xml.startsWith("<!--", i)) {
+    const end = xml.indexOf("-->", i + 4);
+    return end === -1 ? xml.length : end + 3;
+  }
+  if (xml.startsWith("<![CDATA[", i)) {
+    const end = xml.indexOf("]]>", i + 9);
+    return end === -1 ? xml.length : end + 3;
+  }
+  return null;
+}
+
 /** Drop every `<profiles>` section. Activation is not evaluated. Comments and CDATA do not end the section. */
 function stripProfiles(xml: string): string {
   let out = "";
   let i = 0;
   let depth = 0;
   while (i < xml.length) {
-    if (xml.startsWith("<!--", i)) {
-      const end = xml.indexOf("-->", i + 4);
-      const next = end === -1 ? xml.length : end + 3;
-      if (depth === 0) out += xml.slice(i, next);
-      i = next;
-      continue;
-    }
-    if (xml.startsWith("<![CDATA[", i)) {
-      const end = xml.indexOf("]]>", i + 9);
-      const next = end === -1 ? xml.length : end + 3;
-      if (depth === 0) out += xml.slice(i, next);
-      i = next;
+    const skip = skipXmlSection(xml, i);
+    if (skip !== null) {
+      out += depth === 0 ? xml.slice(i, skip) : "";
+      i = skip;
       continue;
     }
     const tag = xml[i] === "<" ? profilesTagAt(xml, i) : null;
     if (!tag) {
-      if (depth === 0) out += xml[i];
+      out += depth === 0 ? xml[i]! : "";
       i++;
       continue;
     }
-    if (tag.close) {
-      if (depth > 0) depth--;
-    } else {
-      depth++;
-    }
+    depth = tag.close ? Math.max(0, depth - 1) : depth + 1;
     i = tag.end;
   }
   return out;

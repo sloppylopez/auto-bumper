@@ -1258,61 +1258,81 @@ function matchesCoordShape(token: string): boolean {
   return false;
 }
 
+/** Pop a tree stack down to `prefixLen`; returns the surviving parent's name, or null when none remains. */
+function popToDepth(stack: Array<{ prefixLen: number; name: string }>, prefixLen: number): string | null {
+  while (stack.length > 0 && stack.at(-1)!.prefixLen >= prefixLen) {
+    stack.pop();
+  }
+  return stack.length > 0 ? stack.at(-1)!.name : null;
+}
+
+/** Append a parent to a package's requiredBy list, skipping duplicates. */
+function appendRequiredBy(pkg: PackageRef | undefined, parentName: string | null): void {
+  if (!pkg || !parentName) return;
+  const requiredBy = pkg.requiredBy ?? (pkg.requiredBy = []);
+  if (!requiredBy.includes(parentName)) requiredBy.push(parentName);
+}
+
+interface MavenTreeState {
+  pkgs: PackageRef[];
+  seen: Set<string>;
+  byKey: Map<string, PackageRef>;
+  /** Monotonic stack of (prefix length, coordinate) — the top entry with a shorter prefix than the
+   * current line is its parent. Prefix length grows strictly with depth in dependency:tree output,
+   * so raw lengths compare correctly without assuming an exact cell width. */
+  parentStack: Array<{ prefixLen: number; name: string }>;
+}
+
+/** Record a first-seen coordinate and push it onto the parent stack. */
+function recordMavenNode(name: string, version: string, parentName: string | null, prefixLen: number, filePath: string, state: MavenTreeState): void {
+  const key = `${name.toLowerCase()}@${version}`;
+  state.seen.add(key);
+  const pkg: PackageRef = {
+    ecosystem: "maven",
+    name,
+    version,
+    manifestPath: filePath,
+  };
+  if (parentName) pkg.requiredBy = [parentName];
+  state.pkgs.push(pkg);
+  state.byKey.set(key, pkg);
+  state.parentStack.push({ prefixLen, name });
+}
+
+/** Process one dependency:tree line: update the parent stack and collect packages. */
+function processMavenTreeLine(line: string, filePath: string, state: MavenTreeState): void {
+  const prefixMatch = /^[|\s+\\-]+/.exec(line);
+  const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
+  const trimmed = line.slice(prefixLen).trim();
+  if (!trimmed) return;
+  if (/omitted for conflict/i.test(trimmed)) return;
+  const duplicate = /omitted for duplicate/i.test(trimmed);
+  const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
+  if (!match) return;
+
+  const [, group, artifact, version] = match;
+  if (!version || version.startsWith("(")) return;
+
+  const parentName = popToDepth(state.parentStack, prefixLen);
+  const name = `${group}:${artifact}`;
+  const key = `${name.toLowerCase()}@${version}`;
+  if (duplicate || state.seen.has(key)) {
+    appendRequiredBy(state.byKey.get(key), parentName);
+    state.parentStack.push({ prefixLen, name });
+    return;
+  }
+  recordMavenNode(name, version, parentName, prefixLen, filePath, state);
+}
+
 /** Parse Maven dependency:tree output into PackageRef[]. */
 export function parseMavenTree(output: string, filePath: string): ParseResult {
-  const pkgs: PackageRef[] = [];
-  const seen = new Set<string>();
-  const byKey = new Map<string, PackageRef>();
-  // Monotonic stack of (prefix length, coordinate) — the top entry with a shorter prefix than the
-  // current line is its parent. Prefix length grows strictly with depth in dependency:tree output,
-  // so raw lengths compare correctly without assuming an exact cell width.
-  const parentStack: Array<{ prefixLen: number; name: string }> = [];
-
-    for (const rawLine of output.split("\n")) {
-      // Strip only the "[INFO]" marker. The indentation that follows encodes tree depth; removing it
-      // collapses nodes drawn under a last-child branch (space-indented, no leading "|") into their grandparent.
-      const line = rawLine.replace(/^\[INFO\]/, "");
-      const prefixMatch = /^[|\s+\\-]+/.exec(line);
-      const prefixLen = prefixMatch ? prefixMatch[0].length : 0;
-      const trimmed = line.slice(prefixLen).trim();
-      if (!trimmed) continue;
-      if (/omitted for conflict/i.test(trimmed)) continue;
-      const duplicate = /omitted for duplicate/i.test(trimmed);
-      const match = /^([\w.-]+):([\w.-]+):[^:]+:([^:\s(]+)/.exec(trimmed);
-      if (!match) continue;
-
-    const [, group, artifact, version] = match;
-    if (!version || version.startsWith("(")) continue;
-
-    while (parentStack.length > 0 && parentStack[parentStack.length - 1].prefixLen >= prefixLen) {
-      parentStack.pop();
-    }
-    const parentName = parentStack.length > 0 ? parentStack[parentStack.length - 1].name : null;
-
-    const key = `${group.toLowerCase()}:${artifact.toLowerCase()}@${version}`;
-    const existing = byKey.get(key);
-    if (duplicate || seen.has(key)) {
-      if (existing && parentName) {
-        const requiredBy = existing.requiredBy ?? (existing.requiredBy = []);
-        if (!requiredBy.includes(parentName)) requiredBy.push(parentName);
-      }
-      parentStack.push({ prefixLen, name: `${group}:${artifact}` });
-      continue;
-    }
-    seen.add(key);
-    const pkg: PackageRef = {
-      ecosystem: "maven",
-      name: `${group}:${artifact}`,
-      version,
-      manifestPath: filePath,
-    };
-    if (parentName) pkg.requiredBy = [parentName];
-    pkgs.push(pkg);
-    byKey.set(key, pkg);
-    parentStack.push({ prefixLen, name: `${group}:${artifact}` });
+  const state: MavenTreeState = { pkgs: [], seen: new Set(), byKey: new Map(), parentStack: [] };
+  for (const rawLine of output.split("\n")) {
+    // Strip only the "[INFO]" marker. The indentation that follows encodes tree depth; removing it
+    // collapses nodes drawn under a last-child branch (space-indented, no leading "|") into their grandparent.
+    processMavenTreeLine(rawLine.replace(/^\[INFO\]/, ""), filePath, state);
   }
-
-  return pkgs.length > 0 ? { packages: pkgs, warnings: [] } : { packages: [], warnings: [] };
+  return state.pkgs.length > 0 ? { packages: state.pkgs, warnings: [] } : { packages: [], warnings: [] };
 }
 
 /**
@@ -1705,6 +1725,17 @@ function normalizeGradleTreeVersion(rawVersion: string): string {
   return version;
 }
 
+/** Collect a "FAILED" line into the unresolved list (once per coordinate). */
+function recordGradleFailed(group: string, name: string, rawVersion: string, state: GradleTreeState): void {
+  const requested = rawVersion.slice(0, -"FAILED".length);
+  const reqVersion = (requested.includes('->') ? requested.split('->').pop()! : requested).trim();
+  const failedKey = `${group}:${name}`.toLowerCase();
+  if (!state.failedSeen.has(failedKey)) {
+    state.failedSeen.add(failedKey);
+    state.unresolved.push(`${failedKey}@${reqVersion}`);
+  }
+}
+
 function parseGradleTreeLine(line: string, filePath: string, state: GradleTreeState): void {
   const match = /^([|\s]*)([+\\-])---\s+([\w.@-]+):([\w.@-]+):(.*)$/.exec(line);
   if (!match) return;
@@ -1713,13 +1744,7 @@ function parseGradleTreeLine(line: string, filePath: string, state: GradleTreeSt
   const rawVersion = rawVersionPart.trimStart();
   // Gradle marks unresolvable deps with a trailing "FAILED" (e.g. "10.1.58 FAILED" or "1.2 -> 3.4 FAILED")
   if (/\sFAILED$/.test(rawVersion)) {
-    const requested = rawVersion.slice(0, -"FAILED".length);
-    const reqVersion = (requested.includes('->') ? requested.split('->').pop()! : requested).trim();
-    const failedKey = `${group}:${name}`.toLowerCase();
-    if (!state.failedSeen.has(failedKey)) {
-      state.failedSeen.add(failedKey);
-      state.unresolved.push(`${failedKey}@${reqVersion}`);
-    }
+    recordGradleFailed(group, name, rawVersion, state);
     return;
   }
   // Take resolved version after -> arrow if present; unwrap "{strictly x}" and "(...)" notes.
@@ -1727,18 +1752,11 @@ function parseGradleTreeLine(line: string, filePath: string, state: GradleTreeSt
   if (!version || version.startsWith('(')) return;
   const key = `${group}:${name}`.toLowerCase();
 
-  while (state.parentStack.length > 0 && state.parentStack[state.parentStack.length - 1].prefixLen >= prefixLen) {
-    state.parentStack.pop();
-  }
-  const parentName = state.parentStack.length > 0 ? state.parentStack[state.parentStack.length - 1].name : null;
+  const parentName = popToDepth(state.parentStack, prefixLen);
 
   if (state.seen.has(key)) {
     // Diamond: the first occurrence must not hide later parents — append this one.
-    const existing = state.byKey.get(key);
-    if (existing && parentName) {
-      const requiredBy = existing.requiredBy ?? (existing.requiredBy = []);
-      if (!requiredBy.includes(parentName)) requiredBy.push(parentName);
-    }
+    appendRequiredBy(state.byKey.get(key), parentName);
   } else {
     state.seen.add(key);
     const pkg: PackageRef = { ecosystem: 'maven', name: `${group}:${name}`, version, manifestPath: filePath };

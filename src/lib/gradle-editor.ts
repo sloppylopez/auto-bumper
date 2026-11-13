@@ -130,7 +130,9 @@ function rewriteDirect(
   let out = "";
   let lastIdx = 0;
   literalRe.lastIndex = 0;
-  for (let lm: RegExpExecArray | null; (lm = literalRe.exec(masked)); ) {
+  while (true) {
+    const lm = literalRe.exec(masked);
+    if (!lm) break;
     const at = lm.index;
     if (compareMavenVersion(lm[3], bump.targetVersion) >= 0) {
       out += content.slice(lastIdx, at + lm[0].length);
@@ -154,34 +156,51 @@ function rewriteDirect(
   });
 
   // 3. Version variable: "group:artifact:${someVersion}" -> bump `def someVersion = "..."`
-  const varRefRe = new RegExp(String.raw`["']${g}:${a}:\$\{(\w+)\}["']`);
-  const varRef = varRefRe.exec(content);
-  if (varRef) {
-    const varName = varRef[1];
-    const defRe = new RegExp(String.raw`((?:def|val)\s+${escapeRegex(varName)}\s*=\s*["'])([^"']+)(["'])`);
-    let variableBumped = false;
-    if (defRe.test(content)) {
-      content = content.replace(defRe, (m, pre, oldVer, close) => {
-        if (compareMavenVersion(oldVer, bump.targetVersion) >= 0) return m;
-        changed = true;
-        variableBumped = true;
-        return `${pre}${bump.targetVersion}${close}`;
-      });
-      // Only report a shared-variable bump when the def actually moved — otherwise the managed
-      // pin is what enforces the version and "bumped" would misreport a no-op.
-      if (variableBumped) {
-        warnings.push(
-          `${bump.packageName}: bumped via shared variable \${${varName}} — other deps using it move too`,
-        );
-      }
-    } else {
-      warnings.push(
-        `${bump.packageName}: version variable \${${varName}} not defined as \`def\` in this file — falling back to constraint`,
-      );
-    }
-  }
+  const varResult = rewriteSharedVariable(content, bump.packageName, bump.targetVersion, warnings);
+  content = varResult.content;
+  if (varResult.changed) changed = true;
 
   return { content, changed };
+}
+
+/**
+ * Case 3 of the direct-declaration rewrite: the declaration references a version variable
+ * (`"g:a:${someVersion}"`), so bump the `def someVersion = "…"` in place. Warns when the variable
+ * is not defined or the def already sits at/above the target (the managed pin enforces it then).
+ */
+function rewriteSharedVariable(
+  content: string,
+  packageName: string,
+  targetVersion: string,
+  warnings: string[],
+): { content: string; changed: boolean } {
+  const [group, artifact] = packageName.split(":");
+  const g = escapeRegex(group!);
+  const a = escapeRegex(artifact!);
+  const varRefRe = new RegExp(String.raw`["']${g}:${a}:\$\{(\w+)\}["']`);
+  const varRef = varRefRe.exec(content);
+  if (!varRef) return { content, changed: false };
+  const varName = varRef[1]!;
+  const defRe = new RegExp(String.raw`((?:def|val)\s+${escapeRegex(varName)}\s*=\s*["'])([^"']+)(["'])`);
+  let variableBumped = false;
+  if (!defRe.test(content)) {
+    warnings.push(
+      `${packageName}: version variable \${${varName}} not defined as \`def\` in this file — falling back to constraint`,
+    );
+    return { content, changed: false };
+  }
+  const next = content.replace(defRe, (m, pre, oldVer, close) => {
+    if (compareMavenVersion(oldVer, targetVersion) >= 0) return m;
+    variableBumped = true;
+    return `${pre}${targetVersion}${close}`;
+  });
+  // Only report a shared-variable bump when the def actually moved — otherwise the managed
+  // pin is what enforces the version and "bumped" would misreport a no-op.
+  if (variableBumped) {
+    warnings.push(`${packageName}: bumped via shared variable \${${varName}} — other deps using it move too`);
+    return { content: next, changed: true };
+  }
+  return { content: next, changed: false };
 }
 
 /** Rewrite dependency declarations from one Maven coordinate to another. */
@@ -303,56 +322,78 @@ function updateManagedBlock(
   const forceMap = parseExistingForces(block);
   const dmPinMap = new Map([...parseExistingDmPins(block)].map(([pkg, v]) => [pkg, { version: v, because: "" }]));
   const freeText = remapFreeTextKeys(parseBlockFreeText(block), renames);
-  const renameMap = new Map(renames.map(r => [r.fromPackage, r]));
-  const toToolsJackson = renames.some(r => r.toPackage.startsWith("tools.jackson.core"));
-
   for (const rename of renames) {
     updateConstraintEntry(entries, rename);
     // A force pin on the old coordinate follows its package to the new one.
-    const forced = forceMap.get(rename.fromPackage);
-    if (forced !== undefined) {
-      forceMap.delete(rename.fromPackage);
-      const existingForce = forceMap.get(rename.toPackage);
-      if (existingForce === undefined || compareMavenVersion(forced, existingForce) > 0) {
-        forceMap.set(rename.toPackage, forced);
-      }
-    }
+    followForce(forceMap, rename.fromPackage, rename.toPackage);
     // A Spring DM pin on the old coordinate follows its package to the new one.
-    const dmPinned = dmPinMap.get(rename.fromPackage);
-    if (dmPinned !== undefined) {
-      dmPinMap.delete(rename.fromPackage);
-      const existingDm = dmPinMap.get(rename.toPackage);
-      if (existingDm === undefined || compareMavenVersion(dmPinned.version, existingDm.version) > 0) {
-        dmPinMap.set(rename.toPackage, dmPinned);
-      }
-    }
+    followDmPin(dmPinMap, rename.fromPackage, rename.toPackage);
   }
 
-  if (toToolsJackson) {
-    entries.delete("tools.jackson.core:jackson-annotations");
-    for (const coord of entries.keys()) {
-      if (coord === JACKSON3_ANNOTATIONS_COORD) continue;
-      if (!coord.startsWith("com.fasterxml.jackson.core:")) continue;
-      const art = mavenArtifact(coord);
-      const toolsCoord = `tools.jackson.core:${art}`;
-      if (renameMap.has(coord) || renames.some(r => r.toPackage === toolsCoord)) {
-        entries.delete(coord);
-      }
-    }
-    for (const coord of dmPinMap.keys()) {
-      if (!coord.startsWith("com.fasterxml.jackson.core:")) continue;
-      const art = mavenArtifact(coord);
-      const toolsCoord = `tools.jackson.core:${art}`;
-      if (renameMap.has(coord) || renames.some(r => r.toPackage === toolsCoord)) {
-        dmPinMap.delete(coord);
-      }
-    }
+  if (renames.some(r => r.toPackage.startsWith("tools.jackson.core"))) {
+    jackson3Cleanup(entries, dmPinMap, renames);
   }
 
   const before = collapseTrailingNewlines(content.slice(0, begin));
   const after = content.slice(end + endLen).replace(/^\n+/, "\n");
   const newBlock = renderManagedBlock(entries, excludeSet, forceMap, kotlin, pruneFreeText(freeText, entries, excludeSet, forceMap, dmPinMap), dmPinMap);
   return `${before}${newBlock}${after}`;
+}
+
+/** Move a force pin from an old coordinate to its rename target, keeping the higher version. */
+function followForce(forceMap: Map<string, string>, from: string, to: string): void {
+  const forced = forceMap.get(from);
+  if (forced === undefined) return;
+  forceMap.delete(from);
+  const existingForce = forceMap.get(to);
+  if (existingForce === undefined || compareMavenVersion(forced, existingForce) > 0) {
+    forceMap.set(to, forced);
+  }
+}
+
+/** Move a Spring DM pin from an old coordinate to its rename target, keeping the higher version. */
+function followDmPin(
+  dmPinMap: Map<string, { version: string; because: string }>,
+  from: string,
+  to: string,
+): void {
+  const dmPinned = dmPinMap.get(from);
+  if (dmPinned === undefined) return;
+  dmPinMap.delete(from);
+  const existingDm = dmPinMap.get(to);
+  if (existingDm === undefined || compareMavenVersion(dmPinned.version, existingDm.version) > 0) {
+    dmPinMap.set(to, dmPinned);
+  }
+}
+
+/** Old Jackson 2 coordinates superseded by a tools.jackson rename (from one managed map). */
+function dropJackson2Superseded(
+  coords: IterableIterator<string>,
+  renameMap: Map<string, RenameRequest>,
+  renames: RenameRequest[],
+): Set<string> {
+  const dropped = new Set<string>();
+  for (const coord of coords) {
+    if (coord === JACKSON3_ANNOTATIONS_COORD) continue;
+    if (!coord.startsWith("com.fasterxml.jackson.core:")) continue;
+    const toolsCoord = `tools.jackson.core:${mavenArtifact(coord)}`;
+    if (renameMap.has(coord) || renames.some(r => r.toPackage === toolsCoord)) {
+      dropped.add(coord);
+    }
+  }
+  return dropped;
+}
+
+/** Drop the old Jackson 2 coordinates that a tools.jackson rename supersedes. */
+function jackson3Cleanup(
+  entries: Map<string, { version: string; because: string }>,
+  dmPinMap: Map<string, { version: string; because: string }>,
+  renames: RenameRequest[],
+): void {
+  const renameMap = new Map(renames.map(r => [r.fromPackage, r]));
+  entries.delete("tools.jackson.core:jackson-annotations");
+  for (const coord of dropJackson2Superseded(entries.keys(), renameMap, renames)) entries.delete(coord);
+  for (const coord of dropJackson2Superseded(dmPinMap.keys(), renameMap, renames)) dmPinMap.delete(coord);
 }
 
 /** Update managed-block constraints for a single rename */
@@ -452,6 +493,63 @@ export function parseExistingDmPins(block: string): Map<string, string> {
   return out;
 }
 
+/** True for the characters JS's `\s` matches inside a line (line terminators excluded — callers split lines). */
+function isLineWs(ch: string | undefined): boolean {
+  if (!ch) return false;
+  if (ch === " " || ch === "\t" || ch === "\r" || ch === "\f" || ch === "\v") return true;
+  if (ch === "\u00a0" || ch === "\u1680" || ch === "\u202f" || ch === "\u205f" || ch === "\u3000" || ch === "\ufeff") return true;
+  return ch >= "\u2000" && ch <= "\u200a";
+}
+
+/** True for JS `\w` characters. */
+function isWordChar(ch: string | undefined): boolean {
+  if (!ch) return false;
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch === "_";
+}
+
+/** Skip line-whitespace from i; returns the index of the first non-whitespace character. */
+function skipLineWs(line: string, i: number): number {
+  while (i < line.length && isLineWs(line[i])) i++;
+  return i;
+}
+
+/** Consume a bare `final`/`def`/`val`/`var` prefix at i (no following space required); returns the new index. */
+function skipDeclKeyword(line: string, i: number): number {
+  if (line.startsWith("final ", i)) return i + 6;
+  if (line.startsWith("def", i)) return i + 3;
+  if (line.startsWith("val", i)) return i + 3;
+  if (line.startsWith("var", i)) return i + 3;
+  return i;
+}
+
+/** Read `= "value"` / `= 'value'` starting after the name at i; null on any shape mismatch. */
+function readAssignedValue(line: string, i: number): string | null {
+  i = skipLineWs(line, i);
+  if (line[i] !== "=") return null;
+  i = skipLineWs(line, i + 1);
+  if (line[i] !== "\"" && line[i] !== "'") return null;
+  const start = i + 1;
+  let j = start;
+  while (j < line.length && line[j] !== "\"" && line[j] !== "'") j++;
+  if (start === j || j >= line.length) return null;
+  return line.slice(start, j);
+}
+
+/**
+ * Parse one line as a version-variable declaration of the shape `[def|val|var|final ]name = "value"`.
+ * Mirrors the historical regex exactly, including consuming a bare `def`/`val`/`var` prefix without
+ * a following space (`defx = "1"` declares `x`) and accepting mismatched opening/closing quotes.
+ */
+function parseVarDeclLine(line: string): { name: string; value: string } | null {
+  const keywordEnd = skipDeclKeyword(line, skipLineWs(line, 0));
+  let i = skipLineWs(line, keywordEnd);
+  const nameStart = i;
+  while (i < line.length && isWordChar(line[i])) i++;
+  if (i === nameStart) return null;
+  const value = readAssignedValue(line, i);
+  return value === null ? null : { name: line.slice(nameStart, i), value };
+}
+
 /**
  * Parse the project's OWN resolutionStrategy.force pins — anywhere in the file outside the
  * managed block. `force 'g:a:v'` / `force("g:a:v")`; `${var}` versions are resolved from
@@ -461,15 +559,16 @@ export function parseExistingDmPins(block: string): Map<string, string> {
  */
 export function parseUserForces(content: string): Map<string, string> {
   const vars = new Map<string, string>();
-  for (const m of content.matchAll(/^\s*(?:def|val|var|final\s+)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*["']([^"']+)["']/gm)) {
-    vars.set(m[1]!, m[2]!);
+  for (const line of content.split(/\r\n|\n|\r|\u2028|\u2029/)) {
+    const decl = parseVarDeclLine(line);
+    if (decl) vars.set(decl.name, decl.value);
   }
   const regions = findManagedBlocks(content);
   const out = new Map<string, string>();
   const forceRe = /force(?:\s*\(\s*|\s*)["']([^"':]+:[^"':]+):([^"']+)["']/g;
   for (const m of content.matchAll(forceRe)) {
     if (regions.some(r => m.index! >= r.begin && m.index! < r.end + r.endLen)) continue; // managed block — our own pins
-    const version = m[2]!.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => vars.get(name) ?? "");
+    const version = m[2]!.replace(/\$\{(\w+)\}/g, (_, name: string) => vars.get(name) ?? "");
     if (!version || version.includes("${")) continue;
     out.set(m[1]!, version);
   }
@@ -595,52 +694,84 @@ function trailingCommentIndex(line: string): number {
  * below it; text before any section goes to the block header, text after the last
  * structured line to the footer. Blank lines are dropped (the renderer owns layout).
  */
+interface FreeTextState {
+  out: Map<string, string[]>;
+  pending: string[];
+}
+
+/** Flush a pending comment bucket into the map under `key`. */
+function flushFreeText(state: FreeTextState, key: string): void {
+  if (state.pending.length === 0) return;
+  const lines = state.out.get(key);
+  if (lines) lines.push(...state.pending);
+  else state.out.set(key, [...state.pending]);
+  state.pending = [];
+}
+
+/** What a marker line does: skip it (opening), flush the footer (closing), or nothing. */
+function markerLineAction(trimmed: string): "skip" | "footer" | null {
+  if (GRADLE_MARKERS.some(m => m.begin === trimmed)) return "skip"; // any brand's opening marker
+  if (GRADLE_MARKERS.some(m => m.end === trimmed)) return "footer";
+  return null;
+}
+
+/** Append a line's trailing comment (if any) to its entry bucket. */
+function appendTrailingComment(out: Map<string, string[]>, key: string, raw: string): void {
+  // A trailing comment on the line itself documents the same entry.
+  const slash = trailingCommentIndex(raw);
+  if (slash === -1) return;
+  const tail = raw.slice(slash).trim();
+  if (tail.length < 2) return;
+  const lines = out.get(key);
+  if (lines) lines.push(tail);
+  else out.set(key, [tail]);
+}
+
 function parseBlockFreeText(block: string): Map<string, string[]> {
-  const out = new Map<string, string[]>();
-  let pending: string[] = [];
+  const state: FreeTextState = { out: new Map(), pending: [] };
   let sectionEntered = false;
-  const flush = (key: string) => {
-    if (pending.length === 0) return;
-    const lines = out.get(key);
-    if (lines) lines.push(...pending);
-    else out.set(key, [...pending]);
-    pending = [];
-  };
   for (const raw of block.split("\n")) {
     const trimmed = raw.trim();
     if (trimmed === "") continue;
-    if (GRADLE_MARKERS.some(m => m.begin === trimmed)) continue; // any brand's opening marker
-    if (GRADLE_MARKERS.some(m => m.end === trimmed)) {
-      flush(FREE_TEXT_FOOTER);
+    const marker = markerLineAction(trimmed);
+    if (marker === "footer") {
+      flushFreeText(state, FREE_TEXT_FOOTER);
       continue;
     }
+    if (marker === "skip") continue;
     if (trimmed.startsWith("//")) {
-      pending.push(trimmed);
+      state.pending.push(trimmed);
       continue;
     }
     const key = managedLineKey(raw);
     if (key !== null) {
-      flush(key);
-      // A trailing comment on the line itself documents the same entry.
-      const slash = trailingCommentIndex(raw);
-      if (slash !== -1) {
-        const tail = raw.slice(slash).trim();
-        if (tail.length >= 2) {
-          const lines = out.get(key);
-          if (lines) lines.push(tail);
-          else out.set(key, [tail]);
-        }
-      }
+      flushFreeText(state, key);
+      appendTrailingComment(state.out, key, raw);
       continue;
     }
     if (!sectionEntered && trimmed.includes("{")) {
       // First section header: comments above it document the block as a whole.
-      flush(FREE_TEXT_HEADER);
+      flushFreeText(state, FREE_TEXT_HEADER);
       sectionEntered = true;
     }
   }
-  flush(FREE_TEXT_FOOTER);
-  return out;
+  flushFreeText(state, FREE_TEXT_FOOTER);
+  return state.out;
+}
+
+/** True when the entry a free-text bucket documents still exists in the re-rendered block. */
+function freeTextKeySurvives(
+  key: string,
+  entries: Map<string, { version: string; because: string }>,
+  excludes: Set<string>,
+  forces: Map<string, string>,
+  dmPins?: ReadonlyMap<string, { version: string; because: string }>,
+): boolean {
+  if (key === FREE_TEXT_HEADER || key === FREE_TEXT_FOOTER) return true;
+  if (key.startsWith("force:")) return forces.has(key.slice("force:".length));
+  if (key.startsWith("dm:")) return dmPins?.has(key.slice("dm:".length)) ?? false;
+  if (key.startsWith("exclude:")) return excludes.has(key.slice("exclude:".length));
+  return entries.has(key);
 }
 
 /** Drop preserved comments whose entry no longer exists (pin removed, excluded, or dropped). */
@@ -654,19 +785,28 @@ function pruneFreeText(
   if (!freeText || freeText.size === 0) return freeText;
   const out = new Map<string, string[]>();
   for (const [key, lines] of freeText) {
-    if (key === FREE_TEXT_HEADER || key === FREE_TEXT_FOOTER) {
-      out.set(key, lines);
-    } else if (key.startsWith("force:")) {
-      if (forces.has(key.slice("force:".length))) out.set(key, lines);
-    } else if (key.startsWith("dm:")) {
-      if (dmPins?.has(key.slice("dm:".length))) out.set(key, lines);
-    } else if (key.startsWith("exclude:")) {
-      if (excludes.has(key.slice("exclude:".length))) out.set(key, lines);
-    } else if (entries.has(key)) {
-      out.set(key, lines);
-    }
+    if (freeTextKeySurvives(key, entries, excludes, forces, dmPins)) out.set(key, lines);
   }
   return out;
+}
+
+/** The prefix a free-text key carries when it names a force or DM pin rather than a constraint. */
+function freeTextKeyPrefix(key: string): string {
+  if (key.startsWith("force:")) return "force:";
+  if (key.startsWith("dm:")) return "dm:";
+  return "";
+}
+
+/** A free-text key after applying renames — constraint, force, and DM keys all follow. */
+function remappedFreeTextKey(key: string, renames: RenameRequest[]): string {
+  let moved = key;
+  for (const r of renames) {
+    if (moved === r.fromPackage || moved === `force:${r.fromPackage}` || moved === `dm:${r.fromPackage}`) {
+      moved = `${freeTextKeyPrefix(moved)}${r.toPackage}`;
+      break;
+    }
+  }
+  return moved;
 }
 
 /** Move preserved comments from a renamed coordinate to its replacement. */
@@ -677,14 +817,7 @@ function remapFreeTextKeys(
   if (!freeText || freeText.size === 0) return freeText;
   const out = new Map<string, string[]>();
   for (const [key, lines] of freeText) {
-    let moved = key;
-    for (const r of renames) {
-      if (moved === r.fromPackage || moved === `force:${r.fromPackage}` || moved === `dm:${r.fromPackage}`) {
-        const prefix = moved.startsWith("force:") ? "force:" : moved.startsWith("dm:") ? "dm:" : "";
-        moved = `${prefix}${r.toPackage}`;
-        break;
-      }
-    }
+    const moved = remappedFreeTextKey(key, renames);
     const existing = out.get(moved);
     if (existing) existing.push(...lines);
     else out.set(moved, [...lines]);
@@ -727,8 +860,7 @@ function renderManagedBlock(
     lines.push(...renderDmLines(dmPins, kotlin, freeText));
   }
 
-  lines.push(...freeTextLines(freeText, FREE_TEXT_FOOTER, "    "));
-  lines.push(MARKER_END);
+  lines.push(...freeTextLines(freeText, FREE_TEXT_FOOTER, "    "), MARKER_END);
   return lines.join("\n");
 }
 
@@ -747,8 +879,7 @@ function renderDmLines(
   const lines = ["dependencyManagement {", "    dependencies {"];
   for (const [pkg, { version, because }] of [...dmPins.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     if (because) lines.push(`        // ${because}`);
-    lines.push(...freeTextLines(freeText, `dm:${pkg}`, "        "));
-    lines.push(kotlin ? `        dependency(${q}${pkg}:${version}${q})` : `        dependency ${q}${pkg}:${version}${q}`);
+    lines.push(...freeTextLines(freeText, `dm:${pkg}`, "        "), kotlin ? `        dependency(${q}${pkg}:${version}${q})` : `        dependency ${q}${pkg}:${version}${q}`);
   }
   lines.push("    }", "}");
   return lines;
@@ -762,8 +893,7 @@ function renderConstraintLines(
   const lines = ["dependencies {", "    constraints {"];
   const sorted = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [pkg, { version, because }] of sorted) {
-    lines.push(...freeTextLines(freeText, pkg, "        "));
-    lines.push(`        ${renderConstraintCall(pkg, version, because, kotlin)}`);
+    lines.push(...freeTextLines(freeText, pkg, "        "), `        ${renderConstraintCall(pkg, version, because, kotlin)}`);
   }
   lines.push("    }", "}");
   return lines;
@@ -782,8 +912,10 @@ function renderForceLines(forces: Map<string, string>, kotlin: boolean, freeText
   if (forces.size === 0) return [];
   const lines = ["    resolutionStrategy {"];
   for (const [pkg, version] of [...forces.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    lines.push(...freeTextLines(freeText, `force:${pkg}`, "        "));
-    lines.push(kotlin ? `        force("${pkg}:${version}")` : `        force '${pkg}:${version}'`);
+    lines.push(
+      ...freeTextLines(freeText, `force:${pkg}`, "        "),
+      kotlin ? `        force("${pkg}:${version}")` : `        force '${pkg}:${version}'`,
+    );
   }
   lines.push("    }");
   return lines;
@@ -794,8 +926,8 @@ function renderExcludeLines(excludes: Set<string>, kotlin: boolean, freeText: Ma
   const lines: string[] = [];
   for (const coord of [...excludes].sort((a, b) => a.localeCompare(b))) {
     const [group, module] = coord.split(":");
-    lines.push(...freeTextLines(freeText, `exclude:${coord}`, "    "));
     lines.push(
+      ...freeTextLines(freeText, `exclude:${coord}`, "    "),
       kotlin
         ? `    exclude(group = ${q}${group}${q}, module = ${q}${module}${q})`
         : `    exclude group: '${group}', module: '${module}'`,
@@ -843,14 +975,15 @@ function findManagedBlocks(content: string): ManagedRegion[] {
  */
 function consolidateManagedBlocks(content: string): string {
   let base = content;
-  for (;;) {
-    const regions = findManagedBlocks(base);
-    if (regions.length <= 1) return base;
-    const victim = regions[regions.length - 1]!; // lowest brand priority
+  let regions = findManagedBlocks(base);
+  while (regions.length > 1) {
+    const victim = regions.at(-1)!; // lowest brand priority
     const before = collapseTrailingNewlines(base.slice(0, victim.begin));
     const after = base.slice(victim.end + victim.endLen).replace(/^\n+/, "\n");
     base = `${before}${after}`;
+    regions = findManagedBlocks(base);
   }
+  return base;
 }
 
 interface ManagedRegionData {
@@ -862,30 +995,41 @@ interface ManagedRegionData {
   freeText: Map<string, string[]> | null;
 }
 
+/** Merge one block's free-text buckets into the running map, creating it on first use. */
+function mergeRegionFreeText(
+  freeText: Map<string, string[]> | null,
+  regionText: Map<string, string[]>,
+): Map<string, string[]> {
+  const target = freeText ?? new Map<string, string[]>();
+  for (const [key, lines] of regionText) {
+    const existing = target.get(key);
+    if (existing) existing.push(...lines);
+    else target.set(key, [...lines]);
+  }
+  return target;
+}
+
+/** Fold one block's constraints/excludes/forces/DM pins/free text into the merged view. */
+function absorbRegionBlock(data: ManagedRegionData, block: string): void {
+  for (const [pkg, e] of parseExistingConstraints(block)) if (!data.entries.has(pkg)) data.entries.set(pkg, e);
+  for (const pkg of parseExistingExcludes(block)) data.excludeSet.add(pkg);
+  for (const [pkg, v] of parseExistingForces(block)) if (!data.forceMap.has(pkg)) data.forceMap.set(pkg, v);
+  for (const [pkg, v] of parseExistingDmPins(block)) if (!data.dmPinMap.has(pkg)) data.dmPinMap.set(pkg, { version: v, because: "" });
+  data.freeText = mergeRegionFreeText(data.freeText, parseBlockFreeText(block));
+}
+
 /** Merged view of every managed block (brand priority decides conflicts — canonical wins). */
 function parseAllManagedRegions(content: string): ManagedRegionData {
-  const regions = findManagedBlocks(content);
-  const entries = new Map<string, { version: string; because: string }>();
-  const excludeSet = new Set<string>();
-  const forceMap = new Map<string, string>();
-  const dmPinMap = new Map<string, { version: string; because: string }>();
-  let freeText: Map<string, string[]> | null = null;
-  for (const region of regions) {
-    const block = content.slice(region.begin, region.end + region.endLen);
-    for (const [pkg, e] of parseExistingConstraints(block)) if (!entries.has(pkg)) entries.set(pkg, e);
-    for (const pkg of parseExistingExcludes(block)) excludeSet.add(pkg);
-    for (const [pkg, v] of parseExistingForces(block)) if (!forceMap.has(pkg)) forceMap.set(pkg, v);
-    for (const [pkg, v] of parseExistingDmPins(block)) if (!dmPinMap.has(pkg)) dmPinMap.set(pkg, { version: v, because: "" });
-    const ft = parseBlockFreeText(block);
-    if (ft.size > 0) {
-      for (const [key, lines] of ft) {
-        const existing = freeText?.get(key);
-        if (existing) existing.push(...lines);
-        else (freeText ??= new Map()).set(key, [...lines]);
-      }
-    }
-  }
-  return { regions, entries, excludeSet, forceMap, dmPinMap, freeText };
+  const data: ManagedRegionData = {
+    regions: findManagedBlocks(content),
+    entries: new Map(),
+    excludeSet: new Set(),
+    forceMap: new Map(),
+    dmPinMap: new Map(),
+    freeText: null,
+  };
+  for (const region of data.regions) absorbRegionBlock(data, content.slice(region.begin, region.end + region.endLen));
+  return data;
 }
 
 /** Advisory IDs referenced by any managed-block constraint `because` clause (merged view). */
@@ -910,6 +1054,164 @@ function regionHasPin(content: string, region: ManagedRegion, packageName: strin
   );
 }
 
+interface UpsertOptions {
+  kotlin?: boolean;
+  bomManaged?: ReadonlyMap<string, string> | null;
+  droppedOut?: StaleManagedPin[];
+  protectedPins?: ReadonlySet<string>;
+  shadowedOut?: ShadowedManagedPin[];
+  dmBumps?: BumpRequest[];
+}
+
+/** Drop constraint pins a BOM now manages at or above; returns the dropped package names. */
+function dropBomCoveredEntries(
+  entries: Map<string, { version: string; because: string }>,
+  bomManaged: ReadonlyMap<string, string> | null | undefined,
+  protectedPins: ReadonlySet<string> | undefined,
+  droppedOut: StaleManagedPin[] | undefined,
+): Set<string> {
+  const droppedPkgs = new Set<string>();
+  if (!bomManaged) return droppedPkgs;
+  for (const [pkg, e] of entries) {
+    if (protectedPins?.has(pkg)) continue;
+    const bv = bomManaged.get(pkg);
+    if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
+      entries.delete(pkg);
+      droppedOut?.push({ packageName: pkg, version: e.version, bomVersion: bv });
+      droppedPkgs.add(pkg);
+    }
+  }
+  return droppedPkgs;
+}
+
+/** Drop forces covered by the BOM pass — either matching a dropped pin or covered on their own. */
+function dropBomCoveredForces(
+  forceMap: Map<string, string>,
+  bomManaged: ReadonlyMap<string, string> | null | undefined,
+  protectedPins: ReadonlySet<string> | undefined,
+  droppedOut: StaleManagedPin[] | undefined,
+  droppedPkgs: Set<string>,
+): void {
+  if (!bomManaged) return;
+  for (const [pkg, v] of forceMap) {
+    if (droppedPkgs.has(pkg)) {
+      forceMap.delete(pkg); // already reported via the constraint entry — still drop the matching force
+      continue;
+    }
+    if (protectedPins?.has(pkg)) continue;
+    const bv = bomManaged.get(pkg);
+    if (bv !== undefined && compareMavenVersion(bv, v) >= 0) {
+      forceMap.delete(pkg);
+      droppedOut?.push({ packageName: pkg, version: v, bomVersion: bv });
+    }
+  }
+}
+
+/** Drop DM pins covered by the BOM pass — either matching a dropped pin or covered on their own. */
+function dropBomCoveredDmPins(
+  dmPinMap: Map<string, { version: string; because: string }>,
+  bomManaged: ReadonlyMap<string, string> | null | undefined,
+  protectedPins: ReadonlySet<string> | undefined,
+  droppedOut: StaleManagedPin[] | undefined,
+  droppedPkgs: Set<string>,
+): void {
+  if (!bomManaged) return;
+  for (const [pkg, e] of dmPinMap) {
+    if (droppedPkgs.has(pkg)) {
+      dmPinMap.delete(pkg); // already reported via the constraint entry — still drop the matching DM pin
+      continue;
+    }
+    if (protectedPins?.has(pkg)) continue;
+    const bv = bomManaged.get(pkg);
+    if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
+      dmPinMap.delete(pkg);
+      droppedOut?.push({ packageName: pkg, version: e.version, bomVersion: bv });
+    }
+  }
+}
+
+/** Drop pins the project's own force covers at or above and this run does not rewrite. */
+function dropShadowedPins(
+  content: string,
+  touched: ReadonlySet<string>,
+  protectedPins: ReadonlySet<string> | undefined,
+  entries: Map<string, { version: string; because: string }>,
+  forceMap: Map<string, string>,
+  shadowedOut: ShadowedManagedPin[] | undefined,
+): void {
+  for (const s of findShadowedManagedPins(content, touched)) {
+    // Vulnerability escapes survive even when the project's own force covers them at or above:
+    // that forced version is itself affected, and last resolutionStrategy.force wins — ours is last.
+    if (protectedPins?.has(s.packageName)) continue;
+    if (!entries.has(s.packageName) && !forceMap.has(s.packageName)) continue; // already dropped by the BOM pass
+    entries.delete(s.packageName);
+    forceMap.delete(s.packageName);
+    shadowedOut?.push(s);
+  }
+}
+
+/** Apply new constraint pins — new pins win on version conflicts. */
+function applyPinRequests(entries: Map<string, { version: string; because: string }>, pins: BumpRequest[]): void {
+  for (const pin of pins) {
+    entries.set(pin.packageName, {
+      version: pin.targetVersion,
+      because: pin.because.join(", "),
+    });
+  }
+}
+
+/** Apply force requests, keeping the higher version unless the request is a deliberate downgrade. */
+function applyForceRequests(forceMap: Map<string, string>, forces: BumpRequest[]): void {
+  for (const force of forces) {
+    const prev = forceMap.get(force.packageName);
+    if (force.isDowngrade || !prev || compareMavenVersion(force.targetVersion, prev) > 0) {
+      forceMap.set(force.packageName, force.targetVersion);
+    }
+  }
+}
+
+/** Apply DM pin bumps; the advisory comment is rendered only on first creation. */
+function applyDmBumpRequests(
+  dmPinMap: Map<string, { version: string; because: string }>,
+  dmBumps: BumpRequest[] | undefined,
+): void {
+  if (!dmBumps) return;
+  for (const b of dmBumps) {
+    const prev = dmPinMap.get(b.packageName);
+    if (b.isDowngrade || !prev || compareMavenVersion(b.targetVersion, prev.version) > 0) {
+      // The advisory comment is rendered only on first creation; on re-runs the existing
+      // entry's comment comes back as preserved free text, so don't render a second one.
+      dmPinMap.set(b.packageName, { version: b.targetVersion, because: prev ? "" : b.because.join(", ") });
+    }
+  }
+}
+
+/** Apply exclusions (constraint + force + DM pin removal) and record first-time reasons as free text. */
+function applyExcludeRequests(
+  excludeSet: Set<string>,
+  entries: Map<string, { version: string; because: string }>,
+  dmPinMap: Map<string, { version: string; because: string }>,
+  freeText: Map<string, string[]> | null,
+  excludes: ExcludeRequest[],
+): Map<string, string[]> | null {
+  let ft = freeText;
+  for (const ex of excludes) {
+    excludeSet.add(ex.packageName);
+    // An excluded package no longer needs a version constraint
+    entries.delete(ex.packageName);
+    dmPinMap.delete(ex.packageName);
+    // A first-time reason becomes preserved free text, rendered as a comment above the exclusion.
+    if (ex.reason) {
+      const key = `exclude:${ex.packageName}`;
+      if (!ft?.has(key)) {
+        ft = ft ?? new Map<string, string[]>();
+        ft.set(key, [`// ${ex.reason}`]);
+      }
+    }
+  }
+  return ft;
+}
+
 /**
  * Replace (or append) the auto-bumper managed block, merging new pins/excludes
  * with any existing ones. New pins win on version conflicts. When a BOM managed-version
@@ -923,14 +1225,10 @@ function upsertManagedBlock(
   content: string,
   pins: BumpRequest[],
   excludes: ExcludeRequest[],
-  forces: BumpRequest[] = [],
-  kotlin = false,
-  bomManaged: ReadonlyMap<string, string> | null = null,
-  droppedOut?: StaleManagedPin[],
-  protectedPins?: ReadonlySet<string>,
-  shadowedOut?: ShadowedManagedPin[],
-  dmBumps?: BumpRequest[],
+  forces: BumpRequest[],
+  opts: UpsertOptions,
 ): string {
+  const { kotlin = false, bomManaged, droppedOut, protectedPins, shadowedOut, dmBumps } = opts;
   // Merge any legacy-brand blocks into one before upserting, so the file ends with a single block.
   const merged = parseAllManagedRegions(content);
   content = consolidateManagedBlocks(content);
@@ -956,42 +1254,10 @@ function upsertManagedBlock(
 
     // Drop pins the platform BOM now manages at or above — they only force an older version.
     // Protected pins (vulnerability escapes) survive: the BOM-managed version is itself affected.
-    if (bomManaged) {
-      const droppedPkgs = new Set<string>();
-      for (const [pkg, e] of [...entries]) {
-        if (protectedPins?.has(pkg)) continue;
-        const bv = bomManaged.get(pkg);
-        if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
-          entries.delete(pkg);
-          droppedOut?.push({ packageName: pkg, version: e.version, bomVersion: bv });
-          droppedPkgs.add(pkg);
-        }
-      }
-      for (const [pkg, v] of [...forceMap]) {
-        if (droppedPkgs.has(pkg)) {
-          forceMap.delete(pkg); // already reported via the constraint entry — still drop the matching force
-          continue;
-        }
-        if (protectedPins?.has(pkg)) continue;
-        const bv = bomManaged.get(pkg);
-        if (bv !== undefined && compareMavenVersion(bv, v) >= 0) {
-          forceMap.delete(pkg);
-          droppedOut?.push({ packageName: pkg, version: v, bomVersion: bv });
-        }
-      }
-      for (const [pkg, e] of [...dmPinMap]) {
-        if (droppedPkgs.has(pkg)) {
-          dmPinMap.delete(pkg); // already reported via the constraint entry — still drop the matching DM pin
-          continue;
-        }
-        if (protectedPins?.has(pkg)) continue;
-        const bv = bomManaged.get(pkg);
-        if (bv !== undefined && compareMavenVersion(bv, e.version) >= 0) {
-          dmPinMap.delete(pkg);
-          droppedOut?.push({ packageName: pkg, version: e.version, bomVersion: bv });
-        }
-      }
-    }
+    const droppedPkgs = dropBomCoveredEntries(entries, bomManaged, protectedPins, droppedOut);
+    dropBomCoveredForces(forceMap, bomManaged, protectedPins, droppedOut, droppedPkgs);
+    dropBomCoveredDmPins(dmPinMap, bomManaged, protectedPins, droppedOut, droppedPkgs);
+
     // Drop pins the project's own force already covers at or above and this run does not rewrite —
     // they would only shadow an explicit decision (last resolutionStrategy.force wins, ours is last).
     const touched = new Set<string>([
@@ -999,58 +1265,16 @@ function upsertManagedBlock(
       ...forces.map(f => f.packageName),
       ...excludes.map(e => e.packageName),
     ]);
-    for (const s of findShadowedManagedPins(content, touched)) {
-      // Vulnerability escapes survive even when the project's own force covers them at or above:
-      // that forced version is itself affected, and last resolutionStrategy.force wins — ours is last.
-      if (protectedPins?.has(s.packageName)) continue;
-      if (!entries.has(s.packageName) && !forceMap.has(s.packageName)) continue; // already dropped by the BOM pass
-      entries.delete(s.packageName);
-      forceMap.delete(s.packageName);
-      shadowedOut?.push(s);
-    }
+    dropShadowedPins(content, touched, protectedPins, entries, forceMap, shadowedOut);
 
     before = collapseTrailingNewlines(content.slice(0, beginIdx));
     after = content.slice(endIdx + endLen).replace(/^\n+/, "\n");
   }
 
-  for (const pin of pins) {
-    entries.set(pin.packageName, {
-      version: pin.targetVersion,
-      because: pin.because.join(", "),
-    });
-  }
-  for (const ex of excludes) {
-    excludeSet.add(ex.packageName);
-    // An excluded package no longer needs a version constraint
-    entries.delete(ex.packageName);
-  }
-  for (const force of forces) {
-    const prev = forceMap.get(force.packageName);
-    if (force.isDowngrade || !prev || compareMavenVersion(force.targetVersion, prev) > 0) {
-      forceMap.set(force.packageName, force.targetVersion);
-    }
-  }
-  if (dmBumps) {
-    for (const b of dmBumps) {
-      const prev = dmPinMap.get(b.packageName);
-      if (b.isDowngrade || !prev || compareMavenVersion(b.targetVersion, prev.version) > 0) {
-        // The advisory comment is rendered only on first creation; on re-runs the existing
-        // entry's comment comes back as preserved free text, so don't render a second one.
-        dmPinMap.set(b.packageName, { version: b.targetVersion, because: prev ? "" : b.because.join(", ") });
-      }
-    }
-  }
-  for (const ex of excludes) {
-    excludeSet.add(ex.packageName);
-    // An excluded package no longer needs a version constraint
-    entries.delete(ex.packageName);
-    dmPinMap.delete(ex.packageName);
-    // A first-time reason becomes preserved free text, rendered as a comment above the exclusion.
-    if (ex.reason) {
-      const key = `exclude:${ex.packageName}`;
-      if (!freeText?.has(key)) (freeText ??= new Map()).set(key, [`// ${ex.reason}`]);
-    }
-  }
+  applyPinRequests(entries, pins);
+  applyForceRequests(forceMap, forces);
+  applyDmBumpRequests(dmPinMap, dmBumps);
+  freeText = applyExcludeRequests(excludeSet, entries, dmPinMap, freeText, excludes);
 
   if (entries.size === 0 && excludeSet.size === 0 && forceMap.size === 0 && dmPinMap.size === 0) {
     // Fully cleaned block: remove it so re-runs stay idempotent.
@@ -1203,6 +1427,38 @@ export interface GradlePlatform {
   property?: string;
 }
 
+/** True for characters that may start a gradle.properties key ([A-Za-z_]). */
+function isPropsKeyFirst(ch: string | undefined): boolean {
+  if (!ch) return false;
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch === "_";
+}
+
+/** True for characters that may follow the first in a gradle.properties key ([A-Za-z0-9_.-]). */
+function isPropsKeyRest(ch: string | undefined): boolean {
+  if (!ch) return false;
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch === "_" || ch === "." || ch === "-";
+}
+
+/**
+ * Parse one gradle.properties line of the shape `name=value` or `name:value`. Returns null for
+ * comments, blank lines, and lines without a separator; the value keeps inner whitespace but not
+ * its surrounding padding — mirroring the historical regex exactly.
+ */
+function parsePropsLine(line: string): { name: string; value: string } | null {
+  if (line.trim().startsWith("#")) return null;
+  let i = 0;
+  while (i < line.length && isLineWs(line[i])) i++;
+  if (!isPropsKeyFirst(line[i])) return null;
+  i++;
+  while (i < line.length && isPropsKeyRest(line[i])) i++;
+  const name = line.slice(0, i);
+  while (i < line.length && isLineWs(line[i])) i++;
+  if (line[i] !== "=" && line[i] !== ":") return null;
+  const rest = line.slice(i + 1);
+  if (rest.length === 0) return null;
+  return { name, value: rest.trim() };
+}
+
 /** Map of gradle.properties entries plus inline `def`/typed assignments in the build file. */
 function readVersionProperties(buildFile: string): Map<string, string> {
   const props = new Map<string, string>();
@@ -1214,9 +1470,8 @@ function readVersionProperties(buildFile: string): Map<string, string> {
   const propsPath = path.join(path.dirname(buildFile), "gradle.properties");
   if (fs.existsSync(propsPath)) {
     for (const line of fs.readFileSync(propsPath, "utf-8").split(/\r?\n/)) {
-      if (line.trim().startsWith("#")) continue;
-      const m = /^\s*([A-Za-z_][\w.-]*)\s*[=:]\s*(.+?)\s*$/.exec(line);
-      if (m) props.set(m[1]!, m[2]!);
+      const p = parsePropsLine(line);
+      if (p) props.set(p.name, p.value);
     }
   }
   return props;
@@ -1248,8 +1503,35 @@ export function detectGradlePlatform(buildFile: string): GradlePlatform | null {
   return { group, artifact, version, property: vm?.[1] };
 }
 
-/** `id 'org.springframework.boot' version '…'` or `id("…") version "…"`, literal or `${prop}`. */
-const BOOT_PLUGIN_VERSION_RE = /id\s*\(?\s*(['"])org\.springframework\.boot\1\s*\)?\s+version\s+(['"])([^'"]+)\2/;
+/** The Spring Boot plugin id declaration: `id 'org.springframework.boot'` or `id("…")`. */
+const BOOT_PLUGIN_ID_RE = /id(?:\s*\(\s*|\s+)(['"])org\.springframework\.boot\1/g;
+
+/** A `version "…"` (or `'…'`) directly following the id, with an optional closing paren. */
+const BOOT_PLUGIN_VERSION_TAIL_RE = /^(?:\s*\)\s+|\s+)version\s+(['"])([^'"]+)\1/;
+
+/**
+ * Locate the Spring Boot plugin version declaration (`id "…" version "…"` / `id '…' version '…'`,
+ * literal or `${prop}`). Two anchored stages keep each regex simple; the first id whose declaration
+ * carries a version wins, matching the historical single-regex leftmost-match semantics. Returns the
+ * raw version and its span in content.
+ */
+function findBootPluginVersion(content: string): { raw: string; quote: string; start: number; end: number } | null {
+  // The id regex is global for iteration; reset so a previous call's lastIndex can't skip matches.
+  BOOT_PLUGIN_ID_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while (true) {
+    m = BOOT_PLUGIN_ID_RE.exec(content);
+    if (!m) break;
+    const tail = BOOT_PLUGIN_VERSION_TAIL_RE.exec(content.slice(m.index + m[0].length));
+    if (!tail) continue;
+    const base = m.index + m[0].length;
+    const raw = tail[2]!;
+    // tail[0] = prefix + opening quote + version + closing quote (one char each)
+    const start = base + tail[0].length - raw.length - 1;
+    return { raw, quote: tail[1]!, start, end: start + raw.length };
+  }
+  return null;
+}
 
 /** Resolved Spring Boot Gradle plugin version, when the plugins block sets one. */
 export interface SpringBootPluginVersion {
@@ -1266,9 +1548,9 @@ export function detectSpringBootPlugin(buildFile: string): SpringBootPluginVersi
   } catch {
     return null;
   }
-  const m = BOOT_PLUGIN_VERSION_RE.exec(content);
-  if (!m) return null;
-  const raw = m[3]!;
+  const f = findBootPluginVersion(content);
+  if (!f) return null;
+  const raw = f.raw;
   const vm = /^\$\{(\w+)\}$/.exec(raw);
   if (!vm) return { version: raw };
   const version = readVersionProperties(buildFile).get(vm[1]!);
@@ -1290,7 +1572,7 @@ function rewriteVersionProperty(buildFile: string, property: string, fromVersion
   const propsPath = path.join(path.dirname(buildFile), "gradle.properties");
   if (fs.existsSync(propsPath)) {
     const text = fs.readFileSync(propsPath, "utf-8");
-    const lineRe = new RegExp(`^([ \\t]*${escapeRegex(property)}[ \\t]*=[ \\t]*)${escapeRegex(fromVersion)}\\s*$`, "m");
+    const lineRe = new RegExp(String.raw`^([ \t]*${escapeRegex(property)}[ \t]*=[ \t]*)${escapeRegex(fromVersion)}\s*$`, "m");
     if (lineRe.test(text)) {
       fs.writeFileSync(propsPath, text.replace(lineRe, `$1${toVersion}`), "utf-8");
       return true;
@@ -1298,7 +1580,7 @@ function rewriteVersionProperty(buildFile: string, property: string, fromVersion
   }
   const content = fs.readFileSync(buildFile, "utf-8");
   const inlineRe = new RegExp(
-    `^([ \\t]*(?:(?:def|final)[ \\t]+)?(?:(?:String|int|Integer)[ \\t]+)?${escapeRegex(property)}[ \\t]*=[ \\t]*["'])${escapeRegex(fromVersion)}(["'].*)$`,
+    String.raw`^([ \t]*(?:(?:def|final)[ \t]+)?(?:(?:String|int|Integer)[ \t]+)?${escapeRegex(property)}[ \t]*=[ \t]*["'])${escapeRegex(fromVersion)}(["'].*)$`,
     "m",
   );
   if (!inlineRe.test(content)) return false;
@@ -1311,21 +1593,16 @@ export function bumpSpringBootPlugin(buildFile: string, pin: SpringBootPluginVer
   if (compareMavenVersion(newVersion, pin.version) <= 0) return false;
   if (pin.property) return rewriteVersionProperty(buildFile, pin.property, pin.version, newVersion);
   const content = fs.readFileSync(buildFile, "utf-8");
-  const m = BOOT_PLUGIN_VERSION_RE.exec(content);
-  if (!m || m[3] !== pin.version) return false;
-  const quote = m[2]!;
-  const updated = m[0].replace(
-    new RegExp(`(version\\s+${quote})${escapeRegex(m[3]!)}${quote}`),
-    `$1${newVersion}${quote}`,
-  );
-  fs.writeFileSync(buildFile, content.slice(0, m.index) + updated + content.slice(m.index + m[0].length), "utf-8");
+  const f = findBootPluginVersion(content);
+  if (f?.raw !== pin.version) return false;
+  fs.writeFileSync(buildFile, content.slice(0, f.start) + newVersion + content.slice(f.end), "utf-8");
   return true;
 }
 
 /** When a spring-boot-dependencies bump matches the plugin version, move the plugin with it. */
 function syncSpringBootPlugin(buildFile: string, fromVersion: string, toVersion: string): void {
   const boot = detectSpringBootPlugin(buildFile);
-  if (!boot || boot.version !== fromVersion) return;
+  if (boot?.version !== fromVersion) return;
   bumpSpringBootPlugin(buildFile, boot, toVersion);
 }
 
@@ -1359,17 +1636,17 @@ export function bumpGradlePlatform(platform: GradlePlatform, buildFile: string, 
     const propsPath = path.join(dir, "gradle.properties");
     if (!fs.existsSync(propsPath)) return false;
     let text = fs.readFileSync(propsPath, "utf-8");
-    const lineRe = new RegExp(`^([ \\t]*${escapeRegex(platform.property)}[ \\t]*=[ \\t]*)${escapeRegex(platform.version)}\\s*$`, "m");
+    const lineRe = new RegExp(String.raw`^([ \t]*${escapeRegex(platform.property)}[ \t]*=[ \t]*)${escapeRegex(platform.version)}\s*$`, "m");
     if (!lineRe.test(text)) return false;
     text = text.replace(lineRe, `$1${newVersion}`);
     const pluginRe = /^([ \t]*quarkusPluginVersion[ \t]*=[ \t]*)(\S+)\s*$/m;
     const pm = pluginRe.exec(text);
-    if (pm && pm[2] === platform.version) text = text.replace(pluginRe, `$1${newVersion}`);
+    if (pm?.[2] === platform.version) text = text.replace(pluginRe, `$1${newVersion}`);
     fs.writeFileSync(propsPath, text, "utf-8");
     return true;
   }
   let content = fs.readFileSync(buildFile, "utf-8");
-  const coordRe = new RegExp(`(["'])${escapeRegex(platform.group)}:${escapeRegex(platform.artifact)}:${escapeRegex(platform.version)}\\1`);
+  const coordRe = new RegExp(String.raw`(["'])${escapeRegex(platform.group)}:${escapeRegex(platform.artifact)}:${escapeRegex(platform.version)}\1`);
   if (!coordRe.test(content)) return false;
   content = content.replace(coordRe, `$1${platform.group}:${platform.artifact}:${newVersion}$1`);
   fs.writeFileSync(buildFile, content, "utf-8");
@@ -1572,11 +1849,7 @@ export function applyBumps(
   const kotlin = filePath.endsWith(".kts");
   let content = fs.readFileSync(filePath, "utf-8");
   // Cleanup-only runs (no bumps/excludes) proceed when the BOM map marks existing pins stale.
-  if (bumps.length === 0 && excludes.length === 0) {
-    const stale = bomManaged ? findStaleManagedPins(content, bomManaged, protectedPins) : [];
-    const shadowedDroppable = findShadowedManagedPins(content).some(s => !protectedPins?.has(s.packageName));
-    if (stale.length === 0 && !shadowedDroppable) return result;
-  }
+  if (bumps.length === 0 && excludes.length === 0 && !hasCleanupWork(content, bomManaged, protectedPins)) return result;
   const catalogDirect = applyCatalogBumps(filePath, bumps);
   let remainingBumps = bumps.filter(b => !catalogDirect.includes(b.packageName));
 
@@ -1606,72 +1879,130 @@ export function applyBumps(
   content = classified.content;
 
   const effectiveBumps = remainingBumps.map(b => withEffectiveVersion(content, b));
-  let pins = mergePinsToEffective(content, classified.pinned, effectiveBumps);
-  let forces = enforced ? collectForcePins(content, effectiveBumps) : [];
-
-  // The project's own resolutionStrategy.force pins (outside the managed block) express an explicit
-  // decision. A managed pin at the same version is redundant and skipped; one at a different
-  // version would silently override that decision, so it must be called out before being written.
+  const initialPins = mergePinsToEffective(content, classified.pinned, effectiveBumps);
+  const initialForces = enforced ? collectForcePins(content, effectiveBumps) : [];
   const userForces = parseUserForces(content);
-  if (userForces.size > 0) {
-    pins = pins.filter(pin => {
-      const uv = userForces.get(pin.packageName);
-      if (uv === undefined) return true;
-      if (compareMavenVersion(uv, pin.targetVersion) === 0) {
-        result.warnings.push(`skipped managed pin ${pin.packageName}@${pin.targetVersion} — the project already forces it at that version via its own resolutionStrategy`);
-        return false;
-      }
-      result.warnings.push(`managed pin ${pin.packageName}@${pin.targetVersion} overrides the project's own force ${pin.packageName}@${uv} — last resolutionStrategy.force wins`);
-      return true;
-    });
-    forces = forces.filter(force => {
-      const uv = userForces.get(force.packageName);
-      if (uv === undefined) return true;
-      if (compareMavenVersion(uv, force.targetVersion) === 0) {
-        result.warnings.push(`skipped managed force ${force.packageName}@${force.targetVersion} — the project already forces it at that version via its own resolutionStrategy`);
-        return false;
-      }
-      result.warnings.push(`managed force ${force.packageName}@${force.targetVersion} overrides the project's own force ${force.packageName}@${uv} — last resolutionStrategy.force wins`);
-      return true;
-    });
-  }
+  const { pins, forces, dmBumps } = reconcilePinSets(result, {
+    userForces, springDm, catalogDirect, direct: classified.direct, effectiveBumps, pins: initialPins, forces: initialForces,
+  });
 
-  // On Spring dependency-management projects the component-metadata rule outranks BOM imports
-  // AND resolutionStrategy.force, so the same pins are also written as dependencyManagement
-  // entries — the only mechanism that reliably beats it.
+  announcePinMechanisms(result, forces, dmBumps);
+
+  const dropped: StaleManagedPin[] = [];
+  const shadowed: ShadowedManagedPin[] = [];
+  const prevDm = parseExistingDmPins(content);
+  content = upsertManagedBlock(content, pins, excludes, forces, {
+    kotlin,
+    bomManaged,
+    droppedOut: dropped,
+    protectedPins,
+    shadowedOut: shadowed,
+    dmBumps: dmBumps ?? undefined,
+  });
+  recordDroppedPins(result, dropped, shadowed);
+  result.direct.push(...catalogDirect, ...classified.direct);
+  result.constrained.push(...pins.map(p => p.packageName));
+  // A dependencyManagement pin written by this apply is a constraint too — credit it even when the
+  // managed constraints line already sat at the target (e.g. leftover from an earlier run) and only
+  // the DM pin made the fix effective on the classpath. Exact no-ops are not credited, so a plan that
+  // writes nothing stays unrecorded and the stall detector stops honestly.
+  creditDmBumps(result, prevDm, dmBumps);
+  recordAppliedTargets(appliedTargets, pins, dmBumps);
+  if (Object.keys(appliedTargets).length > 0) result.appliedTargets = appliedTargets;
+  result.warnings.push(...classified.warnings);
+  emitSpringBootWarnings(result, pins);
+  result.excluded = excludes.map(e => e.packageName);
+  fs.writeFileSync(filePath, content, "utf-8");
+  return result;
+}
+
+/** True when a cleanup-only run (no bumps/excludes) still has stale or shadowed pins to drop. */
+function hasCleanupWork(
+  content: string,
+  bomManaged: ReadonlyMap<string, string> | null,
+  protectedPins?: ReadonlySet<string>,
+): boolean {
+  const stale = bomManaged ? findStaleManagedPins(content, bomManaged, protectedPins) : [];
+  if (stale.length > 0) return true;
+  return findShadowedManagedPins(content).some(s => !protectedPins?.has(s.packageName));
+}
+
+/**
+ * Filter pin entries against the project's own resolutionStrategy.force pins: an entry at the same
+ * version is redundant and skipped; one at a different version would silently override that decision,
+ * so it must be called out before being written.
+ */
+function reconcileWithUserForces<T extends { packageName: string; targetVersion: string }>(
+  result: ApplyResult,
+  userForces: Map<string, string>,
+  label: string,
+  overrideNote: string,
+  entries: T[],
+): T[] {
+  return entries.filter(entry => {
+    const uv = userForces.get(entry.packageName);
+    if (uv === undefined) return true;
+    if (compareMavenVersion(uv, entry.targetVersion) === 0) {
+      result.warnings.push(`skipped ${label} ${entry.packageName}@${entry.targetVersion} — the project already forces it at that version via its own resolutionStrategy`);
+      return false;
+    }
+    result.warnings.push(`${label} ${entry.packageName}@${entry.targetVersion} overrides the project's own force ${entry.packageName}@${uv}${overrideNote}`);
+    return true;
+  });
+}
+
+interface PinSetInputs {
+  userForces: Map<string, string>;
+  springDm: boolean;
+  catalogDirect: string[];
+  direct: string[];
+  effectiveBumps: BumpRequest[];
+  pins: BumpRequest[];
+  forces: BumpRequest[];
+}
+
+/**
+ * Reconcile the pin and force sets against user forces, and build the dependencyManagement set when
+ * the project uses Spring dependency management (its component-metadata rule outranks BOM imports
+ * AND resolutionStrategy.force, so the same pins are also written as DM entries — the only mechanism
+ * that reliably beats it).
+ */
+function reconcilePinSets(
+  result: ApplyResult,
+  input: PinSetInputs,
+): { pins: BumpRequest[]; forces: BumpRequest[]; dmBumps: BumpRequest[] | null } {
+  const { userForces, springDm, catalogDirect, direct, effectiveBumps, pins, forces } = input;
+  const note = " — last resolutionStrategy.force wins";
+  const reconciledPins = userForces.size > 0 ? reconcileWithUserForces(result, userForces, "managed pin", note, pins) : pins;
+  const reconciledForces = userForces.size > 0 ? reconcileWithUserForces(result, userForces, "managed force", note, forces) : forces;
+
+  // Directly-declared dependencies are already rewritten in place; a DM pin for them is redundant.
   let dmBumps: BumpRequest[] | null = null;
   if (springDm) {
-    // Directly-declared dependencies are already rewritten in place; a DM pin for them is redundant.
-    const directSet = new Set([...catalogDirect, ...classified.direct]);
-    dmBumps = effectiveBumps.filter(b => !directSet.has(b.packageName)).filter(b => {
-      const uv = userForces.get(b.packageName);
-      if (uv === undefined) return true;
-      if (compareMavenVersion(uv, b.targetVersion) === 0) {
-        result.warnings.push(`skipped dependencyManagement pin ${b.packageName}@${b.targetVersion} — the project already forces it at that version via its own resolutionStrategy`);
-        return false;
-      }
-      result.warnings.push(`dependencyManagement pin ${b.packageName}@${b.targetVersion} overrides the project's own force ${b.packageName}@${uv}`);
-      return true;
-    });
+    const directSet = new Set([...catalogDirect, ...direct]);
+    const candidates = effectiveBumps.filter(b => !directSet.has(b.packageName));
+    dmBumps = userForces.size > 0 ? reconcileWithUserForces(result, userForces, "dependencyManagement pin", "", candidates) : candidates;
   }
+  return { pins: reconciledPins, forces: reconciledForces, dmBumps };
+}
 
+/** Warnings announcing the extra pin mechanisms (resolutionStrategy.force / dependencyManagement). */
+function announcePinMechanisms(result: ApplyResult, forces: BumpRequest[], dmBumps: BumpRequest[] | null): void {
   if (forces.length > 0) {
     result.forced.push(...forces.map(f => f.packageName));
     result.warnings.push(
       `BOM or Spring dependency management detected — added resolutionStrategy.force for ${forces.length} package(s) so the BOM cannot downgrade fixes`,
     );
   }
-
   if (dmBumps && dmBumps.length > 0) {
     result.warnings.push(
       `Spring dependency management detected — pinned ${dmBumps.length} package(s) via dependencyManagement (its component-metadata rule beats BOM imports and resolutionStrategy.force)`,
     );
   }
+}
 
-  const dropped: StaleManagedPin[] = [];
-  const shadowed: ShadowedManagedPin[] = [];
-  const prevDm = parseExistingDmPins(content);
-  content = upsertManagedBlock(content, pins, excludes, forces, kotlin, bomManaged, dropped, protectedPins, shadowed, dmBumps ?? undefined);
+/** Warnings for pins this run dropped as stale or shadowed by the project's own force. */
+function recordDroppedPins(result: ApplyResult, dropped: StaleManagedPin[], shadowed: ShadowedManagedPin[]): void {
   if (dropped.length > 0) {
     result.droppedStale = dropped.map(d => `${d.packageName}@${d.version}`);
     for (const d of dropped) {
@@ -1681,34 +2012,33 @@ export function applyBumps(
   for (const s of shadowed) {
     result.warnings.push(`removed stale managed pin ${s.packageName}@${s.version} — the project's own resolutionStrategy.force already pins it at ${s.userVersion}`);
   }
-  result.direct.push(...catalogDirect, ...classified.direct);
-  result.constrained.push(...pins.map(p => p.packageName));
-  // A dependencyManagement pin written by this apply is a constraint too — credit it even when the
-  // managed constraints line already sat at the target (e.g. leftover from an earlier run) and only
-  // the DM pin made the fix effective on the classpath. Exact no-ops are not credited, so a plan that
-  // writes nothing stays unrecorded and the stall detector stops honestly.
-  if (dmBumps) {
-    const credited = new Set(result.constrained);
-    for (const b of dmBumps) {
-      if (credited.has(b.packageName)) continue;
-      const prevV = prevDm.get(b.packageName);
-      if (prevV !== undefined && compareMavenVersion(prevV, b.targetVersion) >= 0) continue;
-      result.constrained.push(b.packageName);
-      credited.add(b.packageName);
-    }
+}
+
+/**
+ * Credit dependencyManagement pins that made a fix effective even when the managed constraints line
+ * already sat at the target (e.g. leftover from an earlier run). Exact no-ops are not credited, so a
+ * plan that writes nothing stays unrecorded and the stall detector stops honestly.
+ */
+function creditDmBumps(result: ApplyResult, prevDm: Map<string, string>, dmBumps: BumpRequest[] | null): void {
+  if (!dmBumps) return;
+  const credited = new Set(result.constrained);
+  for (const b of dmBumps) {
+    if (credited.has(b.packageName)) continue;
+    const prevV = prevDm.get(b.packageName);
+    if (prevV !== undefined && compareMavenVersion(prevV, b.targetVersion) >= 0) continue;
+    result.constrained.push(b.packageName);
+    credited.add(b.packageName);
   }
+}
+
+/** Record the effective target version for every pin and DM entry this run wrote. */
+function recordAppliedTargets(appliedTargets: Record<string, string>, pins: BumpRequest[], dmBumps: BumpRequest[] | null): void {
   for (const p of pins) appliedTargets[p.packageName] = p.targetVersion;
   if (dmBumps) {
     for (const b of dmBumps) {
       if (!(b.packageName in appliedTargets)) appliedTargets[b.packageName] = b.targetVersion;
     }
   }
-  if (Object.keys(appliedTargets).length > 0) result.appliedTargets = appliedTargets;
-  result.warnings.push(...classified.warnings);
-  emitSpringBootWarnings(result, pins);
-  result.excluded = excludes.map(e => e.packageName);
-  fs.writeFileSync(filePath, content, "utf-8");
-  return result;
 }
 
 /**
@@ -1766,19 +2096,12 @@ function routeSpringBootPluginBumps(
   return rest;
 }
 
-/**
- * Route BOM-managed family candidates that cross the platform's minor line to a whole-platform bump.
- * Quarkus and Spring Boot's own modules also route patch bumps, because those versions are the platform version.
- * Returns the bumps left for the normal pin/force path; records applied/skipped entries on result.
- */
-function routePlatformBumps(
+/** Split bumps into those routed to a whole-platform bump and the rest left for pins. */
+function classifyPlatformBumps(
   platform: GradlePlatform,
-  buildFile: string,
   content: string,
   bumps: BumpRequest[],
-  result: ApplyResult,
-  appliedTargets: Record<string, string>,
-): BumpRequest[] {
+): { routed: BumpRequest[]; rest: BumpRequest[] } {
   const routed: BumpRequest[] = [];
   const rest: BumpRequest[] = [];
   for (const b of bumps) {
@@ -1796,31 +2119,29 @@ function routePlatformBumps(
     if (newer && (bootModule || quarkusModule || crossMinorFamily)) routed.push(b);
     else rest.push(b);
   }
-  if (routed.length === 0) return bumps;
+  return { routed, rest };
+}
 
-  // Unified-version platforms (e.g. Quarkus): the fix target IS a platform version. Other BOMs
-  // (e.g. Spring Boot, where artifact versions differ from BOM versions) cannot be mapped — skip.
-  const platformMajor = /^(\d+)/.exec(platform.version)?.[1] ?? "";
-  const mappable = routed.filter(b => (/^(\d+)/.exec(b.targetVersion)?.[1] ?? "") === platformMajor);
-  if (mappable.length === 0) {
-    for (const b of routed) result.warnings.push(
-      `${b.packageName}: fix ${b.targetVersion} crosses the minor line managed by ${platform.group}:${platform.artifact} ${platform.version}, but artifact versions do not map to platform releases — skipped; bump the platform/BOM manually`,
-    );
-    return rest;
-  }
+/** Highest Maven version in the list, or `initial` when the list is empty. */
+function highestMavenVersion(versions: string[], initial: string): string {
+  return versions.reduce((max, v) => (compareMavenVersion(v, max) > 0 ? v : max), initial);
+}
 
-  const target = mappable.reduce(
-    (max, b) => compareMavenVersion(b.targetVersion, max) > 0 ? b.targetVersion : max,
-    platform.version,
-  );
-  if (!bumpGradlePlatform(platform, buildFile, target)) {
-    for (const b of routed) result.warnings.push(
-      `${b.packageName}: could not rewrite ${platform.group}:${platform.artifact} version — skipped instead of force-pinning across the minor line`,
-    );
-    return rest;
-  }
-  if (isSpringBootBom(platform)) syncSpringBootPlugin(buildFile, platform.version, target);
+/** True when a same-family candidate at or below the new platform version is covered by the bump. */
+function coveredByPlatformBump(packageName: string, targetVersion: string, platform: GradlePlatform, target: string): boolean {
+  const group = packageName.split(":")[0] || "";
+  return group !== "" && sameGroupFamily(group, platform.group) && compareMavenVersion(targetVersion, target) <= 0;
+}
 
+/** Record the platform bump on result/appliedTargets and warn about candidates it does not cover. */
+function recordPlatformBump(
+  result: ApplyResult,
+  appliedTargets: Record<string, string>,
+  platform: GradlePlatform,
+  target: string,
+  routed: BumpRequest[],
+  mappable: BumpRequest[],
+): void {
   for (const b of mappable) {
     result.direct.push(`${b.packageName}: via ${platform.group}:${platform.artifact} ${platform.version} → ${target}`);
     appliedTargets[b.packageName] = target;
@@ -1836,12 +2157,96 @@ function routePlatformBumps(
       ? `Bumped ${platform.group}:${platform.artifact} ${platform.version} → ${target} — ${mappable.length} fix(es) cross the platform's minor line. Expect API changes; run a full build and tests.`
       : `Bumped ${platform.group}:${platform.artifact} ${platform.version} → ${target} — ${mappable.length} fix(es) stay on the platform line.`,
   );
+}
+
+/**
+ * Route BOM-managed family candidates that cross the platform's minor line to a whole-platform bump.
+ * Quarkus and Spring Boot's own modules also route patch bumps, because those versions are the platform version.
+ * Returns the bumps left for the normal pin/force path; records applied/skipped entries on result.
+ */
+function routePlatformBumps(
+  platform: GradlePlatform,
+  buildFile: string,
+  content: string,
+  bumps: BumpRequest[],
+  result: ApplyResult,
+  appliedTargets: Record<string, string>,
+): BumpRequest[] {
+  const { routed, rest } = classifyPlatformBumps(platform, content, bumps);
+  if (routed.length === 0) return bumps;
+
+  // Unified-version platforms (e.g. Quarkus): the fix target IS a platform version. Other BOMs
+  // (e.g. Spring Boot, where artifact versions differ from BOM versions) cannot be mapped — skip.
+  const platformMajor = /^(\d+)/.exec(platform.version)?.[1] ?? "";
+  const mappable = routed.filter(b => (/^(\d+)/.exec(b.targetVersion)?.[1] ?? "") === platformMajor);
+  if (mappable.length === 0) {
+    for (const b of routed) result.warnings.push(
+      `${b.packageName}: fix ${b.targetVersion} crosses the minor line managed by ${platform.group}:${platform.artifact} ${platform.version}, but artifact versions do not map to platform releases — skipped; bump the platform/BOM manually`,
+    );
+    return rest;
+  }
+
+  const target = highestMavenVersion(mappable.map(b => b.targetVersion), platform.version);
+  if (!bumpGradlePlatform(platform, buildFile, target)) {
+    for (const b of routed) result.warnings.push(
+      `${b.packageName}: could not rewrite ${platform.group}:${platform.artifact} version — skipped instead of force-pinning across the minor line`,
+    );
+    return rest;
+  }
+  if (isSpringBootBom(platform)) syncSpringBootPlugin(buildFile, platform.version, target);
+
+  recordPlatformBump(result, appliedTargets, platform, target, routed, mappable);
 
   // Family candidates now covered by the new platform version need no pin of their own.
-  return rest.filter(b => {
-    const group = b.packageName.split(":")[0] || "";
-    return !(group !== "" && sameGroupFamily(group, platform.group) && compareMavenVersion(b.targetVersion, target) <= 0);
-  });
+  return rest.filter(b => !coveredByPlatformBump(b.packageName, b.targetVersion, platform, target));
+}
+
+/** Classpath members of the family sharing `installedVersion`'s release line (null = no classpath). */
+function findLineSiblings(
+  group: string,
+  packageName: string,
+  installedVersion: string,
+  classpathPackages: readonly { name: string; version: string }[] | null,
+): { name: string; version: string }[] | null {
+  if (!classpathPackages) return null;
+  const [maj, min] = versionLine(installedVersion);
+  return classpathPackages.filter(p =>
+    p.name !== packageName
+    && sameGroupFamily(p.name.split(":")[0] ?? "", group)
+    && versionLine(p.version).join(".") === `${maj}.${min}`);
+}
+
+/**
+ * Expand a cross-line fix to the whole family: every classpath member of the family below the highest
+ * fix target gets a pin at that target, so the family moves together. Members whose target version is
+ * not published in the project's repositories are left alone (`alignedMemberOk` answers false for
+ * them; null = unknown, allowed best-effort). Returns the candidate plus the added members.
+ */
+function expandAlignedFamily(
+  bumps: BumpRequest[],
+  b: BumpRequest,
+  group: string,
+  classpathPackages: readonly { name: string; version: string }[],
+  alignedMemberOk: ((packageName: string, version: string) => boolean | null) | undefined,
+  result: ApplyResult,
+): BumpRequest[] {
+  const maxTarget = familyMaxTarget(bumps, group, b.targetVersion);
+  const added: BumpRequest[] = [];
+  for (const p of classpathPackages) {
+    if (p.name === b.packageName || !sameGroupFamily(p.name.split(":")[0] ?? "", group)) continue;
+    if (compareMavenVersion(p.version, maxTarget) >= 0) continue;
+    if (alignedMemberOk?.(p.name, maxTarget) === false) {
+      result.warnings.push(
+        `${p.name}: family alignment to ${maxTarget} skipped — version not published in the project's repositories`,
+      );
+      continue;
+    }
+    added.push({ packageName: p.name, targetVersion: maxTarget, because: [`family alignment with ${b.packageName}`], installedVersion: p.version });
+  }
+  result.warnings.push(
+    `${group}: cross-minor fix ${b.installedVersion} → ${maxTarget} — aligned the whole family on the classpath to ${maxTarget} (${[b.packageName, ...added.map(a => a.packageName)].join(", ")}) via managed pins`,
+  );
+  return [b, ...added];
 }
 
 /**
@@ -1881,14 +2286,7 @@ function skipCrossMinorBomBumps(
       continue;
     }
     const group = b.packageName.split(":")[0] ?? "";
-    let lineSiblings: { name: string; version: string }[] | null = null;
-    if (classpathPackages) {
-      const [maj, min] = versionLine(b.installedVersion);
-      lineSiblings = classpathPackages.filter(p =>
-        p.name !== b.packageName
-        && sameGroupFamily(p.name.split(":")[0] ?? "", group)
-        && versionLine(p.version).join(".") === `${maj}.${min}`);
-    }
+    const lineSiblings = findLineSiblings(group, b.packageName, b.installedVersion, classpathPackages);
     const hasSibling = lineSiblings === null
       ? hasLineSibling(b.packageName, b.installedVersion, bomManaged)
       : lineSiblings.length > 0;
@@ -1897,23 +2295,7 @@ function skipCrossMinorBomBumps(
     // Expansion needs classpath ground truth to know which members to align; without it, skip conservatively.
     if (classpathPackages) {
       alignedGroups.add(group);
-      const maxTarget = familyMaxTarget(bumps, group, b.targetVersion);
-      const added: BumpRequest[] = [];
-      for (const p of classpathPackages ?? []) {
-        if (p.name === b.packageName || !sameGroupFamily(p.name.split(":")[0] ?? "", group)) continue;
-        if (compareMavenVersion(p.version, maxTarget) >= 0) continue;
-        if (alignedMemberOk?.(p.name, maxTarget) === false) {
-          result.warnings.push(
-            `${p.name}: family alignment to ${maxTarget} skipped — version not published in the project's repositories`,
-          );
-          continue;
-        }
-        added.push({ packageName: p.name, targetVersion: maxTarget, because: [`family alignment with ${b.packageName}`], installedVersion: p.version });
-      }
-      result.warnings.push(
-        `${group}: cross-minor fix ${b.installedVersion} → ${maxTarget} — aligned the whole family on the classpath to ${maxTarget} (${[b.packageName, ...added.map(a => a.packageName)].join(", ")}) via managed pins`,
-      );
-      kept.push(b, ...added);
+      kept.push(...expandAlignedFamily(bumps, b, group, classpathPackages, alignedMemberOk, result));
       continue;
     }
     const via = platform ? ` managed by ${platform.group}:${platform.artifact} ${platform.version}` : "";
@@ -1997,8 +2379,9 @@ function filterBomCoveredBumps(
     if (!b.isDowngrade) {
       const bv = bomManaged.get(b.packageName);
       if (bv !== undefined && compareMavenVersion(bv, b.targetVersion) >= 0) {
+        const managedBy = platform ? `${platform.group}:${platform.artifact} ${platform.version}` : "BOM";
         result.warnings.push(
-          `${b.packageName}: target ${b.targetVersion} is at or below ${platform ? `${platform.group}:${platform.artifact} ${platform.version}` : "BOM"}-managed ${bv} — pin would force a downgrade; skipped`,
+          `${b.packageName}: target ${b.targetVersion} is at or below ${managedBy}-managed ${bv} — pin would force a downgrade; skipped`,
         );
         continue;
       }
@@ -2083,7 +2466,7 @@ export function applyRenames(
   // Phase 3: finalize and write
   emitSpringBootWarnings(result, finalPinsAndExcludes.pins);
   content = finalizeCoordinateMigration(content, migrationRenames, result.warnings, kotlin);
-  content = upsertManagedBlock(content, finalPinsAndExcludes.pins, finalPinsAndExcludes.excludes, [], kotlin);
+  content = upsertManagedBlock(content, finalPinsAndExcludes.pins, finalPinsAndExcludes.excludes, [], { kotlin });
   result.excluded = finalPinsAndExcludes.excludes.map(e => e.packageName);
 
   if (content !== contentBefore) {

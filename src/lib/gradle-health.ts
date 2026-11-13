@@ -61,7 +61,8 @@ function relocatedFamilyWarnings(packages: PackageRef[]): string[] {
     if (present.length < 2) continue;
     const majors = new Set(present.map(e => majorOf(e.version)));
     if (majors.size < 2) continue;
-    warnings.push(`Mixed-major relocated family '${family[0].split(":")[1]}': ${present.map(e => `${e.coord}@${e.version}`).join(" vs ")} — verify the stack is compatible.`);
+    const detail = present.map(e => `${e.coord}@${e.version}`).join(" vs ");
+    warnings.push(`Mixed-major relocated family '${family[0].split(":")[1]}': ${detail} — verify the stack is compatible.`);
   }
   return warnings;
 }

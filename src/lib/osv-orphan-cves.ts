@@ -21,7 +21,11 @@ const LEGACY_ORPHAN_CACHE_NAME = "Maven-orphan";
 export function orphanCacheName(products: BridgeProduct[]): string {
   const fingerprint = products
     .map(p => `${p.id}|${(p.knownCveIds ?? []).join(",")}|${p.advisoryIdSources.join(",")}`)
-    .sort()
+    .sort((a, b) => {
+      if (a < b) return -1;
+      if (a > b) return 1;
+      return 0;
+    })
     .join("\u00a7");
   return `Maven-orphan-${crypto.createHash("sha256").update(fingerprint).digest("hex").slice(0, 12)}`;
 }

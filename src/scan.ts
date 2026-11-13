@@ -260,6 +260,21 @@ async function loadAdvisoriesForEcosystems(
   return allAdvData;
 }
 
+/** Load one supplemental advisory source, converting a failure into a warning + incomplete flag instead of aborting the scan. */
+async function loadSupplementalAdvisories(
+  warnings: string[],
+  markIncomplete: () => void,
+  load: (onWarning: (msg: string) => void) => Promise<AdvisoryEntry[]>,
+): Promise<AdvisoryEntry[]> {
+  try {
+    return await load(msg => warnings.push(msg));
+  } catch (err) {
+    warnings.push(err instanceof Error ? err.message : String(err));
+    markIncomplete();
+    return [];
+  }
+}
+
 export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = {}): Promise<ScanResult> {
   const { ecosystemFilter = null, quiet = false, quietBanner = quiet, spinnerPrefix } = opts;
   const oraFactory = resolveOraFactory(quiet, opts.ora);
@@ -290,20 +305,12 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   // Phase 3: Reviewed GitHub Maven advisories (global list, incremental after the first pull)
   let repoAdvisories: AdvisoryEntry[] = [];
   let advisoryIncomplete = false;
+  const markAdvisoriesIncomplete = () => { advisoryIncomplete = true; };
   if (!supplementalDisabled() && packages.some(pkg => pkg.ecosystem.toLowerCase() === "maven")) {
-    try {
+    repoAdvisories = await loadSupplementalAdvisories(warnings, markAdvisoriesIncomplete, async onWarning => {
       setText(opts.offline ? "Loading cached GitHub Maven advisories..." : "Loading GitHub Maven advisories...");
-      repoAdvisories = await loadRepoAdvisories({
-        setText,
-        offline: opts.offline,
-        onWarning: (msg) => warnings.push(msg),
-        onIncomplete: () => { advisoryIncomplete = true; },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(msg);
-      advisoryIncomplete = true;
-    }
+      return loadRepoAdvisories({ setText, offline: opts.offline, onWarning, onIncomplete: markAdvisoriesIncomplete });
+    });
   }
   // Phase 3b: Merge locally-vendored advisories (package dir + <target>/local-advisories)
   const localAdvisories = loadLocalAdvisoriesForTarget(resolvedTarget);
@@ -313,18 +320,8 @@ export async function runAutoBumperScan(targetPath: string, opts: ScanOptions = 
   // Phase 3c: Snyk Open Source public advisories (per-package pages, cached per coordinate)
   let snykAdvisories: AdvisoryEntry[] = [];
   if (!supplementalDisabled()) {
-    try {
-      snykAdvisories = await loadSnykAdvisories(packages, {
-        offline: opts.offline,
-        setText,
-        onWarning: (msg) => warnings.push(msg),
-        onIncomplete: () => { advisoryIncomplete = true; },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(msg);
-      advisoryIncomplete = true;
-    }
+    snykAdvisories = await loadSupplementalAdvisories(warnings, markAdvisoriesIncomplete, onWarning =>
+      loadSnykAdvisories(packages, { offline: opts.offline, setText, onWarning, onIncomplete: markAdvisoriesIncomplete }));
   }
   const combinedData = mergeAdvisories(allAdvData, [...repoAdvisories, ...snykAdvisories, ...localAdvisories]);
 

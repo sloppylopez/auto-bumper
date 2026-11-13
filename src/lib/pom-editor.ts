@@ -43,24 +43,52 @@ function dependencyTagAt(content: string, index: number): { close: boolean; end:
   return { close: close || content[gt - 1] === "/", end: gt + 1 };
 }
 
-/**
- * Dependency elements. Comments and CDATA are skipped, so a `</dependency>` inside
- * a comment does not end the block. Nested dependency elements stay inside the outer one.
- */
+/** End index of the `<!-- -->` or `<![CDATA[ ]]>` section starting at `i`; null when neither. */
+function skipXmlSection(content: string, i: number): number | null {
+  if (content.startsWith("<!--", i)) {
+    const end = content.indexOf("-->", i + 4);
+    return end === -1 ? content.length : end + 3;
+  }
+  if (content.startsWith("<![CDATA[", i)) {
+    const end = content.indexOf("]]>", i + 9);
+    return end === -1 ? content.length : end + 3;
+  }
+  return null;
+}
+
+/** Apply one dependency tag to the scan state, closing the outermost block when depth returns to zero. */
+function applyDependencyTag(
+  tag: { close: boolean; end: number },
+  depth: number,
+  start: number,
+  i: number,
+  blocks: XmlBlock[],
+  content: string,
+): { depth: number; start: number } {
+  if (tag.close) {
+    if (depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        blocks.push({ start, end: tag.end, text: content.slice(start, tag.end) });
+        start = -1;
+      }
+    }
+    return { depth, start };
+  }
+  if (depth === 0) return { depth: 1, start: i };
+  return { depth: depth + 1, start };
+}
+
+/** Every <dependency> element (with its full text); nested elements stay inside the outer one. */
 function dependencyBlocks(content: string): XmlBlock[] {
   const blocks: XmlBlock[] = [];
   let i = 0;
   let depth = 0;
   let start = -1;
   while (i < content.length) {
-    if (content.startsWith("<!--", i)) {
-      const end = content.indexOf("-->", i + 4);
-      i = end === -1 ? content.length : end + 3;
-      continue;
-    }
-    if (content.startsWith("<![CDATA[", i)) {
-      const end = content.indexOf("]]>", i + 9);
-      i = end === -1 ? content.length : end + 3;
+    const skip = skipXmlSection(content, i);
+    if (skip !== null) {
+      i = skip;
       continue;
     }
     const tag = content[i] === "<" ? dependencyTagAt(content, i) : null;
@@ -68,20 +96,7 @@ function dependencyBlocks(content: string): XmlBlock[] {
       i++;
       continue;
     }
-    if (tag.close) {
-      if (depth > 0) {
-        depth--;
-        if (depth === 0 && start >= 0) {
-          blocks.push({ start, end: tag.end, text: content.slice(start, tag.end) });
-          start = -1;
-        }
-      }
-    } else if (depth === 0) {
-      start = i;
-      depth = 1;
-    } else {
-      depth++;
-    }
+    ({ depth, start } = applyDependencyTag(tag, depth, start, i, blocks, content));
     i = tag.end;
   }
   return blocks;
@@ -260,41 +275,48 @@ function parsePomBlockFreeText(block: string): Map<string, string[]> {
     pending = [];
   };
   const lines = block.split("\n");
-  for (let i = 0; i < lines.length; i++) {
+  let i = 0;
+  while (i < lines.length) {
     const trimmed = lines[i].trim();
-    if (trimmed === "") continue;
+    if (trimmed === "") {
+      i++;
+      continue;
+    }
     if (POM_MARKERS.some(m => m.begin === trimmed || m.end === trimmed)) {
       if (POM_MARKERS.some(m => m.end === trimmed)) flush(FREE_TEXT_FOOTER);
+      i++;
       continue;
     }
-    if (inComment) {
+    if (inComment || trimmed.startsWith("<!--")) {
       pending.push(trimmed);
-      if (trimmed.includes("-->")) inComment = false;
-      continue;
-    }
-    if (trimmed.startsWith("<!--")) {
-      pending.push(trimmed);
-      if (!trimmed.includes("-->")) inComment = true;
+      inComment = !trimmed.includes("-->");
+      i++;
       continue;
     }
     if (trimmed.startsWith("<dependency>")) {
-      let span = lines[i];
-      let j = i;
-      while (!span.includes("</dependency>") && j + 1 < lines.length) {
-        j++;
-        span += "\n" + lines[j];
-      }
-      const group = /<groupId>([^<]+)<\/groupId>/.exec(span)?.[1]?.trim();
-      const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(span)?.[1]?.trim();
-      if (group && artifact) flush(`${group}:${artifact}`);
-      i = j;
+      i = skipDependencySpan(lines, i, flush) + 1;
       continue;
     }
     // Unrecognized structural line: treat pending text as block-level.
     flush(FREE_TEXT_HEADER);
+    i++;
   }
   flush(FREE_TEXT_FOOTER);
   return out;
+}
+
+/** Consume a <dependency> element starting at line i, flushing pending text to its coordinate key. Returns the last consumed line index. */
+function skipDependencySpan(lines: string[], i: number, flush: (key: string) => void): number {
+  let span = lines[i];
+  let j = i;
+  while (!span.includes("</dependency>") && j + 1 < lines.length) {
+    j++;
+    span += "\n" + lines[j];
+  }
+  const group = /<groupId>([^<]+)<\/groupId>/.exec(span)?.[1]?.trim();
+  const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(span)?.[1]?.trim();
+  if (group && artifact) flush(`${group}:${artifact}`);
+  return j;
 }
 
 /** Drop preserved comments whose pin no longer exists. */
@@ -322,11 +344,9 @@ function renderManagedBlock(entries: Map<string, string>, freeText: Map<string, 
   lines.push(...pomFreeTextLines(freeText, FREE_TEXT_HEADER, "  "));
   const sorted = [...entries.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [pkg, version] of sorted) {
-    lines.push(...pomFreeTextLines(freeText, pkg, "  "));
-    lines.push(renderPinDependency(pkg, version));
+    lines.push(...pomFreeTextLines(freeText, pkg, "  "), renderPinDependency(pkg, version));
   }
-  lines.push(...pomFreeTextLines(freeText, FREE_TEXT_FOOTER, "  "));
-  lines.push(MARKER_END);
+  lines.push(...pomFreeTextLines(freeText, FREE_TEXT_FOOTER, "  "), MARKER_END);
   return lines.join("\n");
 }
 
@@ -359,7 +379,7 @@ function consolidateManagedBlocks(content: string): string {
   for (;;) {
     const regions = findManagedBlocks(base);
     if (regions.length <= 1) return base;
-    const victim = regions[regions.length - 1]!; // lowest brand priority
+    const victim = regions.at(-1)!; // lowest brand priority
     const before = collapseTrailingNewlines(base.slice(0, victim.begin), 1);
     const after = base.slice(victim.end + victim.endLen).replace(/^\n+/, "\n");
     base = `${before}${after}`;
@@ -374,15 +394,23 @@ function parseAllManagedPins(content: string): { entries: Map<string, string>; f
     const existing = content.slice(region.begin, region.end + region.endLen);
     for (const [pkg, v] of parseExistingPins(existing)) if (!entries.has(pkg)) entries.set(pkg, v);
     const ft = parsePomBlockFreeText(existing);
-    if (ft.size > 0) {
-      for (const [key, lines] of ft) {
-        const prev = freeText?.get(key);
-        if (prev) prev.push(...lines);
-        else (freeText ??= new Map()).set(key, [...lines]);
-      }
-    }
+    if (ft.size > 0) freeText = mergePomFreeText(freeText, ft);
   }
   return { entries, freeText };
+}
+
+/** Merge one block's free-text buckets into the running map; a null map materializes on first content. */
+function mergePomFreeText(
+  freeText: Map<string, string[]> | null,
+  ft: Map<string, string[]>,
+): Map<string, string[]> {
+  const target = freeText ?? new Map<string, string[]>();
+  for (const [key, lines] of ft) {
+    const prev = target.get(key);
+    if (prev) prev.push(...lines);
+    else target.set(key, [...lines]);
+  }
+  return target;
 }
 
 function upsertManagedBlock(content: string, pins: BumpRequest[], directlyHandled: string[] = []): string {
@@ -620,6 +648,19 @@ function applyMavenExclusions(content: string, excludes: ExcludeRequest[], resul
   return next;
 }
 
+/** True when a block is not an attachment target: inside dependencyManagement, the excluded coordinate itself, or out of scope. */
+function exclusionBlocked(
+  found: XmlBlock,
+  packageName: string,
+  spans: Array<[number, number]>,
+  scopedTo: Set<string> | null,
+): boolean {
+  if (insideSpan(found.start, spans)) return true;
+  const coords = blockCoordinates(found.text);
+  if (coords === packageName) return true;
+  return scopedTo !== null && !scopedTo.has(coords ?? "");
+}
+
 /** Attach one exclusion to every direct dependency block outside dependencyManagement (or only to ex.attachTo when scoped). */
 function applyOneExclusion(
   content: string,
@@ -636,20 +677,13 @@ function applyOneExclusion(
   const edits: Array<{ start: number; end: number; text: string }> = [];
   let already = false;
   for (const found of dependencyBlocks(content)) {
-    const { start, end } = found;
+    if (exclusionBlocked(found, ex.packageName, spans, scopedTo)) continue;
     const block = found.text;
-    if (insideSpan(start, spans)) continue;
-    if (blockCoordinates(block) === ex.packageName) continue;
-    if (scopedTo && !scopedTo.has(blockCoordinates(block) ?? "")) continue;
     if (blockHasExclusion(block, group, artifact)) {
       already = true;
       continue;
     }
-    edits.push({
-      start,
-      end,
-      text: insertExclusion(block, group, artifact),
-    });
+    edits.push({ start: found.start, end: found.end, text: insertExclusion(block, group, artifact) });
   }
   if (edits.length === 0 && !already) {
     result.warnings.push(scopedTo ? `${ex.packageName}: none of its resolved sources (${[...scopedTo].join(", ")}) are direct dependencies — nothing to attach <exclusion> to` : `${ex.packageName}: no direct dependency to attach <exclusion> to`);

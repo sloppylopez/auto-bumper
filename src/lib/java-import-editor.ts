@@ -177,8 +177,10 @@ function javaFilesFor(projectRoot: string, globs: string[]): string[] {
   return files;
 }
 
+const REGEX_SPECIALS = /[.*+?^${}()|[\]\\]/g;
+
 function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return s.replace(REGEX_SPECIALS, String.raw`\$&`);
 }
 
 /**
@@ -188,7 +190,7 @@ function escapeRegExp(s: string): string {
 export function findJavaImportUsages(projectRoot: string, packagePrefix: string, globs: string[] = DEFAULT_JAVA_GLOBS): string[] {
   const prefix = packagePrefix.trim();
   if (!prefix) return [];
-  const re = new RegExp(`import\\s+(?:static\\s+)?${escapeRegExp(prefix)}(?=\\.)`);
+  const re = new RegExp(String.raw`import\s+(?:static\s+)?${escapeRegExp(prefix)}(?=\.)`);
   const hits: string[] = [];
   for (const file of javaFilesFor(projectRoot, globs)) {
     let content: string;

@@ -58,7 +58,7 @@ interface SnykCacheDoc {
 /** Build the public per-package page URL for a Snyk-supported ecosystem. */
 export function snykPackageUrl(ecosystem: SnykEcosystem, name: string): string {
   const coordName = ecosystem === "Maven" ? name.toLowerCase() : name;
-  const coord = ecosystem === "Maven" ? coordName.replace(/:/g, "%3A") : encodeURIComponent(coordName);
+  const coord = ecosystem === "Maven" ? coordName.replaceAll(":", "%3A") : encodeURIComponent(coordName);
   return `${SNYK_BASE}/${ecosystem === "Maven" ? "maven" : "npm"}/${coord}`;
 }
 
@@ -115,44 +115,95 @@ function assignResolved(o: Record<string, unknown>, key: unknown, value: unknown
   o[name] = value;
 }
 
+/** Resolve a numeric reference into the node list, guarding cycles and out-of-range values. */
+function resolveNumberRef(v: number, nodes: unknown[], nextDepth: number, anc: Set<number>): unknown {
+  if (!Number.isInteger(v) || v < 0 || v >= nodes.length) return v < 0 ? null : v;
+  if (anc.has(v)) return null;
+  anc.add(v);
+  try {
+    return resolveNuxt(nodes[v], nodes, nextDepth, anc);
+  } finally {
+    anc.delete(v);
+  }
+}
+
+/** Resolve a devalue-tagged array (`ShallowReactive`, `Reactive`, `Object`, `Array`). */
+function resolveTaggedArray(tag: string, rest: unknown[], v: unknown[], nodes: unknown[], nextDepth: number, anc: Set<number>): unknown {
+  if (tag === "ShallowReactive" || tag === "Reactive") return resolveNuxt(rest[0], nodes, nextDepth, anc);
+  if (tag === "Object") {
+    const o: Record<string, unknown> = Object.create(null);
+    for (let k = 0; k < rest.length; k += 2) {
+      assignResolved(o, resolveNuxt(rest[k], nodes, nextDepth, anc), resolveNuxt(rest[k + 1], nodes, nextDepth, anc));
+    }
+    return o;
+  }
+  if (tag === "Array") return rest.map((x) => resolveNuxt(x, nodes, nextDepth, anc));
+  return v.map((x) => resolveNuxt(x, nodes, nextDepth, anc));
+}
+
+/** Resolve a plain object node key by key. */
+function resolvePlainObject(v: object, nodes: unknown[], nextDepth: number, anc: Set<number>): Record<string, unknown> {
+  const o: Record<string, unknown> = Object.create(null);
+  for (const [k, val] of Object.entries(v)) assignResolved(o, k, resolveNuxt(val, nodes, nextDepth, anc));
+  return o;
+}
+
 /** Resolve one devalue node (numeric values are references into the node list). */
 function resolveNuxt(v: unknown, nodes: unknown[], depth: number, anc: Set<number>): unknown {
   if (depth > 64) return null;
-  if (typeof v === "number") {
-    if (!Number.isInteger(v) || v < 0 || v >= nodes.length) return v < 0 ? null : v;
-    if (anc.has(v)) return null;
-    anc.add(v);
-    try {
-      return resolveNuxt(nodes[v], nodes, depth + 1, anc);
-    } finally {
-      anc.delete(v);
-    }
-  }
+  if (typeof v === "number") return resolveNumberRef(v, nodes, depth + 1, anc);
   if (Array.isArray(v)) {
     const [tag, ...rest] = v;
-    if (typeof tag === "string") {
-      if (tag === "ShallowReactive" || tag === "Reactive") return resolveNuxt(rest[0], nodes, depth + 1, anc);
-      if (tag === "Object") {
-        const o: Record<string, unknown> = Object.create(null);
-        for (let k = 0; k < rest.length; k += 2) {
-          assignResolved(o, resolveNuxt(rest[k], nodes, depth + 1, anc), resolveNuxt(rest[k + 1], nodes, depth + 1, anc));
-        }
-        return o;
-      }
-      if (tag === "Array") return rest.map((x) => resolveNuxt(x, nodes, depth + 1, anc));
-    }
+    if (typeof tag === "string") return resolveTaggedArray(tag, rest, v, nodes, depth + 1, anc);
     return v.map((x) => resolveNuxt(x, nodes, depth + 1, anc));
   }
-  if (v && typeof v === "object") {
-    const o: Record<string, unknown> = Object.create(null);
-    for (const [k, val] of Object.entries(v)) assignResolved(o, k, resolveNuxt(val, nodes, depth + 1, anc));
-    return o;
-  }
+  if (v && typeof v === "object") return resolvePlainObject(v, nodes, depth + 1, anc);
   return v;
 }
 
 function isVulnList(val: unknown[]): boolean {
   return val.every((v) => !!v && typeof v === "object" && typeof (v as SnykVuln).id === "string");
+}
+
+interface VulnWalkState {
+  sawEmpty: boolean;
+}
+
+/** Recursively look for a `vulnerabilities` array in a resolved payload. */
+function walkForVulnerabilities(current: unknown, depth: number, state: VulnWalkState): SnykVuln[] | null {
+  if (depth > 24 || current === null || typeof current !== "object") return null;
+  if (Array.isArray(current)) return searchArrayItems(current, state, depth);
+  const direct = directVulnList(current as Record<string, unknown>, state);
+  if (direct) return direct;
+  return searchObjectValues(current as Record<string, unknown>, state, depth);
+}
+
+/** A well-formed `vulnerabilities` array directly on the node; empty ones mark `state.sawEmpty`. */
+function directVulnList(current: Record<string, unknown>, state: VulnWalkState): SnykVuln[] | null {
+  for (const [k, val] of Object.entries(current)) {
+    if (k !== "vulnerabilities" || !Array.isArray(val) || !isVulnList(val)) continue;
+    if (val.length > 0) return val as SnykVuln[];
+    state.sawEmpty = true;
+  }
+  return null;
+}
+
+/** Search each element of an array node in order; the first non-empty hit wins. */
+function searchArrayItems(current: unknown[], state: VulnWalkState, depth: number): SnykVuln[] | null {
+  for (const item of current) {
+    const found = walkForVulnerabilities(item, depth + 1, state);
+    if (found && found.length > 0) return found;
+  }
+  return null;
+}
+
+/** Search the values of an object node in order; the first non-empty hit wins. */
+function searchObjectValues(current: Record<string, unknown>, state: VulnWalkState, depth: number): SnykVuln[] | null {
+  for (const val of Object.values(current)) {
+    const found = walkForVulnerabilities(val, depth + 1, state);
+    if (found && found.length > 0) return found;
+  }
+  return null;
 }
 
 /**
@@ -161,33 +212,10 @@ function isVulnList(val: unknown[]): boolean {
  * advisories. Null means the key was not found (the caller must not cache that).
  */
 function findVulnerabilities(node: unknown): SnykVuln[] | null {
-  let sawEmpty = false;
-
-  const walk = (current: unknown, depth: number): SnykVuln[] | null => {
-    if (depth > 24 || current === null || typeof current !== "object") return null;
-    if (Array.isArray(current)) {
-      for (const item of current) {
-        const found = walk(item, depth + 1);
-        if (found && found.length > 0) return found;
-      }
-      return null;
-    }
-    for (const [k, val] of Object.entries(current as Record<string, unknown>)) {
-      if (k === "vulnerabilities" && Array.isArray(val) && isVulnList(val)) {
-        if (val.length > 0) return val as SnykVuln[];
-        sawEmpty = true;
-      }
-    }
-    for (const val of Object.values(current as Record<string, unknown>)) {
-      const found = walk(val, depth + 1);
-      if (found && found.length > 0) return found;
-    }
-    return null;
-  };
-
-  const found = walk(node, 0);
+  const state: VulnWalkState = { sawEmpty: false };
+  const found = walkForVulnerabilities(node, 0, state);
   if (found && found.length > 0) return found;
-  return sawEmpty ? [] : null;
+  return state.sawEmpty ? [] : null;
 }
 
 /** Parse a Snyk package page into its vulnerability list. Empty array when the page has none. */
@@ -341,6 +369,30 @@ async function loadCoordinate(
   }
 }
 
+type CoordinateOutcome = "ok" | "missing" | "failed";
+
+/** Load one coordinate and merge its entries into the by-id map; report no-cache and fetch failures. */
+async function mergeCoordinateResult(
+  coord: SnykCoordinate,
+  offline: boolean,
+  forceRefresh: boolean,
+  byId: Map<string, AdvisoryEntry>,
+  failures: string[],
+): Promise<CoordinateOutcome> {
+  try {
+    const result = await loadCoordinate(coord, offline, forceRefresh);
+    if (result.kind === "missing-cache") return "missing";
+    for (const e of result.entries) {
+      const existing = byId.get(e.id);
+      byId.set(e.id, existing ? unionAdvisory(existing, e) : e);
+    }
+    return "ok";
+  } catch (err) {
+    failures.push(`${coord.name}: ${err instanceof Error ? err.message : String(err)}`);
+    return "failed";
+  }
+}
+
 /**
  * Load Snyk public advisories for the scanned packages.
  * Per-coordinate caches (7-day TTL) make repeat runs cheap; a coordinate that is not in
@@ -365,23 +417,11 @@ export async function loadSnykAdvisories(packages: PackageRef[], opts: SnykLoadO
     Array.from({ length: Math.min(CONCURRENCY, coords.length) }, async () => {
       while (queue.length > 0) {
         const coord = queue.shift()!;
-        try {
-          const result = await loadCoordinate(coord, offline, forceRefresh);
-          if (result.kind === "missing-cache") {
-            missingOffline += 1;
-          } else {
-            for (const e of result.entries) {
-              const existing = byId.get(e.id);
-              byId.set(e.id, existing ? unionAdvisory(existing, e) : e);
-            }
-          }
-        } catch (err) {
-          failures.push(`${coord.name}: ${err instanceof Error ? err.message : String(err)}`);
-        } finally {
-          done += 1;
-          if (done % 10 === 0 || done === coords.length) {
-            setText?.(offline ? `Loading cached Snyk advisories (${done}/${coords.length})...` : `Fetching Snyk advisories (${done}/${coords.length})...`);
-          }
+        const outcome = await mergeCoordinateResult(coord, offline, forceRefresh, byId, failures);
+        if (outcome === "missing") missingOffline += 1;
+        done += 1;
+        if (done % 10 === 0 || done === coords.length) {
+          setText?.(offline ? `Loading cached Snyk advisories (${done}/${coords.length})...` : `Fetching Snyk advisories (${done}/${coords.length})...`);
         }
       }
     }),
