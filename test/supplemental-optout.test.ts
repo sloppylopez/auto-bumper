@@ -244,7 +244,7 @@ describe("scan with AUTO_BUMPER_SUPPLEMENTAL unset", () => {
       } finally {
         globalThis.fetch = originalFetch;
       }
-      expect(hits.some(url => url.includes("api.github.com/advisories"))).toBe(false);
+      expect(hits.some(url => hasOrigin(url, "https://api.github.com"))).toBe(false);
     });
   }, 20000);
 });

@@ -7,7 +7,7 @@
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { windowsBatchArgs, windowsBatchEnv } from "./parse-lockfile.ts";
+import { windowsBatchLaunch } from "./parse-lockfile.ts";
 
 export interface LockRefreshCommand {
   bin: string;
@@ -33,15 +33,22 @@ export interface LockRefreshOptions {
 }
 
 function detectPoetryVersion(dir: string): string | undefined {
-  const result = childProcess.spawnSync(binName("poetry"), ["--version"], {
-    cwd: dir,
-    encoding: "utf-8",
-    timeout: 5_000,
-    windowsHide: true,
-    shell: false,
-  });
-  if (result.error || result.status !== 0) return undefined;
-  return /\b(\d+)\.\d+(?:\.\d+)?\b/.exec(`${result.stdout || ""} ${result.stderr || ""}`)?.[1];
+  const bins = process.platform === "win32" ? ["poetry.exe", "poetry.cmd", "poetry"] : ["poetry"];
+  for (const bin of bins) {
+    const result = spawnCaptured(bin, ["--version"], { cwd: dir, timeout: 5_000 });
+    if (result.error || result.status !== 0) continue;
+    const major = /\b(\d+)\.\d+(?:\.\d+)?\b/.exec(`${result.stdout || ""} ${result.stderr || ""}`)?.[1];
+    if (major) return major;
+  }
+  return undefined;
+}
+
+/** Poetry 2 rejects `--no-update`. Return the retry argv, or null when this failure is something else. */
+export function poetryLockRetry(args: string[], detail: string): string[] | null {
+  if (!args.includes("--no-update")) return null;
+  if (!/no-update/i.test(detail)) return null;
+  if (!/does not exist|no such option|unrecognized|unknown option/i.test(detail)) return null;
+  return args.filter(arg => arg !== "--no-update");
 }
 
 function binName(name: string): string {
@@ -138,12 +145,16 @@ function spawnCaptured(
     shell: false as const,
   };
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(executable)) {
-    const comspec = process.env.ComSpec || "cmd.exe";
-    return childProcess.spawnSync(comspec, windowsBatchArgs(executable, args), {
-      ...base,
-      env: { ...process.env, ...windowsBatchEnv(executable, args) },
-      windowsVerbatimArguments: true,
-    });
+    const launch = windowsBatchLaunch(executable, args);
+    try {
+      return childProcess.spawnSync(launch.file, launch.args, {
+        ...base,
+        env: launch.env,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      });
+    } finally {
+      launch.cleanup();
+    }
   }
   return childProcess.spawnSync(executable, args, base);
 }
@@ -161,9 +172,15 @@ export function refreshProjectLocks(dir: string, timeoutMs = 300_000, opts: Lock
     ? opts
     : { ...opts, poetryVersion: detectPoetryVersion(dir) };
   return lockRefreshCommands(dir, resolvedOpts).map(command => {
-    const result = spawnCaptured(command.bin, command.args, { cwd: dir, timeout: timeoutMs });
+    let result = spawnCaptured(command.bin, command.args, { cwd: dir, timeout: timeoutMs });
+    let label = command.label;
+    const retry = result.status === 0 && !result.error ? null : poetryLockRetry(command.args, failureDetail(result));
+    if (retry) {
+      result = spawnCaptured(command.bin, retry, { cwd: dir, timeout: timeoutMs });
+      label = `poetry ${retry.join(" ")}`;
+    }
     const warn = command.warn;
-    if (result.status === 0 && !result.error) return { label: command.label, ok: true, detail: "", ...(warn ? { warn } : {}) };
-    return { label: command.label, ok: false, detail: failureDetail(result), ...(warn ? { warn } : {}) };
+    if (result.status === 0 && !result.error) return { label, ok: true, detail: "", ...(warn ? { warn } : {}) };
+    return { label, ok: false, detail: failureDetail(result), ...(warn ? { warn } : {}) };
   });
 }

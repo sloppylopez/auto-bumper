@@ -954,13 +954,31 @@ function findUp(dir: string, fileName: string): string | null {
   }
 }
 
-/** Keep command text static; delayed expansion inserts quoted executable and argument values. */
-export function windowsBatchArgs(executable: string, args: string[]): string[] {
-  const exe = /^[A-Za-z0-9._-]+$/.test(executable)
-    ? "!AUTO_BUMPER_BATCH_EXECUTABLE!"
-    : '"!AUTO_BUMPER_BATCH_EXECUTABLE!"';
-  const command = `"${[exe, ...args.map((_, i) => `"!AUTO_BUMPER_BATCH_ARG_${i}!"`)].join(" ")}"`;
-  return ["/d", "/v:on", "/s", "/c", command];
+/**
+ * Launcher script. Values stay in the environment. Delayed expansion copies them
+ * into locals, then `setlocal DisableDelayedExpansion` turns it off before the
+ * real `.bat`/`.cmd` runs. Bare names stay unquoted so PATH lookup works.
+ */
+export function windowsBatchScript(executable: string, args: string[]): string {
+  const bare = /^[A-Za-z0-9._-]+$/.test(executable);
+  const lines = [
+    "@echo off",
+    "setlocal EnableDelayedExpansion",
+    "set \"EXE=!AUTO_BUMPER_BATCH_EXECUTABLE!\"",
+  ];
+  args.forEach((_, i) => {
+    lines.push(`set "A${i}=!AUTO_BUMPER_BATCH_ARG_${i}!"`);
+  });
+  lines.push("setlocal DisableDelayedExpansion");
+  const exe = bare ? "%EXE%" : "\"%EXE%\"";
+  const rendered = [exe, ...args.map((_, i) => `"%A${i}%"`)].join(" ");
+  lines.push(rendered);
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+/** Static cmd line. The launcher path is `AUTO_BUMPER_BATCH_LAUNCHER`, never user text. */
+export function windowsBatchArgs(_executable: string, _args: string[]): string[] {
+  return ["/d", "/v:on", "/s", "/c", "\"\"!AUTO_BUMPER_BATCH_LAUNCHER!\"\""];
 }
 
 export function windowsBatchEnv(executable: string, args: string[]): Record<string, string> {
@@ -969,6 +987,33 @@ export function windowsBatchEnv(executable: string, args: string[]): Record<stri
     env[`AUTO_BUMPER_BATCH_ARG_${i}`] = arg;
   });
   return env;
+}
+
+export interface WindowsBatchLaunch {
+  file: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  windowsVerbatimArguments: true;
+  cleanup: () => void;
+}
+
+/** cmd.exe launch for a `.bat`/`.cmd`. Drops leftover `AUTO_BUMPER_BATCH_ARG_*` from the parent env. */
+export function windowsBatchLaunch(executable: string, args: string[], base: NodeJS.ProcessEnv = process.env): WindowsBatchLaunch {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-bat-"));
+  const launcher = path.join(dir, "launch.bat");
+  fs.writeFileSync(launcher, windowsBatchScript(executable, args));
+  const env: NodeJS.ProcessEnv = { ...base, ...windowsBatchEnv(executable, args), AUTO_BUMPER_BATCH_LAUNCHER: launcher };
+  for (const key of Object.keys(env)) {
+    const index = /^AUTO_BUMPER_BATCH_ARG_(\d+)$/.exec(key);
+    if (index && Number(index[1]) >= args.length) delete env[key];
+  }
+  return {
+    file: process.env.ComSpec || "cmd.exe",
+    args: windowsBatchArgs(executable, args),
+    env,
+    windowsVerbatimArguments: true,
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
 }
 
 /**
@@ -989,12 +1034,16 @@ function spawnCaptured(
     shell: false as const,
   };
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(executable)) {
-    const comspec = process.env.ComSpec || "cmd.exe";
-    return childProcess.spawnSync(comspec, windowsBatchArgs(executable, args), {
-      ...base,
-      env: { ...process.env, ...windowsBatchEnv(executable, args) },
-      windowsVerbatimArguments: true,
-    });
+    const launch = windowsBatchLaunch(executable, args);
+    try {
+      return childProcess.spawnSync(launch.file, launch.args, {
+        ...base,
+        env: launch.env,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      });
+    } finally {
+      launch.cleanup();
+    }
   }
   return childProcess.spawnSync(executable, args, base);
 }
@@ -1345,13 +1394,14 @@ function runGradlewConfigAsync(
   const args = ["dependencies", "--configuration", config, "--quiet"];
 
   return new Promise(resolve => {
-    const child = isWin && /\.(cmd|bat)$/i.test(gradlew)
-      ? childProcess.spawn(process.env.ComSpec || "cmd.exe", windowsBatchArgs(gradlew, args), {
+    const launch = isWin && /\.(cmd|bat)$/i.test(gradlew) ? windowsBatchLaunch(gradlew, args) : null;
+    const child = launch
+      ? childProcess.spawn(launch.file, launch.args, {
         cwd,
-        env: { ...process.env, ...windowsBatchEnv(gradlew, args) },
+        env: launch.env,
         windowsHide: true,
         shell: false,
-        windowsVerbatimArguments: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
         stdio: ["ignore", "pipe", "pipe"],
       })
       : childProcess.spawn(gradlew, args, {
@@ -1363,6 +1413,12 @@ function runGradlewConfigAsync(
 
     let stdout = "";
     let stderr = "";
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      launch?.cleanup();
+    };
     child.stdout?.on("data", (chunk: Buffer | string) => { stdout += String(chunk); });
     child.stderr?.on("data", (chunk: Buffer | string) => { stderr += String(chunk); });
 
@@ -1373,11 +1429,13 @@ function runGradlewConfigAsync(
 
     child.on("error", err => {
       clearTimeout(timer);
+      cleanup();
       resolve({ output: "", warning: `${config}: ${err.message}` });
     });
 
     child.on("close", code => {
       clearTimeout(timer);
+      cleanup();
       const output = (stdout + stderr).trim();
       if (code !== 0 && code !== null && !output) {
         resolve({ output: "", warning: `${config}: gradlew exited with code ${code}` });

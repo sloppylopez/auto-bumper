@@ -24,6 +24,69 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
+interface XmlBlock {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** `<dependency>` at `index`, not `<dependencies>` or `<dependencyManagement>`. */
+function dependencyTagAt(content: string, index: number): { close: boolean; end: number } | null {
+  const close = content.startsWith("</", index);
+  const nameAt = index + (close ? 2 : 1);
+  if (!content.startsWith("dependency", nameAt)) return null;
+  const after = nameAt + "dependency".length;
+  const next = content[after];
+  if (next !== ">" && next !== "/" && next !== " " && next !== "\t" && next !== "\n" && next !== "\r") return null;
+  const gt = content.indexOf(">", after);
+  if (gt === -1) return null;
+  return { close: close || content[gt - 1] === "/", end: gt + 1 };
+}
+
+/**
+ * Dependency elements. Comments and CDATA are skipped, so a `</dependency>` inside
+ * a comment does not end the block. Nested dependency elements stay inside the outer one.
+ */
+function dependencyBlocks(content: string): XmlBlock[] {
+  const blocks: XmlBlock[] = [];
+  let i = 0;
+  let depth = 0;
+  let start = -1;
+  while (i < content.length) {
+    if (content.startsWith("<!--", i)) {
+      const end = content.indexOf("-->", i + 4);
+      i = end === -1 ? content.length : end + 3;
+      continue;
+    }
+    if (content.startsWith("<![CDATA[", i)) {
+      const end = content.indexOf("]]>", i + 9);
+      i = end === -1 ? content.length : end + 3;
+      continue;
+    }
+    const tag = content[i] === "<" ? dependencyTagAt(content, i) : null;
+    if (!tag) {
+      i++;
+      continue;
+    }
+    if (tag.close) {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          blocks.push({ start, end: tag.end, text: content.slice(start, tag.end) });
+          start = -1;
+        }
+      }
+    } else if (depth === 0) {
+      start = i;
+      depth = 1;
+    } else {
+      depth++;
+    }
+    i = tag.end;
+  }
+  return blocks;
+}
+
 /** Replace a run of trailing newlines with `count` newlines; no-op when none present. */
 function collapseTrailingNewlines(s: string, count: number): string {
   let end = s.length;
@@ -56,11 +119,9 @@ function findDepBlocks(content: string): DepBlock[] {
   const dmEnd = dmStart >= 0 ? content.indexOf("</dependencyManagement>", dmStart) : -1;
   const regions = findManagedBlocks(content);
 
-  const re = /<dependency>[\s\S]*?<\/dependency>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    const block = m[0];
-    const idx = m.index; // hoisted: the closure below cannot see the loop's narrowing of m
+  for (const found of dependencyBlocks(content)) {
+    const block = found.text;
+    const idx = found.start;
     const groupMatch = /<groupId>([^<]+)<\/groupId>/.exec(block);
     const artifactMatch = /<artifactId>([^<]+)<\/artifactId>/.exec(block);
     if (!groupMatch || !artifactMatch) continue;
@@ -168,7 +229,7 @@ function renderPinDependency(pkg: string, version: string): string {
 
 function parseExistingPins(block: string): Map<string, string> {
   const entries = new Map<string, string>();
-  for (const dep of block.match(/<dependency>[\s\S]*?<\/dependency>/g) || []) {
+  for (const dep of dependencyBlocks(block).map(found => found.text)) {
     const group = /<groupId>([^<]+)<\/groupId>/.exec(dep)?.[1]?.trim();
     const artifact = /<artifactId>([^<]+)<\/artifactId>/.exec(dep)?.[1]?.trim();
     const version = /<version>([^<]+)<\/version>/.exec(dep)?.[1]?.trim();
@@ -430,17 +491,25 @@ function rewriteRename(
   };
   let { content: next, changed } = rewriteDirect(content, bump, warnings);
 
-  const depBlocks = next.match(/<dependency>[\s\S]*?<\/dependency>/g) || [];
-  for (const block of depBlocks) {
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  for (const found of dependencyBlocks(next)) {
+    const block = found.text;
     const groupMatch = /<groupId>([^<]+)<\/groupId>/.exec(block);
     const artifactMatch = /<artifactId>([^<]+)<\/artifactId>/.exec(block);
     if (!groupMatch || !artifactMatch) continue;
     if (groupMatch[1].trim() !== fromGroup || artifactMatch[1].trim() !== fromArt) continue;
 
-    const updated = block
-      .replace(/<groupId>[^<]+<\/groupId>/, `<groupId>${toGroup}</groupId>`)
-      .replace(/<artifactId>[^<]+<\/artifactId>/, `<artifactId>${toArt}</artifactId>`);
-    next = next.replace(block, updated);
+    edits.push({
+      start: found.start,
+      end: found.end,
+      text: block
+        .replace(/<groupId>[^<]+<\/groupId>/, `<groupId>${toGroup}</groupId>`)
+        .replace(/<artifactId>[^<]+<\/artifactId>/, `<artifactId>${toArt}</artifactId>`),
+    });
+  }
+  edits.sort((a, b) => b.start - a.start);
+  for (const edit of edits) {
+    next = next.slice(0, edit.start) + edit.text + next.slice(edit.end);
     changed = true;
   }
 
@@ -564,23 +633,11 @@ function applyOneExclusion(
     return content;
   }
   const scopedTo = ex.attachTo && ex.attachTo.length > 0 ? new Set(ex.attachTo) : null;
-  const openTag = "<dependency>";
-  const closeTag = "</dependency>";
   const edits: Array<{ start: number; end: number; text: string }> = [];
   let already = false;
-  let blockStart = -1;
-  for (const tag of content.matchAll(/<\/?dependency>/g)) {
-    if (tag[0] === openTag) {
-      if (blockStart === -1) blockStart = tag.index!;
-      continue;
-    }
-    if (blockStart === -1) {
-      continue;
-    }
-    const start = blockStart;
-    const end = tag.index! + closeTag.length;
-    const block = content.slice(start, end);
-    blockStart = -1;
+  for (const found of dependencyBlocks(content)) {
+    const { start, end } = found;
+    const block = found.text;
     if (insideSpan(start, spans)) continue;
     if (blockCoordinates(block) === ex.packageName) continue;
     if (scopedTo && !scopedTo.has(blockCoordinates(block) ?? "")) continue;

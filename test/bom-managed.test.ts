@@ -95,6 +95,31 @@ describe("parseBomManagedVersions", () => {
     expect(parseBomManagedVersions(pom).size).toBe(0);
   });
 
+  it("still skips a profile when a comment contains a closing profiles tag", () => {
+    const pom = [
+      "<project>",
+      "  <profiles>",
+      "    <!-- </profiles> -->",
+      "    <profile>",
+      "      <dependencyManagement>",
+      "        <dependencies>",
+      depEntry("org.example", "profile-only-lib", "9.9.9"),
+      "        </dependencies>",
+      "      </dependencyManagement>",
+      "    </profile>",
+      "  </profiles>",
+      "  <dependencyManagement>",
+      "    <dependencies>",
+      depEntry("org.example", "root-lib", "1.2.3"),
+      "    </dependencies>",
+      "  </dependencyManagement>",
+      "</project>",
+    ].join("\n");
+    const map = parseBomManagedVersions(pom);
+    expect(map.has("org.example:profile-only-lib")).toBe(false);
+    expect(map.get("org.example:root-lib")).toBe("1.2.3");
+  });
+
   it("skips cyclic properties that remain unresolved after the resolution limit", () => {
     const pom = [
       "<project>",

@@ -12,7 +12,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { defaultSpinnerFactory } from "../src/lib/spinner.ts";
 import { runAutoBumperScan, normalizeCliPath, pathHint } from "../src/scan.ts";
-import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchArgs } from "../src/lib/parse-lockfile.ts";
+import { GRADLE_ALL_CONFIGURATIONS, detectGradlew, detectMaven, listNestedManifests, parseBuildGradleDirect, parsePomXmlDirect, windowsBatchLaunch } from "../src/lib/parse-lockfile.ts";
 import { buildFixPlan, familyOf, majorOf, packageAdvisoryEntries, pickSafeEscapeVersion, planFamilyMigrations, withDowngradeVersion, withNextFixVersion } from "../src/lib/fixer.ts";
 import type { FixCandidate, FixPlan } from "../src/lib/fixer.ts";
 import { bumpApplyMethod, normalizeBumpApplyResult, type BumpApplyResult } from "../src/lib/apply-method.ts";
@@ -2233,8 +2233,16 @@ function runCompileCheck(command: { bin: string; args: string[] }, cwd: string):
   const base = { encoding: "utf-8" as const, timeout: 900_000, cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, shell: false as const };
   let result;
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(command.bin)) {
-    const comspec = process.env.ComSpec || "cmd.exe";
-    result = childProcess.spawnSync(comspec, windowsBatchArgs(command.bin, command.args), { ...base, windowsVerbatimArguments: true });
+    const launch = windowsBatchLaunch(command.bin, command.args);
+    try {
+      result = childProcess.spawnSync(launch.file, launch.args, {
+        ...base,
+        env: launch.env,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      });
+    } finally {
+      launch.cleanup();
+    }
   } else {
     result = childProcess.spawnSync(command.bin, command.args, base);
   }

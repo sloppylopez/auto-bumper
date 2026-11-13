@@ -672,19 +672,21 @@ export function comparePackageVersion(a: string, b: string, ecosystem: string): 
 
 interface EventSegment {
   introduced: string;
+  /** True when the introduced version itself is not affected (`>`). */
+  introducedExclusive: boolean;
   fixed: string | null;
   last_affected: string | null;
 }
 
 function parseEventSegments(
-  events: Array<{ introduced?: string; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
+  events: Array<{ introduced?: string; introduced_exclusive?: boolean; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
 ): EventSegment[] {
   const segments: EventSegment[] = [];
-  let current: EventSegment = { introduced: "0", fixed: null, last_affected: null };
+  let current: EventSegment = { introduced: "0", introducedExclusive: false, fixed: null, last_affected: null };
 
   const pushCurrent = () => {
     segments.push(current);
-    current = { introduced: "0", fixed: null, last_affected: null };
+    current = { introduced: "0", introducedExclusive: false, fixed: null, last_affected: null };
   };
 
   for (const ev of events) {
@@ -693,6 +695,7 @@ function parseEventSegments(
         pushCurrent();
       }
       current.introduced = ev.introduced || "0";
+      current.introducedExclusive = ev.introduced_exclusive === true;
       current.fixed = null;
       current.last_affected = null;
     }
@@ -716,19 +719,20 @@ function parseEventSegments(
 
 function versionInEventSegment(version: string, segment: EventSegment, ecosystem: string): boolean {
   const cmp = (a: string, b: string) => comparePackageVersion(a, b, ecosystem);
-  if (cmp(version, segment.introduced) < 0) return false;
+  const intro = cmp(version, segment.introduced);
+  if (segment.introducedExclusive ? intro <= 0 : intro < 0) return false;
   if (segment.fixed !== null && cmp(version, segment.fixed) >= 0) return false;
   if (segment.last_affected !== null && cmp(version, segment.last_affected) > 0) return false;
   return true;
 }
 
 /** OSV ECOSYSTEM/GIT range event */
-type EcoEvent = { introduced?: string; fixed?: string; deprecated?: string; latest?: string; last_affected?: string };
+type EcoEvent = { introduced?: string; introduced_exclusive?: boolean; fixed?: string; deprecated?: string; latest?: string; last_affected?: string };
 
 /** Match against OSV event ranges (supports multiple introduced/fixed segments). */
 function matchesEcosystemEvents(
   version: string,
-  events: Array<{ introduced?: string; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
+  events: Array<{ introduced?: string; introduced_exclusive?: boolean; fixed?: string; deprecated?: string; latest?: string; last_affected?: string }>,
   ecosystem: string,
 ): AffectedEventResult {
   const segments = parseEventSegments(events);

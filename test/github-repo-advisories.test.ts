@@ -79,6 +79,10 @@ describe("parseGhsaRange", () => {
     expect(parseGhsaRange(">= 1.0.0, < 2.0.0")).toEqual({ gte: "1.0.0", lt: "2.0.0" });
   });
 
+  it("preserves a strict lower bound", () => {
+    expect(parseGhsaRange("> 1.0.0, < 2.0.0")).toEqual({ gt: "1.0.0", lt: "2.0.0" });
+  });
+
   it("parses open-ended ranges", () => {
     expect(parseGhsaRange(">= 1.0")).toEqual({ gte: "1.0" });
     expect(parseGhsaRange("<= 2.0")).toEqual({ lte: "2.0" });
@@ -114,6 +118,23 @@ describe("ghsaToOsv", () => {
     });
     expect(rec?.affected[0].versions).toEqual(["1.2.3"]);
     expect(rec?.affected[0].ranges).toEqual([]);
+  });
+
+  it("treats a strict lower bound as exclusive", () => {
+    const rec = ghsaToOsv({
+      ...nettyAdvisory,
+      vulnerabilities: [{
+        package: nettyAdvisory.vulnerabilities![0].package,
+        vulnerable_version_range: "> 1.0.0, < 2.0.0",
+      }],
+    });
+    expect(rec?.affected[0].ranges).toEqual([
+      { type: "ECOSYSTEM", events: [{ introduced: "1.0.0", introduced_exclusive: true }, { fixed: "2.0.0" }] },
+    ]);
+    const base = { ecosystem: "maven", name: "io.netty:netty-codec-http3", manifestPath: "" };
+    expect(matchVulnerabilities([{ ...base, version: "1.0.0" }], [rec!])).toEqual([]);
+    expect(matchVulnerabilities([{ ...base, version: "1.0.1" }], [rec!])).toHaveLength(1);
+    expect(matchVulnerabilities([{ ...base, version: "2.0.0" }], [rec!])).toEqual([]);
   });
 
   it("converts strict upper bounds into exclusive fixed events", () => {
@@ -460,6 +481,25 @@ describe("loadRepoAdvisories", () => {
     const fullRecs = await loadRepoAdvisories();
     expect(fullRecs.map(r => r.id)).toEqual(["GHSA-q9pg-8h3j-8hvm", "GHSA-page2-aaaa-bbbb"]);
     expect(readGhsaSince()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  });
+
+  it("marks an offline read of a cursor-less cache incomplete", async () => {
+    clearGhsaCache();
+    const base = globalMavenAdvisoriesUrl(null, false);
+    fetchMock.mockImplementation(async (url: string | URL) => {
+      if (String(url).includes("cursor=2")) return new Response("boom", { status: 500 });
+      const link = `<${base}&cursor=2>; rel="next"`;
+      return new Response(JSON.stringify([nettyAdvisory]), { status: 200, headers: { link } });
+    });
+    await loadRepoAdvisories();
+    expect(readGhsaSince()).toBeNull();
+    let incomplete = false;
+    const recs = await loadRepoAdvisories({
+      offline: true,
+      onIncomplete: () => { incomplete = true; },
+    });
+    expect(recs.map(r => r.id)).toEqual(["GHSA-q9pg-8h3j-8hvm"]);
+    expect(incomplete).toBe(true);
   });
 
   it("stops using a rejected token for later pages", async () => {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { lockRefreshCommands } from "../src/lib/lockfile-refresh.ts";
+import { lockRefreshCommands, poetryLockRetry } from "../src/lib/lockfile-refresh.ts";
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "lock-refresh-"));
@@ -49,7 +49,14 @@ describe("lockfile refresh commands", () => {
     fs.writeFileSync(path.join(dir, "poetry.lock"), "");
     expect(lockRefreshCommands(dir, { poetryVersion: "2.0.0" }).map(c => c.label)).toEqual(["poetry lock"]);
     expect(lockRefreshCommands(dir, { poetryVersion: "1.8.5" }).map(c => c.label)).toEqual(["poetry lock --no-update"]);
+    expect(lockRefreshCommands(dir).map(c => c.label)).toEqual(["poetry lock --no-update"]);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("retries poetry lock once when Poetry 2 rejects --no-update", () => {
+    expect(poetryLockRetry(["lock", "--no-update"], "The option \"--no-update\" does not exist")).toEqual(["lock"]);
+    expect(poetryLockRetry(["lock", "--no-update"], "network down")).toBeNull();
+    expect(poetryLockRetry(["lock"], "The option \"--no-update\" does not exist")).toBeNull();
   });
 
   it("does not run cargo update when no crate was bumped", () => {

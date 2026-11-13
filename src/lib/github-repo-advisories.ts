@@ -89,14 +89,15 @@ export function mergeGhsaAdvisories(
 }
 
 /** Parse a GHSA vulnerable_version_range, including strict upper bounds such as "< B". */
-export function parseGhsaRange(rangeStr: string | null | undefined): { exact?: string; gte?: string; lte?: string; lt?: string } | null {
+export function parseGhsaRange(rangeStr: string | null | undefined): { exact?: string; gte?: string; gt?: string; lte?: string; lt?: string } | null {
   if (!rangeStr || typeof rangeStr !== "string") return null;
   let gte: string | undefined;
+  let gt: string | undefined;
   let lte: string | undefined;
   let lt: string | undefined;
   let exact: string | undefined;
   for (const part of rangeStr.split(",").map(s => s.trim()).filter(Boolean)) {
-    const opMatch = /^(>=|<=|<|=)/.exec(part);
+    const opMatch = /^(>=|<=|>|<|=)/.exec(part);
     let op: string;
     let val: string;
     if (opMatch) {
@@ -108,14 +109,16 @@ export function parseGhsaRange(rangeStr: string | null | undefined): { exact?: s
     }
     if (!val) continue;
     if (op === ">=") gte = val;
+    else if (op === ">") gt = val;
     else if (op === "<=") lte = val;
     else if (op === "<") lt = val;
     else exact = val;
   }
   if (exact !== undefined) return { exact };
-  if (gte !== undefined || lte !== undefined || lt !== undefined) {
+  if (gte !== undefined || gt !== undefined || lte !== undefined || lt !== undefined) {
     return {
       ...(gte !== undefined ? { gte } : {}),
+      ...(gt !== undefined ? { gt } : {}),
       ...(lte !== undefined ? { lte } : {}),
       ...(lt !== undefined ? { lt } : {}),
     };
@@ -182,7 +185,12 @@ function buildAffectedEntry(v: GhsaVulnerability, ecosystems: Set<string>) {
   if (r?.exact !== undefined) {
     entry.versions.push(r.exact);
   } else if (r) {
-    const events: Array<Record<string, string>> = [{ introduced: r.gte || "0" }];
+    const introduced = r.gte ?? r.gt ?? "0";
+    const events: Array<Record<string, string | boolean>> = [
+      r.gt !== undefined && r.gte === undefined
+        ? { introduced, introduced_exclusive: true }
+        : { introduced },
+    ];
     if (r.lte !== undefined) events.push({ last_affected: r.lte });
     if (r.lt !== undefined) events.push({ fixed: r.lt });
     const fixed = r.lt === undefined
@@ -375,6 +383,7 @@ export async function loadRepoAdvisories(opts: RepoAdvisoriesOptions = {}): Prom
       onIncomplete?.();
       return [];
     }
+    if (readGhsaSince() === null) onIncomplete?.();
     return cached;
   }
   if (!forceRefresh) {

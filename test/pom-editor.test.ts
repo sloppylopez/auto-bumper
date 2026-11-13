@@ -365,6 +365,30 @@ describe("applyBumps Maven exclusions", () => {
     });
   });
 
+  it("keeps an exclusion on the real block when a comment contains a closing tag", () => {
+    const commented = `<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>app</artifactId>
+      <!-- </dependency> -->
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+`;
+    withTempPom(commented, filePath => {
+      const result = applyBumps(filePath, [], [{ packageName: "org.bad:lib" }]);
+      const xml = readPom(filePath);
+      expect(result.excluded).toEqual(["org.bad:lib"]);
+      expect(xml).toContain("<version>1.0.0</version>");
+      const dep = xml.slice(xml.indexOf("<dependencies>"), xml.indexOf("</dependencies>"));
+      expect(dep.match(/<exclusion>/g)?.length).toBe(1);
+      expect(dep).toContain("<artifactId>lib</artifactId>");
+    });
+  });
+
   it("warns when there is no direct dependency to attach", () => {
     const bare = `<?xml version="1.0" encoding="UTF-8"?>\n<project>\n  <dependencyManagement>\n    <dependencies>\n      <dependency>\n        <groupId>com.example</groupId>\n        <artifactId>managed</artifactId>\n        <version>1.0.0</version>\n      </dependency>\n    </dependencies>\n  </dependencyManagement>\n</project>\n`;
     withTempPom(bare, filePath => {

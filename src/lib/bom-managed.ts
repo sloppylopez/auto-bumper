@@ -21,9 +21,58 @@ import type { AdvisoryEntry } from "./types.ts";
  * Key: "groupId:artifactId", value: version with ${property} references resolved.
  * Import-scoped (nested BOM) entries and unresolvable versions are skipped. Pure — unit-testable.
  */
+/** `<profiles>` at `index`, not `<profile>`. */
+function profilesTagAt(content: string, index: number): { close: boolean; end: number } | null {
+  const close = content.startsWith("</", index);
+  const nameAt = index + (close ? 2 : 1);
+  if (!content.startsWith("profiles", nameAt)) return null;
+  const after = nameAt + "profiles".length;
+  const next = content[after];
+  if (next !== ">" && next !== "/" && next !== " " && next !== "\t" && next !== "\n" && next !== "\r") return null;
+  const gt = content.indexOf(">", after);
+  if (gt === -1) return null;
+  return { close: close || content[gt - 1] === "/", end: gt + 1 };
+}
+
+/** Drop every `<profiles>` section. Activation is not evaluated. Comments and CDATA do not end the section. */
+function stripProfiles(xml: string): string {
+  let out = "";
+  let i = 0;
+  let depth = 0;
+  while (i < xml.length) {
+    if (xml.startsWith("<!--", i)) {
+      const end = xml.indexOf("-->", i + 4);
+      const next = end === -1 ? xml.length : end + 3;
+      if (depth === 0) out += xml.slice(i, next);
+      i = next;
+      continue;
+    }
+    if (xml.startsWith("<![CDATA[", i)) {
+      const end = xml.indexOf("]]>", i + 9);
+      const next = end === -1 ? xml.length : end + 3;
+      if (depth === 0) out += xml.slice(i, next);
+      i = next;
+      continue;
+    }
+    const tag = xml[i] === "<" ? profilesTagAt(xml, i) : null;
+    if (!tag) {
+      if (depth === 0) out += xml[i];
+      i++;
+      continue;
+    }
+    if (tag.close) {
+      if (depth > 0) depth--;
+    } else {
+      depth++;
+    }
+    i = tag.end;
+  }
+  return out;
+}
+
 export function parseBomManagedVersions(pomXml: string): Map<string, string> {
   const out = new Map<string, string>();
-  const unconditionalPom = pomXml.replace(/<profiles\b[^>]*>[\s\S]*?<\/profiles>/g, "");
+  const unconditionalPom = stripProfiles(pomXml);
   const props = parsePomProperties(unconditionalPom);
 
   /** Resolve ${property} references (up to 3 nested levels). Null when unresolvable. */
