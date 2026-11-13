@@ -11,7 +11,7 @@ import {
   SUPPORTED_LOCKFILE_NAMES,
 } from "../src/lib/parse-lockfile.ts";
 import { assertValidOsvZip, isZipBuffer, OSV_ZIP_MIN_BYTES } from "../src/lib/osv-export.ts";
-import { fetchWithRetry } from "../src/lib/fetch-retry.ts";
+import { realFetchWithRetry } from "./preload-real-fetch.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "auto-bumper-p2-"));
 
@@ -267,7 +267,7 @@ describe("fetchWithRetry", () => {
     }) as typeof fetch;
 
     try {
-      const resp = await fetchWithRetry("https://example.test/x", undefined, {
+      const resp = await realFetchWithRetry("https://example.test/x", undefined, {
         retries: 3,
         baseDelayMs: 1,
         label: "test",

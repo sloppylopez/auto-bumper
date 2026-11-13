@@ -7,17 +7,28 @@ describe("CACHE_DIR", () => {
   });
 });
 
+function withoutCacheOverride(run: () => void): void {
+  const prev = process.env.AUTO_BUMPER_CACHE_DIR;
+  delete process.env.AUTO_BUMPER_CACHE_DIR;
+  try {
+    run();
+  } finally {
+    if (prev === undefined) delete process.env.AUTO_BUMPER_CACHE_DIR;
+    else process.env.AUTO_BUMPER_CACHE_DIR = prev;
+  }
+}
+
 describe("getOsvDbDir", () => {
   it("returns correct joined path for given cwd", () => {
-    const result = getOsvDbDir("/some/path");
-    expect(result).toContain(".auto-bumper");
-    expect(result).toContain("db");
-    expect(result).toContain("osv");
+    withoutCacheOverride(() => {
+      expect(getOsvDbDir("/some/path")).toBe(path.join("/some/path", ".auto-bumper", "db", "osv"));
+    });
   });
 
   it("uses process.cwd when no argument provided", () => {
-    const result = getOsvDbDir();
-    expect(result).toContain(process.cwd());
+    withoutCacheOverride(() => {
+      expect(getOsvDbDir()).toBe(path.join(process.cwd(), ".auto-bumper", "db", "osv"));
+    });
   });
 
   it("honors AUTO_BUMPER_CACHE_DIR override", () => {
