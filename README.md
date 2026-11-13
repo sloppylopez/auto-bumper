@@ -4,9 +4,9 @@
 
 **Local-first polyglot dependency scanner & auto-fixer.** Scans npm, Rust, Python, and Java projects for vulnerabilities using the [OSV (Open Source Vulnerabilities)](https://osv.dev/) database — no LLM, no API keys, no cloud after initial download. Runs offline once cached.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Bun](https://img.shields.io/badge/Requires-Bun%20%E2%89%A51.0-brightgreen)](https://bun.sh)
-[![CI](https://github.com/sloppylopez/auto-bumper/actions/workflows/ci.yml/badge.svg)](https://github.com/sloppylopez/auto-bumper/actions/workflows/ci.yml)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Bun](https://img.shields.io/badge/Requires-Bun%20%E2%89%A51.0-brightgreen)
+![CI](https://github.com/sloppylopez/auto-bumper/actions/workflows/ci.yml/badge.svg)
 
 ---
 
@@ -38,7 +38,7 @@
 │  Detect ecosystems (npm / pypi / maven / gradle)                    │
 │        │                                                            │
 │        ▼                                                            │
-│  .auto-bumper/db/osv/                                             │
+│  .auto-bumper/db/osv/                                               │
 │    cache miss  -->  download OSV zip from GCS (gzip)                │
 │    cache hit   -->  read local advisory JSON                        │
 │    stale       -->  update-db                                       │
@@ -71,8 +71,8 @@
 │  buildFixPlan() (fixer.ts)                                          │
 │    group by package, pick minimal fix version                       │
 │    detectMavenRenames() — OSV + known group migrations              │
-│    family guard — cross-major splits stay on one line              │
-│    family migration — an EOL Maven line moves together             │
+│    family guard — cross-major splits stay on one line               │
+│    family migration — an EOL Maven line moves together              │
 │        │                                                            │
 │        ▼                                                            │
 │  FixPlan: fixable | unfixable | renames                             │
@@ -91,7 +91,7 @@
 │    gradle-editor / pom-editor / npm-editor                          │
 │    cargo-editor / python-editor                                     │
 │    backup .auto-bumper-bak before edit                              │
-│    refresh lockfiles after a successful apply                      │
+│    refresh lockfiles after a successful apply                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -184,7 +184,7 @@ bun run security:fix -- . --dry-run
 
 **Lockfiles:** after `--apply` writes a manifest, the tool refreshes the lock so the next scan sees the new pins: `npm install --package-lock-only --ignore-scripts`, Yarn Berry `yarn install --mode=update-lockfile`, Yarn classic `yarn install --ignore-scripts` (a full install — classic has no lockfile-only mode), `pnpm install --lockfile-only --ignore-scripts`, `bun install --lockfile-only --ignore-scripts`, `cargo update -p <crate>` for each bumped crate, and `poetry lock` (`poetry lock --no-update` on Poetry 1). `--offline` or a failed refresh leaves the lock unchanged; later scans then trust the lockfile and say so. Re-scans also overlay direct deps from `package.json` / `Cargo.toml` so bump loops can progress before that refresh.
 
-**`--latest`** (Maven/Gradle) bulk-updates every directly declared dependency to its newest non-prerelease in addition to vulnerability fixes — see the 🚀 callout above.
+`--latest` (Maven/Gradle) bulk-updates every directly declared dependency to its newest non-prerelease in addition to vulnerability fixes — see the 🚀 callout above.
 
 **Gradle platforms and BOMs.** On Spring Boot's `io.spring.dependency-management` plugin, non-direct vulnerability pins are written as `dependencyManagement { dependencies { dependency 'g:a:v' } }` entries — force and constraint pins do not beat that plugin. An undeclared `org.springframework.boot` fix rewrites the Spring Boot plugin version instead of pinning one starter. A same-line or cross-minor fix on `spring-boot-dependencies` moves that BOM and, when it still matches, the plugin version. A same-minor Quarkus patch bumps `quarkusPlatformVersion` and `quarkusPluginVersion` instead of pinning one extension off the BOM. Pins at or below the version a platform BOM already manages are dropped as stale (BOM maps are cached under `.auto-bumper/db/bom/` with no TTL). A new bump at or below a BOM-managed version is skipped, except an explicit `--allow-downgrades` target. A failed BOM fetch leaves the run without that cleanup.
 
@@ -209,7 +209,7 @@ Some CVE fixes move to **new Maven coordinates** (new `group:artifact`), not jus
 - **Consumer variants:** when a family crosses an ecosystem line, a direct dependency that only publishes a line-specific build is swapped in place (today: `org.wiremock:wiremock` → `org.wiremock:wiremock-jetty12`, same version). Old-coordinate exclusions are attached only to the direct dependencies that still pull the old artifacts in.
 - **Jackson 3** (`com.fasterxml.jackson.core` → `tools.jackson.core`): fix auto-adds global excludes for legacy `com.fasterxml.jackson.core` artifacts and pins `tools.jackson` constraints for transitives.
 - **Source migrations (opt-in):** `--allow-renames` updates dependency declarations only. `--allow-source-migrations` applies known source rewrite rules from migration clusters (Java import prefixes for Jackson today). Dry-run shows **Planned source migrations**. Does **not** migrate full API breaking changes — only known import paths.
-- **Jackson annotations:** Jackson 3 still uses `com.fasterxml.jackson.core:jackson-annotations` **2.x** on the classpath for `@Json*` — the tool does not exclude or rename that artifact.
+- **Jackson annotations:** Jackson 3 still uses `com.fasterxml.jackson.core:jackson-annotations` **2.x** on the classpath for `@Json`* — the tool does not exclude or rename that artifact.
 - **Scan clean ≠ ship ready** — after coordinate migrations, health warnings may still mention mixed groups or managed excludes. Always run `gradlew build` / `mvn verify` and your test suite before merge; scan only reflects the resolved tree at scan time.
 
 `--allow-java-imports` is deprecated; use `--allow-source-migrations`.
@@ -257,6 +257,7 @@ scan [path] [options]
 | `--json` | — | Deprecated alias for `--format=json` (prints a warning) |
 
 **Exit codes:**
+
 - `0` — Clean (no vulnerabilities found)
 - `1` — Vulnerabilities detected
 - `2` — Error (invalid path, network failure, no supported lockfile, offline with no advisory cache, or an incomplete dependency tree / advisory load that would otherwise look clean)
@@ -284,6 +285,7 @@ Markdown (default). Warnings, if any, print first. The Window column is `introdu
 ```
 
 JSON (`--format=json`) is the `Finding` array:
+
 ```json
 [
   {
@@ -330,6 +332,7 @@ fix [path] [options]
 | `--format=markdown\|json` | `markdown` | Output format |
 
 **Safety guarantees:**
+
 - Backup created before any edit (`.auto-bumper-bak`; skipped if backup already exists for that file)
 - Restored automatically on apply failure or uncaught error
 - Backup discarded after successful full resolution
@@ -350,6 +353,7 @@ update-db [--ecosystem=<name>]
 | `--ecosystem=<name>` | *(all)* | Refresh only one ecosystem's DB |
 
 **What happens:**
+
 1. Checks local `.auto-bumper/db/osv/` for existing caches
 2. For each missing/expired cache: downloads the per-ecosystem OSV dump from the public GCS bucket (osv.dev data)
 3. Stores as gzip-compressed JSON (~few MB per ecosystem)
@@ -376,6 +380,7 @@ update-db [--ecosystem=<name>]
 ### Deduplication rules
 
 When multiple manifests exist in the same directory:
+
 - `poetry.lock` + `requirements.txt` → poetry.lock wins (authoritative)
 - Multiple npm lockfiles → precedence `package-lock.json` > `yarn.lock` > `pnpm-lock.yaml` > `bun.lock` (bun.lock is the Bun-native fallback, used only when none of the others exist)
 - `pom.xml` + `build.gradle` → both scanned (dual Java layouts); use `--ecosystem=maven` or `--ecosystem=gradle` to force one
@@ -525,7 +530,7 @@ bunx --package @elephantseed/auto-bumper scan -- . --format=json | \
 
 ## FAQ
 
-**Q: `bunx scan` returns 404**  
+**Q:** `bunx scan` **returns 404**  
 A: The published package is `@elephantseed/auto-bumper`. Use `bunx --package @elephantseed/auto-bumper scan -- <path>` (see **Install & Quick Start**).
 
 **Q: Why Bun?**  
